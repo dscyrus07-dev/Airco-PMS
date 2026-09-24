@@ -23,7 +23,7 @@ router = APIRouter(tags=["media"])
 
 
 class InvalidUpload(AppError):
-    status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
+    status_code = status.HTTP_422_UNPROCESSABLE_ENTITY
     code = "INVALID_UPLOAD"
 
 
