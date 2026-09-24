@@ -13,7 +13,6 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from app.models.employee import Employee
 from app.models.structure import Room, Zone
@@ -69,7 +68,6 @@ class TaskOpsService:
         # ---- generated tasks due today (or created today) --------------
         q = (
             select(Task)
-            .options(selectinload(Task.history))
             .where(
                 Task.property_id == prop.id,
                 or_(
@@ -83,12 +81,19 @@ class TaskOpsService:
         res = await self.session.execute(q.order_by(Task.due_date))
         tasks = list(res.unique().scalars())
 
-        # map generated template items by occurrence key
+        # map generated template items by occurrence key — bounded to today:
+        # occurrence keys start with the ISO timestamp, so a lexical range
+        # filter keeps this from scanning the entire ledger history
+        lo, hi = start_utc.isoformat(), end_utc.isoformat()
         gen_by_key: dict[tuple, Task] = {}
         res = await self.session.execute(
             select(TemplateGeneration).join(
                 WorkTemplate, TemplateGeneration.template_id == WorkTemplate.id
-            ).where(WorkTemplate.property_id == prop.id)
+            ).where(
+                WorkTemplate.property_id == prop.id,
+                TemplateGeneration.occurrence_key >= lo,
+                TemplateGeneration.occurrence_key < hi,
+            )
         )
         ledger = {g.occurrence_key: g for g in res.scalars()}
         task_by_id = {t.id: t for t in tasks}
@@ -99,8 +104,7 @@ class TaskOpsService:
         missing = gen_task_ids - set(task_by_id)
         if missing:
             res = await self.session.execute(
-                select(Task).options(selectinload(Task.history))
-                .where(Task.id.in_(missing))
+                select(Task).where(Task.id.in_(missing))
             )
             for t in res.unique().scalars():
                 task_by_id[t.id] = t
@@ -232,6 +236,79 @@ class TaskOpsService:
         return s
 
     # ------------------------------------------------------------------
+    # PENDING CHECK — employee submissions awaiting Property Manager review
+    # ------------------------------------------------------------------
+
+    async def pending_check(self, user: User, property_id: uuid.UUID | None) -> dict:
+        """Tasks in 'submitted' + maintenance tickets in 'resolved' — both
+        are the PENDING_CHECK state for their ticket type. Each item carries
+        the submission evidence so the reviewer can decide without opening
+        the full ticket."""
+        from app.models.maintenance import (
+            MaintenanceTicket, MaintenanceTicketAttachment,
+            MaintenanceTicketEvent,
+        )
+        from app.models.task import TaskHistoryEvent
+        from sqlalchemy.orm import selectinload
+
+        prop = await self._property(user, property_id)
+
+        res = await self.session.execute(
+            select(Task)
+            .options(selectinload(Task.history))
+            .where(Task.property_id == prop.id, Task.status == "submitted")
+            .order_by(Task.submitted_at)
+        )
+        items: list[dict] = []
+        for t in res.unique().scalars():
+            sub = next((e for e in reversed(t.history)
+                        if e.type == "submitted"), None)
+            items.append({
+                "kind": "task",
+                "uid": str(t.id),
+                "ticket_number": t.ticket_number,
+                "title": t.title,
+                "priority": t.priority,
+                "status": t.status,
+                "room_uid": str(t.room_id) if t.room_id else None,
+                "room_number": t.room_number,
+                "employee": t.assigned_to_name,
+                "submitted_at": t.submitted_at.isoformat() if t.submitted_at else None,
+                "note": sub.note if sub else None,
+                "photo_urls": sub.photos if sub and sub.photos else [],
+            })
+
+        res = await self.session.execute(
+            select(MaintenanceTicket)
+            .options(
+                selectinload(MaintenanceTicket.events),
+                selectinload(MaintenanceTicket.attachments),
+            )
+            .where(MaintenanceTicket.property_id == prop.id,
+                   MaintenanceTicket.status == "resolved")
+            .order_by(MaintenanceTicket.resolved_at)
+        )
+        for t in res.scalars():
+            photos = [a.url for a in t.attachments if a.kind == "resolution"]
+            items.append({
+                "kind": "maintenance",
+                "uid": str(t.id),
+                "ticket_number": t.ticket_number,
+                "title": f"{t.maintenance_type}: {t.issue}",
+                "priority": t.priority,
+                "status": t.status,
+                "room_uid": str(t.room_id) if t.room_id else None,
+                "room_number": t.room_number or t.dorm_name,
+                "employee": t.assigned_to_name,
+                "submitted_at": t.resolved_at.isoformat() if t.resolved_at else None,
+                "note": t.resolution_notes,
+                "photo_urls": photos,
+            })
+
+        items.sort(key=lambda x: x["submitted_at"] or "")
+        return {"count": len(items), "items": items}
+
+    # ------------------------------------------------------------------
     # Generate a single occurrence on demand ("Generate Now")
     # ------------------------------------------------------------------
 
@@ -274,7 +351,6 @@ class TaskOpsService:
         prop = await self._property(user, property_id)
         q = (
             select(Task)
-            .options(selectinload(Task.history))
             .where(Task.property_id == prop.id)
         )
         if user.role == UserRole.EMPLOYEE:

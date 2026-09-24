@@ -97,6 +97,17 @@ export async function resolveMaintenanceTicket(
   });
 }
 
+/** PM disapproves a submitted resolution — returns the ticket for rework. */
+export async function disapproveMaintenanceTicket(
+  ticket_uid: string,
+  reason: string
+): Promise<MaintenanceTicket> {
+  return apiFetch<MaintenanceTicket>(`/maintenance/${ticket_uid}/disapprove`, {
+    method: 'POST',
+    body: { reason },
+  });
+}
+
 export async function closeMaintenanceTicket(
   ticket_uid: string
 ): Promise<MaintenanceTicket> {

@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { CalendarCheck, History, Plus } from 'lucide-react';
+import React, { useCallback, useEffect, useState } from 'react';
+import { CalendarCheck, ClipboardCheck, History, Plus } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { Button } from '../ui/Button';
 import { ConfirmationDialog } from '../ui/ConfirmationDialog';
@@ -7,6 +7,8 @@ import { CreateTaskModal } from './CreateTaskModal';
 import { TaskDetailDrawer } from './TaskDetailDrawer';
 import { TodayTasksView } from './TodayTasksView';
 import { TaskHistoryView } from './TaskHistoryView';
+import { PendingCheckView } from './PendingCheckView';
+import * as tasksApi from '../../api/tasks';
 import { Task } from '../../types';
 
 /**
@@ -18,9 +20,26 @@ import { Task } from '../../types';
  *     (the tasks table — nothing appears here before it exists as a task)
  */
 export const TasksView: React.FC = () => {
-  const { currentPropertyTasks, currentUser, canDo, deleteTask } = useApp();
+  const { currentPropertyTasks, currentUser, canDo, deleteTask, activePropertyUid, navigate } = useApp();
 
-  const [tab, setTab] = useState<'today' | 'history'>('today');
+  const [tab, setTab] = useState<'today' | 'pending' | 'history'>('today');
+  const [pendingCount, setPendingCount] = useState(0);
+  const canReview = currentUser?.role !== 'employee';
+
+  // Pending Check badge — backend count, refreshed on mount + 30s poll
+  const refreshPendingCount = useCallback(async () => {
+    if (!activePropertyUid || !canReview) return;
+    try {
+      const res = await tasksApi.pendingCheck(activePropertyUid);
+      setPendingCount(res.count);
+    } catch { /* badge stays at last value */ }
+  }, [activePropertyUid, canReview]);
+
+  useEffect(() => {
+    void refreshPendingCount();
+    const iv = setInterval(() => void refreshPendingCount(), 30000);
+    return () => clearInterval(iv);
+  }, [refreshPendingCount]);
   const [selectedTaskUid, setSelectedTaskUid] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [editingTask, setEditingTask] = useState<Task | null>(null);
@@ -57,10 +76,11 @@ export const TasksView: React.FC = () => {
         )}
       </div>
 
-      {/* Section nav — Today's schedule vs generated-instance history */}
+      {/* Section nav — Today's schedule vs pending review vs history */}
       <div className="flex items-center gap-1 bg-[#F0EDE6] rounded-[12px] p-1 w-fit">
         {([
           { v: 'today' as const, l: "Today's Tasks", icon: CalendarCheck },
+          ...(canReview ? [{ v: 'pending' as const, l: 'Pending Check', icon: ClipboardCheck, count: pendingCount }] : []),
           { v: 'history' as const, l: 'Task History', icon: History },
         ]).map((t) => {
           const Icon = t.icon;
@@ -76,6 +96,13 @@ export const TasksView: React.FC = () => {
             >
               <Icon className="w-4 h-4" />
               {t.l}
+              {'count' in t && t.count !== undefined && (
+                <span className={`ml-1 min-w-[18px] px-1 rounded-full text-[11px] font-bold text-center ${
+                  t.count > 0 ? 'bg-[#B4540A] text-white' : 'bg-[#E4DFD5] text-[#8A857B]'
+                }`}>
+                  {t.count}
+                </span>
+              )}
             </button>
           );
         })}
@@ -83,6 +110,15 @@ export const TasksView: React.FC = () => {
 
       {tab === 'today' ? (
         <TodayTasksView onOpenTask={setSelectedTaskUid} />
+      ) : tab === 'pending' ? (
+        <PendingCheckView
+          onOpenTask={(uid, kind) =>
+            kind === 'maintenance'
+              ? navigate(`/property/${activePropertyUid}/maintenance?ticket=${uid}`)
+              : setSelectedTaskUid(uid)
+          }
+          onCountChange={setPendingCount}
+        />
       ) : (
         <TaskHistoryView onOpenTask={setSelectedTaskUid} />
       )}

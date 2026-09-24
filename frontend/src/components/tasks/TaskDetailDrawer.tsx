@@ -126,7 +126,6 @@ export const TaskDetailDrawer: React.FC<TaskDetailDrawerProps> = ({ task, onClos
     employees,
     zones,
     currentPropertyEmployees,
-    startTask,
     submitTask,
     approveTask,
     rejectTask,
@@ -513,17 +512,6 @@ export const TaskDetailDrawer: React.FC<TaskDetailDrawerProps> = ({ task, onClos
                 />
 
                 <div className="flex items-center gap-2 pt-1">
-                  {status !== 'in_progress' && (
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => startTask(task.task_uid)}
-                      className="gap-1.5"
-                    >
-                      <Play className="w-3.5 h-3.5" />
-                      <span>Start</span>
-                    </Button>
-                  )}
                   <Button
                     variant="primary"
                     size="sm"
@@ -533,12 +521,12 @@ export const TaskDetailDrawer: React.FC<TaskDetailDrawerProps> = ({ task, onClos
                     title={
                       evidencePhotos.length === 0
                         ? 'Attach at least one photo to enable submission'
-                        : 'Submit for supervisor review'
+                        : 'Submit for Property Manager approval'
                     }
                     className="gap-1.5"
                   >
                     <CheckCircle2 className="w-3.5 h-3.5" />
-                    <span>Submit for Review</span>
+                    <span>Submit for Approval</span>
                   </Button>
                 </div>
               </div>
@@ -546,7 +534,14 @@ export const TaskDetailDrawer: React.FC<TaskDetailDrawerProps> = ({ task, onClos
 
             {canActAsEmployee && status === 'submitted' && (
               <div className="p-4 rounded-[14px] bg-[#EAF1FB] border border-[#C9D8F0] text-sm text-[#2C4A7C]">
-                Submitted for supervisor review — you'll be notified if changes are needed.
+                Pending Check — awaiting Property Manager approval.
+              </div>
+            )}
+
+            {/* Returned for correction — employee sees PM feedback */}
+            {canActAsEmployee && status === 'reopened' && (
+              <div className="p-4 rounded-[14px] bg-[#FDF3E8] border border-[#EFD9BC] text-sm text-[#7A4A12]">
+                Returned for correction — address the feedback and resubmit.
               </div>
             )}
 
@@ -573,7 +568,7 @@ export const TaskDetailDrawer: React.FC<TaskDetailDrawerProps> = ({ task, onClos
                     className="gap-1.5 text-[#A32A2A] border-[#F0C4C4] hover:bg-[#FDE8E8]"
                   >
                     <Undo2 className="w-3.5 h-3.5" />
-                    <span>Reject</span>
+                    <span>Disapprove</span>
                   </Button>
                 </div>
                 {rejectMode && (
@@ -582,7 +577,7 @@ export const TaskDetailDrawer: React.FC<TaskDetailDrawerProps> = ({ task, onClos
                       rows={2}
                       value={rejectReason}
                       onChange={(e) => setRejectReason(e.target.value)}
-                      placeholder="Rejection reason (required)…"
+                      placeholder="Disapproval reason (required)…"
                       className="w-full px-3 py-2 bg-white border border-[#DDD7CB] rounded-[10px] text-xs text-[#24221F] focus:outline-none focus:ring-2 focus:ring-[#386641]"
                     />
                     <div className="flex gap-2">
@@ -596,7 +591,7 @@ export const TaskDetailDrawer: React.FC<TaskDetailDrawerProps> = ({ task, onClos
                           setRejectReason('');
                         }}
                       >
-                        Confirm Rejection
+                        Confirm Disapproval
                       </Button>
                       <Button size="sm" variant="ghost" onClick={() => setRejectMode(false)}>
                         Cancel

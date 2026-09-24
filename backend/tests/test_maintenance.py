@@ -157,7 +157,8 @@ async def test_task_ticket_number_and_review_workflow(client, admin, prop):
                             json={"reason": "Mirror still streaky."})
     assert res.json()["status"] == "reopened"
     res = await client.post(f"/api/v1/tasks/{task['task_uid']}/submit", headers=eh,
-                            json={"note": "Fixed."})
+                            json={"note": "Fixed.",
+                                  "photo_urls": ["http://x/p2.jpg"]})
     assert res.json()["status"] == "submitted"
     res = await client.post(f"/api/v1/tasks/{task['task_uid']}/approve", headers=h,
                             json={"note": "Looks good."})

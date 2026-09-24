@@ -112,6 +112,13 @@ export async function tasksToday(property_uid?: string): Promise<import('./types
   });
 }
 
+/** PM review queue — employee-submitted work awaiting approval. */
+export async function pendingCheck(property_uid?: string): Promise<import('./types').PendingCheckResponse> {
+  return apiFetch<import('./types').PendingCheckResponse>('/tasks/pending-check', {
+    query: { property_uid },
+  });
+}
+
 export async function tasksHistory(
   params: import('./types').TaskHistoryParams = {}
 ): Promise<import('./types').TaskHistoryResponse> {

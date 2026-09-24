@@ -1,12 +1,12 @@
 """
 Work allocation batches — grouped ticket creation.
 
-POST /work-batches creates N tickets as ONE allocation operation:
-tickets are grouped by their resolved zone (rooms → room.zone_id, beds →
-dorm.zone_id, dorms → dorm.zone_id — resolved server-side, never trusted
-from the payload), one round-robin employee is picked per zone, and every
-ticket in that zone's batch lands on that employee. The pointer advances
-once per zone batch, never per ticket.
+POST /work-batches creates N tickets grouped by their resolved UNIT
+(room → the room; bed → its dorm; dorm → the dorm — resolved server-side,
+never trusted from the payload). All maintenance items belonging to one
+room land on ONE employee; each unit advances the zone's persistent
+round-robin pointer once, so a multi-room batch distributes A, B, C…
+across rooms instead of stacking everything on one assignee.
 """
 
 import uuid
@@ -67,22 +67,29 @@ async def create_work_batch(
         )
         room, dorm, bed = await svc._resolve_target(prop, req)
         zone_id = (room.zone_id if room else dorm.zone_id) if (room or dorm) else None
-        resolved.append({"req": req, "zone_id": zone_id})
+        # allocation unit = the physical unit: a room, or the dorm that owns
+        # the bed. Same unit → same employee; different units rotate.
+        unit = room.id if room else (dorm.id if dorm else
+                                   (bed.dorm_id if bed else None))
+        resolved.append({"req": req, "zone_id": zone_id, "unit": unit})
 
-    # Phase 2 — group by zone, allocate ONE employee per zone group
-    by_zone: dict[uuid.UUID | None, list[dict]] = {}
+    # Phase 2 — group by unit, allocate ONE employee per unit group.
+    # All of a room's maintenance items share one assignee; the round-robin
+    # pointer advances once per unit so multi-room batches spread fairly.
+    by_unit: dict[tuple, list[dict]] = {}
     for r in resolved:
-        by_zone.setdefault(r["zone_id"], []).append(r)
+        by_unit.setdefault((r["zone_id"], r["unit"]), []).append(r)
 
     from app.models.structure import Zone
 
     out_batches: list[dict] = []
-    for zone_id, items in by_zone.items():
-        zname = None
-        if zone_id:
+    zone_names: dict[uuid.UUID | None, str | None] = {}
+    for (zone_id, _unit), items in by_unit.items():
+        zname = zone_names.get(zone_id)
+        if zone_id and zname is None:
             res = await session.execute(select(Zone).where(Zone.id == zone_id))
             z = res.scalar_one_or_none()
-            zname = z.name if z else None
+            zname = zone_names[zone_id] = z.name if z else None
         result = await alloc.allocate(
             user,
             property_id=prop.id,

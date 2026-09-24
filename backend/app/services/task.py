@@ -400,6 +400,14 @@ class TaskService:
     ) -> dict:
         task = await self._get_task(user, task_id)
         self._require_assignee(user, task)
+        if user.role == UserRole.EMPLOYEE:
+            # Employee completion must pass through the review gate —
+            # /submit → PENDING_CHECK → Property Manager approval.
+            from app.dependencies.auth import Forbidden
+            raise Forbidden(
+                "Employees submit work for approval; direct completion "
+                "requires a manager."
+            )
         if not payload.photo_urls:
             raise ValidationErr(
                 "At least one photo is required to complete a task.",
@@ -408,6 +416,13 @@ class TaskService:
         task.status = "completed"
         self._history(task, "completed", user, note=payload.note,
                       photos=payload.photo_urls)
+
+        # Staff completing directly counts as supervisor acknowledgement —
+        # the resource derives its status now. An employee's completion does
+        # NOT release the room: a supervisor still has to approve (approve
+        # accepts 'completed' tasks that still hold a blocked resource).
+        if task.room_id and user.role != UserRole.EMPLOYEE:
+            await self._refresh_room(task, user, "approved via complete")
 
         generated = None
         if task.recurrence and task.task_type == "repetitive":
@@ -590,11 +605,27 @@ class TaskService:
     async def submit_task(
         self, user: User, task_id: uuid.UUID, payload: TaskSubmitRequest
     ) -> Task:
-        """Employee submits work for supervisor review → 'submitted'."""
+        """Employee submits work for supervisor review → 'submitted'
+        (PENDING_CHECK — completion requires Property Manager approval)."""
         task = await self._get_task(user, task_id)
         self._require_assignee(user, task)
         if task.status in {"completed", "cancelled"}:
             raise ConflictErr(f"Task is already {task.status}.")
+
+        # Evidence gate — template-generated work follows the template's
+        # verification config; manual tasks mirror the UI rule (≥1 photo).
+        required = 1
+        if task.template_id:
+            from app.models.template import WorkTemplate
+            tpl = await self.session.get(WorkTemplate, task.template_id)
+            v = (tpl.verification or {}) if tpl else {}
+            required = v.get("min_photos", 1) if v.get("photo_required") else 0
+        if len(payload.photo_urls or []) < required:
+            raise ValidationErr(
+                f"At least {required} completion photo"
+                f"{'s are' if required > 1 else ' is'} required.",
+                field="photo_urls",
+            )
         task.status = "submitted"
         task.submitted_at = datetime.now(timezone.utc)
         self._history(task, "submitted", user, note=payload.note,
@@ -605,18 +636,37 @@ class TaskService:
     async def approve_task(self, user: User, task_id: uuid.UUID, note=None) -> dict:
         """Supervisor/manager approves a submitted task → 'completed'.
 
-        Employees cannot approve their own submissions.
+        This is the acknowledgement step — only here does the task's room
+        re-derive its status (available only if no other blocking work
+        remains). Employees cannot approve their own submissions.
         """
         task = await self._get_task(user, task_id)
         self._require_assignee(user, task)  # assigned employee can't self-approve
-        if task.status != "submitted":
+        already_completed = task.status == "completed"
+        if already_completed:
+            # the review already happened — only a still-blocked resource
+            # (employee used /complete directly) can be acknowledged again
+            res = await self.session.execute(
+                select(Room.status).where(Room.id == task.room_id)
+            ) if task.room_id else None
+            room_status = res.scalar_one_or_none() if res else None
+            if room_status not in {"cleaning", "maintenance"}:
+                raise ConflictErr("Only submitted tasks can be approved.")
+        elif task.status != "submitted":
             raise ConflictErr("Only submitted tasks can be approved.")
-        task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        if not already_completed:
+            task.status = "completed"
+            task.completed_at = datetime.now(timezone.utc)
         self._history(task, "approved", user, note=note)
 
+        # Supervisor acknowledgement → the resource re-derives its status
+        # from remaining blocking work (other tickets keep it unavailable).
+        if task.room_id:
+            await self._refresh_room(task, user, "supervisor approved")
+
         generated = None
-        if task.recurrence and task.task_type == "repetitive":
+        if not already_completed and task.recurrence \
+                and task.task_type == "repetitive":
             generated = await self._next_instance(user, task)
         await self.session.commit()
         result = {"task": await self._get_task(user, task.id)}
@@ -635,6 +685,8 @@ class TaskService:
         task.status = "reopened"
         task.submitted_at = None
         self._history(task, "rejected", user, note=reason)
+        if task.room_id:
+            await self._refresh_room(task, user, "work rejected — reopened")
         await self.session.commit()
         return await self._get_task(user, task.id)
 
@@ -646,6 +698,8 @@ class TaskService:
         task.status = "assigned" if task.employee_id else "pending"
         task.completed_at = None
         self._history(task, "reopened", user, note=note)
+        if task.room_id:
+            await self._refresh_room(task, user, "task reopened")
         await self.session.commit()
         return await self._get_task(user, task.id)
 
@@ -656,8 +710,27 @@ class TaskService:
         self._require_assignee(user, task)
         task.status = "pending"
         self._history(task, "redo_requested", user, note=note)
+        if task.room_id:
+            await self._refresh_room(task, user, "redo requested")
         await self.session.commit()
         return await self._get_task(user, task.id)
+
+    async def _refresh_room(self, task: Task, user: User, trigger: str) -> None:
+        """Re-derive the task's room status via the central ops service and
+        record the transition on this task's history."""
+        from app.services.ops_status import OpsStatusService
+
+        def _audit(note: str) -> None:
+            task.history.append(TaskHistoryEvent(
+                type="room_status_changed", actor_name=user.name, note=note,
+            ))
+
+        await OpsStatusService(self.session).refresh_room(
+            task.room_id, release_to="available",
+            actor_name=user.name,
+            trigger=f"{trigger} ({task.ticket_number or task.title})",
+            audit=_audit,
+        )
 
     async def reassign(
         self, user: User, task_id: uuid.UUID, employee_uid: uuid.UUID | None

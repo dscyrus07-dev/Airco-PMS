@@ -226,6 +226,28 @@ export interface BulkUnitStatusResponse {
   dorms: import('../types').Dorm[];
   /** Tasks auto-created by automation rules as a side effect */
   generated_tasks?: Task[];
+  /** Units kept unavailable because active work still blocks them */
+  skipped_blocked?: string[];
+}
+
+export interface PendingCheckItem {
+  kind: 'task' | 'maintenance';
+  uid: string;
+  ticket_number: string | null;
+  title: string;
+  priority: string;
+  status: string;
+  room_uid: string | null;
+  room_number: string | null;
+  employee: string | null;
+  submitted_at: string | null;
+  note: string | null;
+  photo_urls: string[];
+}
+
+export interface PendingCheckResponse {
+  count: number;
+  items: PendingCheckItem[];
 }
 
 // ---------------------------------------------------------------------------

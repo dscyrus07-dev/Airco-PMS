@@ -24,6 +24,7 @@ from app.schemas.maintenance import (
     MaintenanceActionRequest,
     MaintenanceAssignRequest,
     MaintenanceCreateRequest,
+    MaintenanceDisapproveRequest,
     MaintenanceResolveRequest,
     MaintenanceUpdateRequest,
     ticket_out,
@@ -284,6 +285,18 @@ async def tasks_history(
 Staff = Depends(require_property_manager)
 
 
+@router.get("/tasks/pending-check")
+async def tasks_pending_check(
+    property_uid: str | None = Query(default=None),
+    user: User = Staff,
+    session: AsyncSession = Depends(get_db),
+):
+    """Pending Check — employee-submitted work awaiting PM review.
+    Tasks in 'submitted' + maintenance tickets in 'resolved'."""
+    from app.services.task_ops import TaskOpsService
+    return await TaskOpsService(session).pending_check(user, _uid(property_uid))
+
+
 # ------------------------------- Areas -----------------------------------
 
 @router.post("/areas", status_code=status.HTTP_201_CREATED)
@@ -508,6 +521,7 @@ async def bulk_unit_status(
         "rooms": [ws.room_out(r) for r in res["rooms"]],
         "dorms": [ws.dorm_out(d) for d in res["dorms"]],
         "generated_tasks": [ws.task_out(t) for t in res["generated_tasks"]],
+        "skipped_blocked": res["skipped_blocked"],
     }
 
 
@@ -818,6 +832,20 @@ async def resolve_maintenance_ticket(
 ):
     return ticket_out(
         await MaintenanceService(session).resolve(user, ticket_id, payload)
+    )
+
+
+@router.post("/maintenance/{ticket_id}/disapprove")
+async def disapprove_maintenance_ticket(
+    ticket_id: uuid.UUID,
+    payload: MaintenanceDisapproveRequest,
+    user: User = Staff,
+    session: AsyncSession = Depends(get_db),
+):
+    return ticket_out(
+        await MaintenanceService(session).disapprove(
+            user, ticket_id, payload.reason
+        )
     )
 
 

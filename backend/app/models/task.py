@@ -3,7 +3,9 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, func, Uuid
+from sqlalchemy import (
+    JSON, DateTime, ForeignKey, Index, Integer, String, func, Uuid,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models import Base
@@ -92,6 +94,20 @@ class Task(Base):
 
     history: Mapped[list["TaskHistoryEvent"]] = relationship(
         back_populates="task", cascade="all, delete-orphan", order_by="TaskHistoryEvent.at"
+    )
+
+    # One OPEN cleaning ticket per (property, room, title) — backstop for
+    # the dedupe check so two concurrent checkouts can't double-book.
+    __table_args__ = (
+        Index(
+            "uq_tasks_open_room_title",
+            "property_id", "room_id", "title",
+            unique=True,
+            postgresql_where=(room_id.isnot(None) & ~status.in_(
+                ("completed", "cancelled"))),
+            sqlite_where=(room_id.isnot(None) & ~status.in_(
+                ("completed", "cancelled"))),
+        ),
     )
 
 

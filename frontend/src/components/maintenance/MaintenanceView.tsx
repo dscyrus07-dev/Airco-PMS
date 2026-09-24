@@ -1,4 +1,5 @@
 import React, { useMemo, useRef, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import {
   Wrench,
   AlertTriangle,
@@ -79,11 +80,14 @@ export const TicketDrawer: React.FC<{
     holdMaintenanceTicket,
     resolveMaintenanceTicket,
     closeMaintenanceTicket,
+    disapproveMaintenanceTicket,
     addToast,
   } = useApp();
 
   const [assignee, setAssignee] = useState(ticket.assigned_to || '');
   const [resolveMode, setResolveMode] = useState(false);
+  const [disapproveMode, setDisapproveMode] = useState(false);
+  const [disapproveReason, setDisapproveReason] = useState('');
   const [resolveNotes, setResolveNotes] = useState('');
   const [resolvePhotos, setResolvePhotos] = useState<{ file: File; previewUrl: string }[]>([]);
   const [isWorking, setIsWorking] = useState(false);
@@ -106,6 +110,7 @@ export const TicketDrawer: React.FC<{
   const canHold = isStaff && ['open', 'assigned', 'in_progress'].includes(ticket.status);
   const canResolve = !['resolved', 'closed', 'cancelled'].includes(ticket.status);
   const canClose = isStaff && ticket.status === 'resolved';
+  const canDisapprove = isStaff && ticket.status === 'resolved';
 
   const doResolve = async () => {
     if (resolveNotes.trim().length < 3) {
@@ -266,14 +271,53 @@ export const TicketDrawer: React.FC<{
             )}
             {canResolve && !resolveMode && (
               <Button variant="sage" size="sm" onClick={() => setResolveMode(true)}>
-                <CheckCircle2 className="w-3.5 h-3.5 mr-1" /> Resolve
+                <CheckCircle2 className="w-3.5 h-3.5 mr-1" /> Submit for Approval
               </Button>
             )}
             {canClose && (
               <Button variant="primary" size="sm" onClick={() => closeMaintenanceTicket(ticket.ticket_uid)}>
-                <CheckCircle2 className="w-3.5 h-3.5 mr-1" /> Close Ticket
+                <CheckCircle2 className="w-3.5 h-3.5 mr-1" /> Approve
               </Button>
             )}
+            {canDisapprove && !disapproveMode && (
+              <Button
+                variant="outline" size="sm"
+                onClick={() => setDisapproveMode(true)}
+                className="text-[#A32A2A] border-[#F0C4C4] hover:bg-[#FDE8E8]"
+              >
+                <X className="w-3.5 h-3.5 mr-1" /> Disapprove
+              </Button>
+            )}
+          </div>
+        )}
+
+        {/* Disapprove form — reason required, returns ticket for rework */}
+        {disapproveMode && (
+          <div className="p-3.5 rounded-[12px] border border-[#F0C4C4] bg-[#FDF6F6] space-y-3">
+            <p className="text-xs font-semibold text-[#8A2B2B] uppercase tracking-wider">
+              Disapprove Resolution
+            </p>
+            <textarea
+              rows={3}
+              value={disapproveReason}
+              onChange={(e) => setDisapproveReason(e.target.value)}
+              placeholder="e.g. Leak persists — please rework the joint."
+              className="w-full px-3 py-2 bg-white border border-[#DDD7CB] rounded-[10px] text-sm focus:outline-none focus:ring-2 focus:ring-[#C53B3B]/25"
+            />
+            <div className="flex gap-2">
+              <Button variant="outline" size="sm" onClick={() => setDisapproveMode(false)}>Cancel</Button>
+              <Button
+                variant="primary" size="sm"
+                disabled={disapproveReason.trim().length < 3}
+                onClick={() => {
+                  disapproveMaintenanceTicket(ticket.ticket_uid, disapproveReason.trim());
+                  setDisapproveMode(false);
+                  setDisapproveReason('');
+                }}
+              >
+                Submit Disapproval
+              </Button>
+            </div>
           </div>
         )}
 
@@ -389,9 +433,12 @@ export const TicketDrawer: React.FC<{
 
 export const MaintenanceView: React.FC = () => {
   const { currentPropertyMaintenance, activeProperty } = useApp();
+  const [searchParams] = useSearchParams();
   const [statusFilter, setStatusFilter] = useState('all');
   const [search, setSearch] = useState('');
-  const [openedTicketUid, setOpenedTicketUid] = useState<string | null>(null);
+  const [openedTicketUid, setOpenedTicketUid] = useState<string | null>(
+    searchParams.get('ticket')
+  );
 
   const tickets = currentPropertyMaintenance;
 

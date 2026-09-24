@@ -29,8 +29,8 @@ export const MAINTENANCE_STATUS_LABELS: Record<MaintenanceStatus, string> = {
   assigned: 'Assigned',
   in_progress: 'In Progress',
   on_hold: 'On Hold',
-  resolved: 'Resolved',
-  closed: 'Closed',
+  resolved: 'Pending Check',
+  closed: 'Completed',
   cancelled: 'Cancelled',
 };
 

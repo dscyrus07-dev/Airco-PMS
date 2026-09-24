@@ -355,7 +355,7 @@ class MaintenanceService:
         if new_status == "cancelled":
             ticket.status = "cancelled"
             self._event(ticket, "cancelled", user)
-            await self._release_room(user, ticket, to_status="available")
+            await self._refresh_target(user, ticket, release_to="available")
         elif new_status is not None:
             raise ValidationErr(
                 "Use the dedicated action endpoints to change ticket status.",
@@ -445,35 +445,26 @@ class MaintenanceService:
         await self.session.commit()
         return await self._get_ticket(user, ticket.id)
 
-    async def _release_room(self, user, ticket, to_status: str):
-        """Return the ticket's target (room / bed / dorm+beds) to service."""
-        if ticket.room_id is not None:
-            res = await self.session.execute(
-                select(Room).where(Room.id == ticket.room_id)
-            )
-            room = res.scalar_one_or_none()
-            if room is not None and room.status == "maintenance":
-                room.status = to_status
-        elif ticket.bed_id is not None:
-            res = await self.session.execute(
-                select(Bed).where(Bed.id == ticket.bed_id)
-            )
-            bed = res.scalar_one_or_none()
-            if bed is not None and bed.status == "maintenance":
-                bed.status = to_status
-        elif ticket.dorm_id is not None:
-            res = await self.session.execute(
-                select(Dorm)
-                .options(selectinload(Dorm.beds))
-                .where(Dorm.id == ticket.dorm_id)
-            )
-            dorm = res.scalar_one_or_none()
-            if dorm is not None:
-                if dorm.status == "maintenance":
-                    dorm.status = to_status
-                for b in dorm.beds:
-                    if b.status == "maintenance":
-                        b.status = to_status
+    async def _refresh_target(self, user, ticket, *, release_to: str):
+        """Supervisor acknowledgement → re-derive the ticket's target status
+        via the central ops service. Other blocking work on the same target
+        keeps it unavailable; the transition is audited on this ticket."""
+        from app.services.ops_status import OpsStatusService
+        ops = OpsStatusService(self.session)
+
+        def _audit(note: str) -> None:
+            self._event(ticket, "room_status_changed", user, comment=note)
+
+        trigger = f"maintenance {ticket.status} ({ticket.ticket_number})"
+        await ops.refresh_room(
+            ticket.room_id, release_to=release_to,
+            actor_name=user.name, trigger=trigger, audit=_audit)
+        await ops.refresh_bed(
+            ticket.bed_id, release_to=release_to,
+            actor_name=user.name, trigger=trigger, audit=_audit)
+        await ops.refresh_dorm(
+            ticket.dorm_id, release_to=release_to,
+            actor_name=user.name, trigger=trigger, audit=_audit)
 
     async def resolve(
         self, user: User, ticket_id: uuid.UUID, payload: MaintenanceResolveRequest
@@ -481,6 +472,19 @@ class MaintenanceService:
         ticket = await self._get_ticket(user, ticket_id)
         if ticket.status in {"resolved", "closed", "cancelled"}:
             raise ConflictErr(f"Ticket is already {ticket.status}.")
+        # Evidence gate — template-generated tickets follow the template's
+        # verification config; manual tickets keep notes-only resolution.
+        if ticket.template_id:
+            from app.models.template import WorkTemplate
+            tpl = await self.session.get(WorkTemplate, ticket.template_id)
+            v = (tpl.verification or {}) if tpl else {}
+            required = v.get("min_photos", 1) if v.get("photo_required") else 0
+            if len(payload.photo_urls or []) < required:
+                raise ValidationErr(
+                    f"At least {required} resolution photo"
+                    f"{'s are' if required > 1 else ' is'} required.",
+                    field="photo_urls",
+                )
         ticket.status = "resolved"
         ticket.resolved_at = datetime.now(timezone.utc)
         ticket.resolution_notes = payload.resolution_notes.strip()
@@ -491,8 +495,22 @@ class MaintenanceService:
                 uploaded_by_name=user.name,
             ))
         self._event(ticket, "resolved", user, comment=payload.resolution_notes.strip())
-        # Post-maintenance the room needs cleaning — not blindly 'available'
-        await self._release_room(user, ticket, to_status="cleaning")
+        # Employee completion does NOT release the resource — a "resolved"
+        # ticket still blocks until the supervisor closes (acknowledges) it.
+        await self.session.commit()
+        return await self._get_ticket(user, ticket.id)
+
+    async def disapprove(self, user: User, ticket_id: uuid.UUID, reason: str):
+        """Property Manager disapproves a submitted resolution — returns the
+        ticket to the employee for rework. The ticket stays blocking."""
+        ticket = await self._get_ticket(user, ticket_id)
+        if ticket.status != "resolved":
+            raise ConflictErr(
+                "Only resolved (pending-check) tickets can be disapproved."
+            )
+        ticket.status = "in_progress"
+        ticket.resolved_at = None
+        self._event(ticket, "disapproved", user, comment=reason)
         await self.session.commit()
         return await self._get_ticket(user, ticket.id)
 
@@ -505,6 +523,9 @@ class MaintenanceService:
         ticket.status = "closed"
         ticket.closed_at = datetime.now(timezone.utc)
         self._event(ticket, "closed", user)
-        await self._release_room(user, ticket, to_status="cleaning")
+        # Supervisor acknowledgement — derive the target's status from any
+        # remaining blocking work; post-maintenance a free target still needs
+        # cleaning, not a blind 'available'.
+        await self._refresh_target(user, ticket, release_to="cleaning")
         await self.session.commit()
         return await self._get_ticket(user, ticket.id)

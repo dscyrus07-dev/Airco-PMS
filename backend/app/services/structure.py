@@ -681,6 +681,7 @@ class StructureService:
                                 field="action")
 
         rooms = dorms = beds = []
+        skipped_blocked: list[str] = []
         prev_bed_status: dict[uuid.UUID, str] = {}
         if payload.room_uids:
             res = await self.session.execute(
@@ -689,10 +690,28 @@ class StructureService:
                 )
             )
             rooms = list(res.scalars())
-            for r in rooms:
-                r.status = target
-                if target == "available":
-                    r.current_guest = None
+            if target == "available":
+                # status is derived from active work — a room with blocking
+                # tickets stays unavailable; staff can cancel/close the work
+                # first if the release is genuinely intended. Occupied rooms
+                # are never touched here (checkout is the only exit).
+                from app.services.ops_status import OpsStatusService
+                ops = OpsStatusService(self.session)
+                for r in rooms:
+                    if r.status == "occupied":
+                        continue
+                    new = await ops.refresh_room(
+                        r.id, release_to="available",
+                        actor_name=user.name,
+                        trigger="manual available request",
+                    )
+                    if new is None and r.status in ("cleaning", "maintenance"):
+                        skipped_blocked.append(r.room_number)
+                    elif r.status == "available":
+                        r.current_guest = None
+            else:
+                for r in rooms:
+                    r.status = target
         if payload.bed_uids:
             res = await self.session.execute(
                 select(Bed)
@@ -701,10 +720,24 @@ class StructureService:
             )
             beds = [b for b in res.scalars() if b.dorm.property_id == prop.id]
             prev_bed_status = {b.id: b.status for b in beds}
-            for b in beds:
-                b.status = target
-                if target == "available":
-                    b.guest_name = None
+            if target == "available":
+                from app.services.ops_status import OpsStatusService
+                ops = OpsStatusService(self.session)
+                for b in beds:
+                    if b.status == "occupied":
+                        continue
+                    new = await ops.refresh_bed(
+                        b.id, release_to="available",
+                        actor_name=user.name,
+                        trigger="manual available request",
+                    )
+                    if new is None and b.status in ("cleaning", "maintenance"):
+                        skipped_blocked.append(f"Bed {b.bed_number}")
+                    elif b.status == "available":
+                        b.guest_name = None
+            else:
+                for b in beds:
+                    b.status = target
             dorm_ids = {b.dorm_id for b in beds}
             res = await self.session.execute(
                 select(Dorm).where(Dorm.id.in_(dorm_ids)).options(selectinload(Dorm.beds))
@@ -734,14 +767,19 @@ class StructureService:
                     await self._fire_automation(
                         user, prop.id, "room_checked_out", r.zone_id)
             await self._commit()
-        return {"rooms": rooms, "dorms": dorms, "generated_tasks": generated}
+        return {"rooms": rooms, "dorms": dorms, "generated_tasks": generated,
+                "skipped_blocked": skipped_blocked}
 
     async def _generate_cleaning_tasks(
         self, user: User, prop: Property, action: str,
         rooms: list[Room], beds: list[Bed],
     ) -> list[Task]:
-        """One cleaning task per room / per dorm, each allocated to that
-        zone's floor employee through the shared round-robin allocator."""
+        """One cleaning task per room / per dorm — ROUND-ROBIN per unit:
+        every unit gets its own allocation step, so the zone pool's
+        persistent pointer advances per room (201→A, 202→B, 203→C, 204→A…)
+        and repeated bulk operations continue the rotation instead of
+        restarting at the first employee. Units already holding an open
+        cleaning task are skipped WITHOUT consuming a rotation step."""
         from collections import defaultdict
 
         from app.services.task import IST
@@ -751,73 +789,78 @@ class StructureService:
         allocs = WorkAllocationService(self.session)
         today = datetime.now(IST).date().isoformat()
         generated: list[Task] = []
+        zone_names: dict[uuid.UUID | None, str | None] = {}
 
-        rooms_by_zone: dict[uuid.UUID | None, list[Room]] = defaultdict(list)
-        for r in rooms:
-            rooms_by_zone[r.zone_id].append(r)
-        dorms_by_zone: dict[uuid.UUID | None, dict[uuid.UUID, list[Bed]]] = (
-            defaultdict(lambda: defaultdict(list))
-        )
-        for b in beds:
-            dorms_by_zone[b.dorm.zone_id][b.dorm_id].append(b)
+        async def zname(zone_id):
+            if zone_id not in zone_names:
+                zn = await self.session.get(Zone, zone_id) if zone_id else None
+                zone_names[zone_id] = zn.name if zn else None
+            return zone_names[zone_id]
 
-        for zone_id in set(rooms_by_zone) | set(dorms_by_zone):
-            zname = None
-            if zone_id:
-                zn = await self.session.get(Zone, zone_id)
-                zname = zn.name if zn else None
-            # ONE allocation batch per zone — every generated task in this
-            # zone lands on the same floor employee
-            alloc = await allocs.allocate(
+        async def alloc_for(zone_id):
+            return await allocs.allocate(
                 user, property_id=prop.id, zone_id=zone_id,
-                zone_name=zname, work_type="task",
+                zone_name=await zname(zone_id), work_type="task",
                 manager_employee_id=prop.manager_employee_id,
             )
-            emp_id = alloc.employee.id if alloc.employee else None
-            emp_name = alloc.employee.name if alloc.employee else None
 
-            for r in rooms_by_zone.get(zone_id, []):
-                t = await self._spawn_cleaning_task(
-                    user, prop, allocs,
-                    title=f"{label} — Room {r.room_number}",
-                    zone_id=zone_id, room=r, alloc=alloc,
-                    emp_id=emp_id, emp_name=emp_name, today=today,
-                )
-                if t:
-                    generated.append(t)
+        # One task per room — each room is an independent allocation unit.
+        for r in rooms:
+            title = f"{label} — Room {r.room_number}"
+            if await self._has_open_cleaning(prop.id, r.id, title):
+                continue  # already queued — don't consume a rotation step
+            alloc = await alloc_for(r.zone_id)
+            t = await self._spawn_cleaning_task(
+                user, prop, allocs, title=title, zone_id=r.zone_id,
+                room=r, alloc=alloc, today=today,
+            )
+            if t:
+                generated.append(t)
 
-            for dbeds in dorms_by_zone.get(zone_id, {}).values():
-                dorm = dbeds[0].dorm
-                nums = ", ".join(sorted(b.bed_number for b in dbeds))
-                t = await self._spawn_cleaning_task(
-                    user, prop, allocs,
-                    title=f"{label} — {dorm.name or 'Dorm'} ({nums})",
-                    zone_id=zone_id, room=None, alloc=alloc,
-                    emp_id=emp_id, emp_name=emp_name, today=today,
-                )
-                if t:
-                    generated.append(t)
+        # One task per dorm (its beds covered by the same cleaning task).
+        dorms: dict[uuid.UUID, list[Bed]] = defaultdict(list)
+        for b in beds:
+            dorms[b.dorm_id].append(b)
+        for dorm_beds in dorms.values():
+            dorm = dorm_beds[0].dorm
+            nums = ", ".join(sorted(b.bed_number for b in dorm_beds))
+            title = f"{label} — {dorm.name or 'Dorm'} ({nums})"
+            if await self._has_open_cleaning(prop.id, None, title):
+                continue
+            alloc = await alloc_for(dorm.zone_id)
+            t = await self._spawn_cleaning_task(
+                user, prop, allocs, title=title, zone_id=dorm.zone_id,
+                room=None, alloc=alloc, today=today,
+            )
+            if t:
+                generated.append(t)
         return generated
 
-    async def _spawn_cleaning_task(
-        self, user: User, prop: Property, allocs, *,
-        title: str, zone_id, room, alloc, emp_id, emp_name, today: str,
-    ) -> Task | None:
-        """Create one cleaning task — dedupes on an identical OPEN task so
-        re-clicking the action doesn't pile up duplicates."""
+    async def _has_open_cleaning(self, property_id, room_id, title) -> bool:
+        """Dedupe — an identical OPEN cleaning task means the unit is
+        already queued for work; never create a second ticket."""
         res = await self.session.execute(
             select(Task.id).where(
-                Task.property_id == prop.id,
+                Task.property_id == property_id,
                 Task.title == title,
-                Task.room_id == (room.id if room else None),
+                Task.room_id == room_id,
                 Task.status.not_in(("completed", "cancelled")),
             )
         )
-        if res.scalar_one_or_none() is not None:
-            return None
+        return res.scalar_one_or_none() is not None
+
+    async def _spawn_cleaning_task(
+        self, user: User, prop: Property, allocs, *,
+        title: str, zone_id, room, alloc, today: str,
+    ) -> Task | None:
+        """Create one cleaning task for the allocation result."""
+        from sqlalchemy.exc import IntegrityError
+
         from app.models.task import TaskHistoryEvent
         from app.services.maintenance import next_ticket_number
 
+        emp_id = alloc.employee.id if alloc.employee else None
+        emp_name = alloc.employee.name if alloc.employee else None
         t = Task(
             property_id=prop.id,
             ticket_number=await next_ticket_number(self.session, "task"),
@@ -844,7 +887,13 @@ class StructureService:
             type="auto_generated", actor_name=user.name,
             note=f"Generated — {title} flagged from the zone board",
         ))
-        await self.session.flush()
+        try:
+            async with self.session.begin_nested():  # SAVEPOINT — one dup
+                await self.session.flush()           # can't kill the batch
+        except IntegrityError:
+            # uq_tasks_open_room_title — a concurrent request won the same
+            # (property, room, title) slot; dedupe instead of duplicating
+            return None
         allocs.record(
             property_id=prop.id, zone_id=zone_id,
             batch=alloc.batch if alloc else None,

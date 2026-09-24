@@ -76,7 +76,7 @@ async def test_round_robin_single_tickets(client, admin, prop):
     assert t["assigned_to_name"] == "Rahul"
 
 
-# -- Test 2+3: batch of 3 → same employee, pointer advances ONCE ------------
+# -- Test 2+3: batch across 3 rooms → per-room groups rotate the pointer ----
 async def test_batch_same_employee_pointer_once(client, admin, prop):
     h = _auth(admin)
     pid = prop["property_uid"]
@@ -95,14 +95,13 @@ async def test_batch_same_employee_pointer_once(client, admin, prop):
         ]})
     assert res.status_code == 201, res.text
     batches = res.json()["batches"]
-    assert len(batches) == 1
-    b = batches[0]
-    assert b["batch_number"].startswith("WB-")
-    assert b["employee_name"] == "Rahul"
-    assert len(b["tickets"]) == 3
-    assert all(t["assigned_to_name"] == "Rahul" for t in b["tickets"])
+    # each room is its own allocation group → 3 batches rotating the pool
+    assert len(batches) == 3
+    assert [b["employee_name"] for b in batches] == ["Rahul", "Priya", "Rahul"]
+    assert all(b["batch_number"].startswith("WB-") for b in batches)
+    assert all(len(b["tickets"]) == 1 for b in batches)
 
-    # pointer advanced ONCE → next single ticket goes to Priya
+    # pointer advanced per room → next single ticket goes to Priya
     t = await _ticket(client, h, pid, rooms[0]["room_uid"], "Next one")
     assert t["assigned_to_name"] == "Priya"
 
@@ -245,9 +244,10 @@ async def test_batch_fetch_and_history(client, admin, prop):
     res = await client.post("/api/v1/work-batches", headers=h, json={
         "property_uid": pid,
         "tickets": [
-            {"kind": "maintenance", "room_uid": r["room_uid"],
-             "maintenance_type": "hvac", "issue": "AC issue"}
-            for r in rooms
+            {"kind": "maintenance", "room_uid": rooms[0]["room_uid"],
+             "maintenance_type": "hvac", "issue": "AC issue"},
+            {"kind": "maintenance", "room_uid": rooms[0]["room_uid"],
+             "maintenance_type": "hvac", "issue": "Thermostat"},
         ]})
     bid = res.json()["batches"][0]["batch_id"]
 
@@ -255,7 +255,7 @@ async def test_batch_fetch_and_history(client, admin, prop):
     assert res.status_code == 200, res.text
     b = res.json()
     assert b["employee_name"] == "Rahul"
-    assert len(b["tickets"]) == 2
+    assert len(b["tickets"]) == 2  # same room → same batch → same employee
 
     res = await client.get(f"/api/v1/properties/{pid}/work-batches", headers=h)
     assert res.json()["total"] >= 1

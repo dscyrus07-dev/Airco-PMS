@@ -216,6 +216,7 @@ interface AppContextType {
   holdMaintenanceTicket: (ticket_uid: string, note?: string) => Promise<void>;
   resolveMaintenanceTicket: (ticket_uid: string, notes: string, photo_urls: string[]) => Promise<void>;
   closeMaintenanceTicket: (ticket_uid: string) => Promise<void>;
+  disapproveMaintenanceTicket: (ticket_uid: string, reason: string) => Promise<void>;
   updateMaintenanceTicket: (
     ticket_uid: string,
     updates: import('../api/types').MaintenanceUpdateRequest
@@ -1044,10 +1045,13 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
             description: `${unitText} set to Cleaning in progress.`,
           });
         } else {
+          const blocked = res.skipped_blocked || [];
           addToast({
-            type: 'success',
-            title: 'Cleaning Finished',
-            description: `${unitText} marked Available.`,
+            type: blocked.length ? 'info' : 'success',
+            title: blocked.length ? 'Partially Released' : 'Cleaning Finished',
+            description: blocked.length
+              ? `${blocked.join(', ')} still ${blocked.length > 1 ? 'have' : 'has'} active work — kept unavailable.`
+              : `${unitText} marked Available.`,
           });
         }
       } catch (err) {
@@ -1647,7 +1651,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
             resolution_notes: notes,
             photo_urls,
           }),
-        { type: 'success', title: 'Ticket Resolved', description: 'Room moved to cleaning.' },
+        { type: 'success', title: 'Submitted for Approval', description: 'Sent for Property Manager review.' },
         'Resolve Failed'
       ),
     [_ticketAction]
@@ -1657,8 +1661,18 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     (ticket_uid: string) =>
       _ticketAction(
         () => maintenanceApi.closeMaintenanceTicket(ticket_uid),
-        { type: 'success', title: 'Ticket Closed' },
-        'Close Failed'
+        { type: 'success', title: 'Approved — Ticket Completed' },
+        'Approve Failed'
+      ),
+    [_ticketAction]
+  );
+
+  const disapproveMaintenanceTicket = useCallback(
+    (ticket_uid: string, reason: string) =>
+      _ticketAction(
+        () => maintenanceApi.disapproveMaintenanceTicket(ticket_uid, reason),
+        { type: 'info', title: 'Returned for correction' },
+        'Disapprove Failed'
       ),
     [_ticketAction]
   );
@@ -1803,6 +1817,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     holdMaintenanceTicket,
     resolveMaintenanceTicket,
     closeMaintenanceTicket,
+    disapproveMaintenanceTicket,
     updateMaintenanceTicket,
     toasts,
     addToast,

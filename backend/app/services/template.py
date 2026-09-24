@@ -193,6 +193,42 @@ class TemplateService:
         self.session = session
         self.structure = StructureService(session)
         self.alloc = WorkAllocationService(session)
+        # Per-instance structure snapshot — _expand_targets used to issue a
+        # serial query per target/zone/dorm/bed (N+1s); against a remote DB
+        # each RTT is ~300-400ms, so one prefetch of the property structure
+        # (4 queries, cached per request/tick) replaces dozens of round trips.
+        self._struct: dict | None = None
+
+    async def _structure(self, pid: uuid.UUID) -> dict:
+        if self._struct is None:
+            zones = (await self.session.execute(
+                select(Zone).where(Zone.property_id == pid))).scalars().all()
+            rooms = (await self.session.execute(
+                select(Room).where(Room.property_id == pid))).scalars().all()
+            dorms = (await self.session.execute(
+                select(Dorm).where(Dorm.property_id == pid))).scalars().all()
+            dorm_ids = [d.id for d in dorms]
+            beds = (await self.session.execute(
+                select(Bed).where(Bed.dorm_id.in_(dorm_ids)))).scalars().all() \
+                if dorm_ids else []
+            self._struct = {
+                "zones": {z.id: z for z in zones},
+                "rooms": rooms,
+                "dorms": dorms,
+                "dorm_beds": {d.id: [b for b in beds if b.dorm_id == d.id]
+                              for d in dorms},
+                "by_id": {
+                    "room": {r.id: r for r in rooms},
+                    "dorm": {d.id: d for d in dorms},
+                    "bed": {b.id: b for b in beds},
+                    "area": {},
+                },
+            }
+            areas = (await self.session.execute(
+                select(Area).where(Area.property_id == pid))).scalars().all()
+            self._struct["areas"] = {a.id: a for a in areas}
+            self._struct["by_id"]["area"] = self._struct["areas"]
+        return self._struct
 
     # ------------------------------------------------------------------
     # Fetch / validation
@@ -477,17 +513,21 @@ class TemplateService:
         if not targets:
             return 0
 
-        # group by zone → ONE allocation batch per zone per occurrence
-        by_zone: dict = {}
+        # group by UNIT (room/dorm/bed — zone/area/property targets keep
+        # their own key) → ONE allocation batch per unit per occurrence.
+        # All of one room's items land on one employee; each unit advances
+        # the zone's round-robin pointer so work distributes fairly.
+        by_unit: dict = {}
         for tgt in targets:
-            by_zone.setdefault(tgt["zone_id"], []).append(tgt)
+            unit = (tgt.get("room_id") or tgt.get("dorm_id")
+                    or tgt.get("bed_id") or tgt["key"])
+            by_unit.setdefault((tgt["zone_id"], unit), []).append(tgt)
 
-        from app.models.property import Property
         from app.models.property import Property
         prop = await self.session.get(Property, t.property_id)
         count = 0
         is_maint = t.template_type == "maintenance"
-        for zone_id, items in by_zone.items():
+        for (zone_id, _unit), items in by_unit.items():
             zname = items[0]["zone_name"]
             alloc = None
             if t.assignment.get("mode") == "automatic":
@@ -658,97 +698,82 @@ class TemplateService:
 
     async def _expand_targets(self, t: WorkTemplate) -> list[dict]:
         """Resolve the location rule against CURRENT structure — dynamic
-        scopes ('all rooms in Zone B') pick up newly added units."""
+        scopes ('all rooms in Zone B') pick up newly added units. Reads from
+        the per-instance structure snapshot (one prefetch per request/tick),
+        not one query per target."""
         loc = t.location or {}
         scope = loc.get("scope", "property")
         pid = t.property_id
         out: list[dict] = []
+        st = await self._structure(pid)
 
-        async def zname(zid):
-            if not zid:
-                return None
-            z = await self.session.get(Zone, zid)
+        def zn(zid):
+            z = st["zones"].get(zid)
             return z.name if z else None
 
         if scope == "zone":
             zid = _uid(loc.get("zone_uid"))
             target = loc.get("target") or "units"
-            zn = await zname(zid)
+            zname = zn(zid)
             if target in ("rooms", "units"):
-                res = await self.session.execute(
-                    select(Room).where(Room.property_id == pid, Room.zone_id == zid)
-                )
-                for r in res.scalars():
-                    out.append({"key": f"room:{r.id}", "zone_id": zid, "zone_name": zn,
+                for r in st["rooms"]:
+                    if r.zone_id != zid:
+                        continue
+                    out.append({"key": f"room:{r.id}", "zone_id": zid, "zone_name": zname,
                                 "room_id": r.id, "room_number": r.room_number,
                                 "label": f"Room {r.room_number}"})
             if target in ("dorms", "units", "beds"):
-                res = await self.session.execute(
-                    select(Dorm).where(Dorm.property_id == pid, Dorm.zone_id == zid)
-                )
-                for d in res.scalars():
+                for d in st["dorms"]:
+                    if d.zone_id != zid:
+                        continue
                     if target == "dorms":
                         out.append({"key": f"dorm:{d.id}", "zone_id": zid,
-                                    "zone_name": zn, "dorm_id": d.id,
+                                    "zone_name": zname, "dorm_id": d.id,
                                     "dorm_name": d.name, "label": d.name})
                     else:
-                        res2 = await self.session.execute(
-                            select(Bed).where(Bed.dorm_id == d.id)
-                        )
-                        for b in res2.scalars():
+                        for b in st["dorm_beds"].get(d.id, []):
                             out.append({"key": f"bed:{b.id}", "zone_id": zid,
-                                        "zone_name": zn, "dorm_id": d.id,
+                                        "zone_name": zname, "dorm_id": d.id,
                                         "dorm_name": d.name, "bed_id": b.id,
                                         "bed_number": b.bed_number,
                                         "label": f"{d.name} · {b.bed_number}"})
             if not out:
-                out.append({"key": f"zone:{zid}", "zone_id": zid, "zone_name": zn,
-                            "label": zn or "Zone"})
+                out.append({"key": f"zone:{zid}", "zone_id": zid, "zone_name": zname,
+                            "label": zname or "Zone"})
             return out
 
         if scope == "area":
             aid = _uid(loc.get("area_uid"))
             target = loc.get("target") or "units"
             # units inside the area — directly (unit.area_id) or via their zone
-            res = await self.session.execute(
-                select(Zone).where(Zone.property_id == pid, Zone.area_id == aid)
-            )
-            area_zones = list(res.scalars())
-            zone_ids = [z.id for z in area_zones]
+            area_zones = [z for z in st["zones"].values() if z.area_id == aid]
+            zone_ids = {z.id for z in area_zones}
+
+            def in_area(u) -> bool:
+                return u.area_id == aid or u.zone_id in zone_ids
 
             if target in ("rooms", "units"):
-                res = await self.session.execute(
-                    select(Room).where(
-                        Room.property_id == pid,
-                        or_(Room.area_id == aid, Room.zone_id.in_(zone_ids)),
-                    )
-                )
-                for r in res.scalars():
+                for r in st["rooms"]:
+                    if not in_area(r):
+                        continue
                     out.append({"key": f"room:{r.id}", "zone_id": r.zone_id,
-                                "zone_name": await zname(r.zone_id),
+                                "zone_name": zn(r.zone_id),
                                 "room_id": r.id, "room_number": r.room_number,
                                 "label": f"Room {r.room_number}"})
             if target in ("dorms", "units", "beds"):
-                res = await self.session.execute(
-                    select(Dorm).where(
-                        Dorm.property_id == pid,
-                        or_(Dorm.area_id == aid, Dorm.zone_id.in_(zone_ids)),
-                    )
-                )
-                for d in res.scalars():
+                for d in st["dorms"]:
+                    if not in_area(d):
+                        continue
                     if target == "dorms":
                         out.append({"key": f"dorm:{d.id}", "zone_id": d.zone_id,
-                                    "zone_name": await zname(d.zone_id),
+                                    "zone_name": zn(d.zone_id),
                                     "dorm_id": d.id, "dorm_name": d.name,
                                     "label": d.name})
                     else:
-                        res2 = await self.session.execute(
-                            select(Bed).where(Bed.dorm_id == d.id)
-                        )
-                        for b in res2.scalars():
+                        for b in st["dorm_beds"].get(d.id, []):
                             out.append({"key": f"bed:{b.id}",
                                         "zone_id": d.zone_id,
-                                        "zone_name": await zname(d.zone_id),
+                                        "zone_name": zn(d.zone_id),
                                         "dorm_id": d.id, "dorm_name": d.name,
                                         "bed_id": b.id,
                                         "bed_number": b.bed_number,
@@ -761,7 +786,7 @@ class TemplateService:
                     out.append({"key": f"zone:{z.id}", "zone_id": z.id,
                                 "zone_name": z.name, "label": z.name})
             if not out:
-                a = await self.session.get(Area, aid)
+                a = st["areas"].get(aid)
                 out.append({"key": f"area:{aid}", "zone_id": None,
                             "area_id": aid,
                             "zone_name": a.name if a else None,
@@ -770,32 +795,32 @@ class TemplateService:
 
         if scope == "rooms":
             for rid in loc.get("room_uids") or []:
-                r = await self.session.get(Room, _uid(rid))
+                r = st["by_id"]["room"].get(_uid(rid))
                 if r:
                     out.append({"key": f"room:{r.id}", "zone_id": r.zone_id,
-                                "zone_name": await zname(r.zone_id),
+                                "zone_name": zn(r.zone_id),
                                 "room_id": r.id, "room_number": r.room_number,
                                 "label": f"Room {r.room_number}"})
             return out
 
         if scope == "dorms":
             for did in loc.get("dorm_uids") or []:
-                d = await self.session.get(Dorm, _uid(did))
+                d = st["by_id"]["dorm"].get(_uid(did))
                 if d:
                     out.append({"key": f"dorm:{d.id}", "zone_id": d.zone_id,
-                                "zone_name": await zname(d.zone_id),
+                                "zone_name": zn(d.zone_id),
                                 "dorm_id": d.id, "dorm_name": d.name,
                                 "label": d.name})
             return out
 
         if scope == "beds":
             for bid in loc.get("bed_uids") or []:
-                b = await self.session.get(Bed, _uid(bid))
+                b = st["by_id"]["bed"].get(_uid(bid))
                 if b:
-                    d = await self.session.get(Dorm, b.dorm_id)
+                    d = st["by_id"]["dorm"].get(b.dorm_id)
                     out.append({"key": f"bed:{b.id}",
                                 "zone_id": d.zone_id if d else None,
-                                "zone_name": await zname(d.zone_id) if d else None,
+                                "zone_name": zn(d.zone_id) if d else None,
                                 "dorm_id": b.dorm_id,
                                 "dorm_name": d.name if d else None,
                                 "bed_id": b.id, "bed_number": b.bed_number,
