@@ -1,0 +1,6 @@
+{
+  "name": "Management Tool",
+  "description": "Role-based property operations management platform featuring spatial zone boards, room and dorm bed tracking, employee allocation, and multi-tier workspaces.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

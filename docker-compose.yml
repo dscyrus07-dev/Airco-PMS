@@ -1,0 +1,108 @@
+# Development / staging stack — `docker compose up --build` brings up the
+# whole system: Postgres, Redis, migrations, API, arq worker, and the
+# nginx-fronted SPA on http://localhost:8080.
+#
+# Postgres here is a LOCAL dev database. Production points DATABASE_URL at
+# managed Postgres (e.g. Supabase) — see docker-compose.prod.yml.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-mgmt}
+      POSTGRES_USER: ${POSTGRES_USER:-mgmt}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mgmt-dev-password}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  migrate:
+    build: ./backend
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-mgmt}:${POSTGRES_PASSWORD:-mgmt-dev-password}@postgres:5432/${POSTGRES_DB:-mgmt}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build: ./backend
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-mgmt}:${POSTGRES_PASSWORD:-mgmt-dev-password}@postgres:5432/${POSTGRES_DB:-mgmt}
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-dev-only-insecure-secret-change-me}
+      CORS_ORIGINS: http://localhost:8080
+      STORAGE_BACKEND: local
+      UPLOAD_DIR: /data/uploads
+      # the worker owns scheduled generation in this stack
+      RUN_EMBEDDED_SCHEDULER: "false"
+      SQL_ECHO: "false"
+    volumes:
+      - uploads:/data/uploads
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build: ./backend
+    command: ["arq", "app.workers.settings.WorkerSettings"]
+    # the image's /health HTTP check doesn't apply — the worker has no
+    # listener; probe the arq process + its Redis connection instead
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import sys;sys.exit(0 if b'arq' in open('/proc/1/cmdline','rb').read() else 1)" &&
+          python -c "import asyncio,sys;from app.core.redis import check_redis;sys.exit(0 if asyncio.run(check_redis()) else 1)"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-mgmt}:${POSTGRES_PASSWORD:-mgmt-dev-password}@postgres:5432/${POSTGRES_DB:-mgmt}
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-dev-only-insecure-secret-change-me}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: /api/v1
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:
+  uploads:

@@ -1,0 +1,80 @@
+# Production stack — API + worker + nginx-fronted SPA.
+#
+# External dependencies are managed infrastructure, NOT containers here:
+#   DATABASE_URL   → managed PostgreSQL (e.g. Supabase / RDS / Cloud SQL)
+#   REDIS_URL      → managed Redis (e.g. Upstash / ElastiCache)
+#   S3_*           → object storage for uploads (S3 / Supabase Storage)
+#
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# Migrations are a deliberate deploy step, not a side effect of boot:
+#   docker compose -f docker-compose.prod.yml run --rm api alembic upgrade head
+
+services:
+  api:
+    build: ./backend
+    image: mgmt-tool-api:latest
+    environment:
+      APP_ENV: production
+      DEBUG: "false"
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in the environment or .env}
+      REDIS_URL: ${REDIS_URL:?set REDIS_URL}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?set JWT_SECRET_KEY}
+      CORS_ORIGINS: ${CORS_ORIGINS:?set CORS_ORIGINS}
+      RUN_EMBEDDED_SCHEDULER: "false"
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-s3}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-}
+      S3_PUBLIC_BASE_URL: ${S3_PUBLIC_BASE_URL:-}
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    # scale with: docker compose up -d --scale api=3
+
+  worker:
+    build: ./backend
+    image: mgmt-tool-api:latest
+    command: ["arq", "app.workers.settings.WorkerSettings"]
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import sys;sys.exit(0 if b'arq' in open('/proc/1/cmdline','rb').read() else 1)" &&
+          python -c "import asyncio,sys;from app.core.redis import check_redis;sys.exit(0 if asyncio.run(check_redis()) else 1)"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    environment:
+      APP_ENV: production
+      DEBUG: "false"
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    # scale with: --scale worker=N — cron ticks self-dedupe via Redis lock
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: /api/v1
+    image: mgmt-tool-web:latest
+    ports:
+      - "${HTTP_PORT:-80}:80"
+    depends_on:
+      - api
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 128M
