@@ -31,6 +31,14 @@ class Task(Base):
         Uuid, ForeignKey("rooms.id", ondelete="SET NULL"), nullable=True, index=True
     )
     room_number: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Dorm/bed linkage — mirrors MaintenanceTicket: one task can cover a whole
+    # dorm or a subset of its beds. bed_ids holds uuid strings (JSON so it is
+    # portable across postgres and sqlite).
+    dorm_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("dorms.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    dorm_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    bed_ids: Mapped[list | None] = mapped_column(JSON, nullable=True)
     supervisor_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid, ForeignKey("employees.id", ondelete="SET NULL"), nullable=True, index=True
     )

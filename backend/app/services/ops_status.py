@@ -4,7 +4,7 @@ A room/bed/dorm's operational status is DERIVED from active work, never set
 in isolation:
 
     blocking maintenance ticket  → "maintenance"
-    blocking operational task    → "cleaning"      (room targets only)
+    blocking operational task    → "cleaning"      (rooms + covered beds)
     nothing blocking             → release_to ("available" or "cleaning")
 
 Rules that make this safe:
@@ -67,20 +67,40 @@ class OpsStatusService:
         )).all()
         return {"maintenance": maint, "tasks": tasks}
 
-    async def _bed_blocked(self, bed_id: uuid.UUID, dorm_id: uuid.UUID) -> bool:
+    async def _bed_blockers(self, bed_id: uuid.UUID, dorm_id: uuid.UUID) -> dict:
+        """Separate maintenance vs operational-task blockers — a bed held by
+        open cleaning work stays 'cleaning', not 'maintenance'."""
+        # dorm_id is set on bed-level tickets too (location context) — only a
+        # ticket with bed_id NULL is a dorm-level block on every bed.
         res = await self.session.execute(
             select(MaintenanceTicket.id).where(
                 MaintenanceTicket.status.in_(BLOCKING_MAINTENANCE),
                 (MaintenanceTicket.bed_id == bed_id)
-                | (MaintenanceTicket.dorm_id == dorm_id),
+                | (
+                    (MaintenanceTicket.dorm_id == dorm_id)
+                    & MaintenanceTicket.bed_id.is_(None)
+                ),
             ).limit(1)
         )
-        return res.scalar_one_or_none() is not None
+        maint = res.scalar_one_or_none() is not None
+        # Open operational task covering this bed — Task.bed_ids lists the
+        # beds a dorm task was raised for (NULL/empty = whole dorm). The
+        # candidate set per dorm is small, so membership is checked in Python
+        # instead of a dialect-specific JSON containment query.
+        res = await self.session.execute(
+            select(Task.bed_ids).where(
+                Task.dorm_id == dorm_id,
+                Task.status.in_(BLOCKING_TASK),
+            )
+        )
+        task = any(not ids or str(bed_id) in ids for ids in res.scalars())
+        return {"maintenance": maint, "task": task}
 
     async def _dorm_blocked(self, dorm_id: uuid.UUID) -> bool:
         res = await self.session.execute(
             select(MaintenanceTicket.id).where(
                 MaintenanceTicket.dorm_id == dorm_id,
+                MaintenanceTicket.bed_id.is_(None),
                 MaintenanceTicket.status.in_(BLOCKING_MAINTENANCE),
             ).limit(1)
         )
@@ -139,8 +159,13 @@ class OpsStatusService:
         bed = res.scalar_one_or_none()
         if bed is None or bed.status not in TRANSITIONABLE:
             return None
-        target = "maintenance" if await self._bed_blocked(bed.id, bed.dorm_id) \
-            else release_to
+        blockers = await self._bed_blockers(bed.id, bed.dorm_id)
+        if blockers["maintenance"]:
+            target = "maintenance"
+        elif blockers["task"]:
+            target = "cleaning"
+        else:
+            target = release_to
         if bed.status == target:
             return None
         prev, bed.status = bed.status, target
@@ -175,9 +200,14 @@ class OpsStatusService:
         )
         for b in res.scalars():
             if b.status in TRANSITIONABLE and b.status != target:
-                if await self._bed_blocked(b.id, dorm.id):
+                blockers = await self._bed_blockers(b.id, dorm.id)
+                if blockers["maintenance"]:
                     continue  # bed-level ticket still blocks this bed
-                b.status = target
+                # remaining open task work holds the bed in 'cleaning'
+                bed_target = "cleaning" if blockers["task"] else target
+                if b.status == bed_target:
+                    continue
+                b.status = bed_target
                 changed.append(f"bed {b.bed_number}")
         if changed and audit is not None:
             audit(f"Dorm {dorm.name}: → {target} ({trigger}); "

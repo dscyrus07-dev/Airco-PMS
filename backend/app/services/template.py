@@ -653,6 +653,8 @@ class TemplateService:
             ticket_number=num, property_id=t.property_id,
             zone_id=tgt["zone_id"], room_id=tgt.get("room_id"),
             room_number=tgt.get("room_number"),
+            dorm_id=tgt.get("dorm_id"), dorm_name=tgt.get("dorm_name"),
+            bed_ids=[str(tgt["bed_id"])] if tgt.get("bed_id") else None,
             supervisor_id=sup_uid, supervisor_name=sup_name,
             employee_id=emp_id, assigned_to_name=emp_name,
             title=t.name, description=t.description,

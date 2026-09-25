@@ -617,14 +617,20 @@ export const ZoneWorkspace: React.FC<ZoneWorkspaceProps> = ({ zone, onBack }) =>
             ) : (
               <div className="space-y-4">
                 {zoneDorms.map((dorm) => {
-                  const dormBedUids = dorm.beds.map((b) => b.bed_uid);
+                  // Only active beds participate in dorm-level selection —
+                  // 'inactive' bunks are kept for history, not actionable.
+                  const selectableBeds = dorm.beds.filter((b) => b.status !== 'inactive');
+                  const dormBedUids = selectableBeds.map((b) => b.bed_uid);
                   const selectedBedsInDorm = dormBedUids.filter((id) =>
                     selectedBedUids.includes(id)
                   );
                   const allBedsInDormSelected =
-                    dorm.beds.length > 0 && selectedBedsInDorm.length === dorm.beds.length;
+                    selectableBeds.length > 0 &&
+                    selectedBedsInDorm.length === selectableBeds.length;
+                  const someBedsInDormSelected = selectedBedsInDorm.length > 0;
 
                   const toggleSelectAllDormBeds = () => {
+                    if (selectableBeds.length === 0) return;
                     if (allBedsInDormSelected) {
                       setSelectedBedUids((prev) =>
                         prev.filter((id) => !dormBedUids.includes(id))
@@ -664,17 +670,35 @@ export const ZoneWorkspace: React.FC<ZoneWorkspaceProps> = ({ zone, onBack }) =>
 
                         {/* Dorm Quick Select & Direct Actions */}
                         <div className="flex items-center gap-2 flex-wrap">
-                          <button
-                            type="button"
-                            onClick={toggleSelectAllDormBeds}
-                            className={`text-xs px-2.5 py-1 rounded-[8px] border font-medium transition-colors cursor-pointer ${
-                              allBedsInDormSelected
-                                ? 'bg-[#386641] text-white border-[#386641]'
-                                : 'bg-[#FAF8F5] text-[#555047] border-[#DDD7CB] hover:bg-[#F2ECE3]'
+                          <label
+                            className={`inline-flex items-center gap-2 px-2.5 py-1.5 rounded-[8px] border text-xs font-medium transition-colors select-none ${
+                              selectableBeds.length === 0
+                                ? 'opacity-50 cursor-not-allowed bg-[#FAF8F5] border-[#DDD7CB] text-[#8C867C]'
+                                : allBedsInDormSelected
+                                ? 'cursor-pointer bg-[#EDF4EE] border-[#386641] text-[#244E2C]'
+                                : 'cursor-pointer bg-[#FAF8F5] border-[#DDD7CB] text-[#555047] hover:bg-[#F2ECE3]'
                             }`}
+                            title={
+                              selectableBeds.length === 0
+                                ? 'No active beds in this dorm'
+                                : 'Select every active bed in this dorm'
+                            }
                           >
-                            {allBedsInDormSelected ? 'Deselect All Beds' : 'Select All Beds'}
-                          </button>
+                            <input
+                              type="checkbox"
+                              checked={allBedsInDormSelected}
+                              disabled={selectableBeds.length === 0}
+                              ref={(el) => {
+                                if (el) {
+                                  el.indeterminate =
+                                    someBedsInDormSelected && !allBedsInDormSelected;
+                                }
+                              }}
+                              onChange={toggleSelectAllDormBeds}
+                              className="accent-[#386641] w-3.5 h-3.5 cursor-pointer disabled:cursor-not-allowed"
+                            />
+                            Select Entire Dorm
+                          </label>
 
                           <Button
                             variant="outline"
@@ -723,13 +747,14 @@ export const ZoneWorkspace: React.FC<ZoneWorkspaceProps> = ({ zone, onBack }) =>
                           </span>
                           {selectedBedsInDorm.length > 0 && (
                             <span className="text-xs font-semibold text-[#386641]">
-                              {selectedBedsInDorm.length}/{dorm.beds.length} beds selected
+                              {selectedBedsInDorm.length}/{selectableBeds.length} beds selected
                             </span>
                           )}
                         </div>
 
                         <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
                           {dorm.beds.map((bed) => {
+                            const isBedSelectable = bed.status !== 'inactive';
                             const isBedSelected = selectedBedUids.includes(bed.bed_uid);
 
                             let tileBg = 'bg-[#EBF3EC] border-[#CFE4D1] text-[#244E2C]';
@@ -739,17 +764,26 @@ export const ZoneWorkspace: React.FC<ZoneWorkspaceProps> = ({ zone, onBack }) =>
                               tileBg = 'bg-[#FEF3E8] border-[#FCD9BD] text-[#8C3F03]';
                             } else if (bed.status === 'maintenance') {
                               tileBg = 'bg-[#FDF1F1] border-[#F0C8C8] text-[#7C2323]';
+                            } else if (bed.status === 'inactive') {
+                              tileBg = 'bg-[#F3EFE9] border-[#E2DDD5] text-[#8C867C]';
                             }
 
                             return (
                               <div
                                 key={bed.bed_uid}
-                                onClick={() => toggleBedSelection(bed.bed_uid)}
-                                className={`p-2.5 rounded-[12px] border ${tileBg} cursor-pointer hover:shadow-xs transition-all select-none relative ${
+                                onClick={() => {
+                                  if (isBedSelectable) toggleBedSelection(bed.bed_uid);
+                                }}
+                                className={`p-2.5 rounded-[12px] border ${tileBg} transition-all select-none relative ${
+                                  isBedSelectable
+                                    ? 'cursor-pointer hover:shadow-xs'
+                                    : 'cursor-not-allowed opacity-75'
+                                } ${
                                   isBedSelected
                                     ? 'ring-2 ring-[#386641] border-[#386641] shadow-xs'
                                     : ''
                                 }`}
+                                title={isBedSelectable ? undefined : 'Inactive bed — not selectable'}
                               >
                                 <div className="flex items-center justify-between text-xs font-semibold">
                                   <span>{bed.bed_number}</span>
@@ -757,16 +791,25 @@ export const ZoneWorkspace: React.FC<ZoneWorkspaceProps> = ({ zone, onBack }) =>
                                   {/* Selection Checkbox */}
                                   <button
                                     type="button"
+                                    disabled={!isBedSelectable}
                                     onClick={(e) => {
                                       e.stopPropagation();
-                                      toggleBedSelection(bed.bed_uid);
+                                      if (isBedSelectable) toggleBedSelection(bed.bed_uid);
                                     }}
-                                    className={`w-4 h-4 rounded-[4px] border flex items-center justify-center transition-all cursor-pointer ${
-                                      isBedSelected
-                                        ? 'bg-[#386641] border-[#386641] text-white'
-                                        : 'bg-white/80 border-[#DDD7CB] text-transparent hover:border-[#386641]'
+                                    className={`w-4 h-4 rounded-[4px] border flex items-center justify-center transition-all ${
+                                      !isBedSelectable
+                                        ? 'cursor-not-allowed bg-[#EBE5DB] border-[#DDD7CB] text-transparent'
+                                        : isBedSelected
+                                        ? 'cursor-pointer bg-[#386641] border-[#386641] text-white'
+                                        : 'cursor-pointer bg-white/80 border-[#DDD7CB] text-transparent hover:border-[#386641]'
                                     }`}
-                                    title={isBedSelected ? 'Deselect bed' : 'Select bed'}
+                                    title={
+                                      !isBedSelectable
+                                        ? 'Inactive bed'
+                                        : isBedSelected
+                                        ? 'Deselect bed'
+                                        : 'Select bed'
+                                    }
                                   >
                                     <Check className="w-3 h-3" strokeWidth={3} />
                                   </button>

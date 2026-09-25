@@ -8,6 +8,7 @@ import {
   LogOut,
   Trash2,
   Filter,
+  Check,
   CheckCircle2,
   Clock,
   Wrench,
@@ -21,7 +22,7 @@ import { CreateRoomModal } from './CreateRoomModal';
 import { BulkCreateRoomsModal } from './BulkCreateRoomsModal';
 import { CreateDormModal } from './CreateDormModal';
 import { UnitZoneBoard } from './UnitZoneBoard';
-import { CreateMaintenanceModal } from '../maintenance/CreateMaintenanceModal';
+import { CreateMaintenanceModal, MaintenanceTarget } from '../maintenance/CreateMaintenanceModal';
 import { ConfirmationDialog } from '../ui/ConfirmationDialog';
 import { Room, Dorm, BedStatus, RoomStatus, MaintenanceTicket } from '../../types';
 import { zoneSupportsUnits } from '../../lib/zoneUtils';
@@ -60,6 +61,20 @@ export const RoomsDormsView: React.FC = () => {
 
   // Maintenance ticket modal — Maint click opens the form, not a status flip
   const [maintenanceRoom, setMaintenanceRoom] = useState<Room | null>(null);
+
+  // Bed multi-select — batch checkout / cleaning / maintenance on picked beds
+  const [selectedBeds, setSelectedBeds] = useState<Set<string>>(new Set());
+  const [bedMaintenanceTargets, setBedMaintenanceTargets] =
+    useState<MaintenanceTarget[] | null>(null);
+
+  const toggleBedSelected = (bed_uid: string) => {
+    setSelectedBeds((prev) => {
+      const next = new Set(prev);
+      if (next.has(bed_uid)) next.delete(bed_uid);
+      else next.add(bed_uid);
+      return next;
+    });
+  };
 
   // room_uid → active ticket map — avoids scanning all tickets per card
   const ticketsByRoom = useMemo(() => {
@@ -349,7 +364,9 @@ export const RoomsDormsView: React.FC = () => {
                       <div className="grid grid-cols-4 gap-1">
                         <button
                           type="button"
-                          onClick={() => updateRoomStatus(room.room_uid, 'available')}
+                          onClick={() =>
+                            bulkUpdateUnits({ action: 'available', roomUids: [room.room_uid] })
+                          }
                           className={`py-1 rounded-[6px] text-[10px] font-semibold transition-all cursor-pointer text-center ${
                             room.status === 'available'
                               ? 'bg-[#386641] text-white shadow-xs'
@@ -371,7 +388,9 @@ export const RoomsDormsView: React.FC = () => {
                         </button>
                         <button
                           type="button"
-                          onClick={() => updateRoomStatus(room.room_uid, 'cleaning')}
+                          onClick={() =>
+                            bulkUpdateUnits({ action: 'cleaning', roomUids: [room.room_uid] })
+                          }
                           className={`py-1 rounded-[6px] text-[10px] font-semibold transition-all cursor-pointer text-center ${
                             room.status === 'cleaning'
                               ? 'bg-[#D97706] text-white shadow-xs'
@@ -429,6 +448,46 @@ export const RoomsDormsView: React.FC = () => {
                 const occupiedCount = dorm.beds.filter((b) => b.status === 'occupied').length;
                 const availableCount = dorm.beds.filter((b) => b.status === 'available').length;
                 const cleaningCount = dorm.beds.filter((b) => b.status === 'cleaning').length;
+                const maintenanceCount = dorm.beds.filter((b) => b.status === 'maintenance').length;
+
+                const selectableBeds = dorm.beds.filter((b) => b.status !== 'inactive');
+                const selectedInDorm = selectableBeds.filter((b) => selectedBeds.has(b.bed_uid));
+                const allBedsSelected =
+                  selectableBeds.length > 0 && selectedInDorm.length === selectableBeds.length;
+
+                const toggleAllBeds = () =>
+                  setSelectedBeds((prev) => {
+                    if (selectableBeds.length === 0) return prev;
+                    const next = new Set(prev);
+                    selectableBeds.forEach((b) =>
+                      allBedsSelected ? next.delete(b.bed_uid) : next.add(b.bed_uid)
+                    );
+                    return next;
+                  });
+
+                const runBedAction = async (action: 'checkout' | 'cleaning' | 'available') => {
+                  const uids = selectedInDorm.map((b) => b.bed_uid);
+                  await bulkUpdateUnits({ action, bedUids: uids });
+                  setSelectedBeds((prev) => {
+                    const next = new Set(prev);
+                    uids.forEach((u) => next.delete(u));
+                    return next;
+                  });
+                };
+
+                const openBedMaintenance = () => {
+                  // Whole dorm selected → ONE dorm-level ticket (flags every
+                  // non-occupied bed); partial selection → a ticket per bed.
+                  const targets: MaintenanceTarget[] = allBedsSelected
+                    ? [{ kind: 'dorm', dorm }]
+                    : selectedInDorm.map((b) => ({ kind: 'bed' as const, dorm, bed: b }));
+                  setBedMaintenanceTargets(targets);
+                  setSelectedBeds((prev) => {
+                    const next = new Set(prev);
+                    selectedInDorm.forEach((b) => next.delete(b.bed_uid));
+                    return next;
+                  });
+                };
 
                 return (
                   <Card key={dorm.dorm_uid} className="p-5">
@@ -436,6 +495,27 @@ export const RoomsDormsView: React.FC = () => {
                     <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 pb-4 border-b border-[#F2ECE3]">
                       <div>
                         <div className="flex items-center gap-2 flex-wrap">
+                          <input
+                            type="checkbox"
+                            checked={allBedsSelected}
+                            disabled={selectableBeds.length === 0}
+                            ref={(el) => {
+                              if (el) {
+                                el.indeterminate =
+                                  selectedInDorm.length > 0 && !allBedsSelected;
+                              }
+                            }}
+                            onChange={toggleAllBeds}
+                            className="accent-[#386641] w-4 h-4 cursor-pointer shrink-0 disabled:cursor-not-allowed disabled:opacity-50"
+                            title={
+                              selectableBeds.length === 0
+                                ? 'No active beds in this dorm'
+                                : allBedsSelected
+                                ? 'Deselect all beds'
+                                : 'Select whole dorm'
+                            }
+                            aria-label={`Select all beds in ${dorm.name}`}
+                          />
                           <h3 className="font-display font-bold text-xl text-[#24221F]">
                             {dorm.name}
                           </h3>
@@ -445,6 +525,11 @@ export const RoomsDormsView: React.FC = () => {
                           <Badge variant="neutral" size="sm">
                             {dorm.washroom}
                           </Badge>
+                          {dorm.status === 'maintenance' && (
+                            <Badge variant="red" size="sm">
+                              Maintenance
+                            </Badge>
+                          )}
                           <span className="text-xs font-mono text-[#8C867C] px-1.5 py-0.5 rounded bg-[#FAF8F5] border border-[#EAE5DC]">
                             {dorm.dorm_uid}
                           </span>
@@ -519,30 +604,150 @@ export const RoomsDormsView: React.FC = () => {
                           <span className="w-2 h-2 rounded-full bg-[#D97706]" />
                           <span>{cleaningCount} Cleaning</span>
                         </span>
+                        <span className="inline-flex items-center gap-1 font-medium text-[#A32A2A]">
+                          <span className="w-2 h-2 rounded-full bg-[#C53B3B]" />
+                          <span>{maintenanceCount} Maintenance</span>
+                        </span>
                       </div>
-                      <span className="text-[11px] text-[#8C867C]">
-                        Use each bed's Clean / Check out action to change its status
-                      </span>
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <label className="flex items-center gap-1.5 cursor-pointer font-medium text-[#555047] select-none">
+                          <input
+                            type="checkbox"
+                            checked={allBedsSelected}
+                            disabled={selectableBeds.length === 0}
+                            ref={(el) => {
+                              if (el) {
+                                el.indeterminate =
+                                  selectedInDorm.length > 0 && !allBedsSelected;
+                              }
+                            }}
+                            onChange={toggleAllBeds}
+                            className="accent-[#386641] w-3.5 h-3.5 cursor-pointer disabled:cursor-not-allowed"
+                          />
+                          All beds
+                        </label>
+                        {selectedInDorm.length > 0 ? (
+                          <>
+                            <span className="text-[#D8D2C7]">|</span>
+                            <span className="font-semibold text-[#24221F]">
+                              {allBedsSelected
+                                ? 'Whole dorm selected'
+                                : `${selectedInDorm.length} selected`}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => runBedAction('checkout')}
+                              className="px-2 py-1 rounded-[7px] text-[11px] font-semibold bg-[#EEF2F6] text-[#1E3A56] hover:bg-[#DFE9F4] transition-colors cursor-pointer"
+                              title="Check out selected beds — flags them for cleaning"
+                            >
+                              Check out
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => runBedAction('cleaning')}
+                              className="px-2 py-1 rounded-[7px] text-[11px] font-semibold bg-[#FEF3E8] text-[#8C3F03] hover:bg-[#FBE8D2] transition-colors cursor-pointer"
+                              title="Queue selected beds for housekeeping"
+                            >
+                              Send to cleaning
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => runBedAction('available')}
+                              className="px-2 py-1 rounded-[7px] text-[11px] font-semibold bg-[#EBF3EC] text-[#244E2C] hover:bg-[#DCEBDE] transition-colors cursor-pointer"
+                              title="Mark selected beds cleaned and available"
+                            >
+                              Mark cleaned
+                            </button>
+                            <button
+                              type="button"
+                              onClick={openBedMaintenance}
+                              className="px-2 py-1 rounded-[7px] text-[11px] font-semibold bg-[#FDE8E8] text-[#A32A2A] hover:bg-[#FBDCDC] transition-colors cursor-pointer"
+                              title={
+                                allBedsSelected
+                                  ? 'Raise one maintenance ticket for the whole dorm'
+                                  : 'Raise a maintenance ticket per selected bed'
+                              }
+                            >
+                              Maintenance
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setSelectedBeds((prev) => {
+                                  const next = new Set(prev);
+                                  selectedInDorm.forEach((b) => next.delete(b.bed_uid));
+                                  return next;
+                                })
+                              }
+                              className="px-2 py-1 rounded-[7px] text-[11px] font-semibold text-[#8C867C] hover:text-[#24221F] transition-colors cursor-pointer"
+                              title="Clear selection"
+                            >
+                              Clear
+                            </button>
+                          </>
+                        ) : (
+                          <span className="text-[11px] text-[#8C867C]">
+                            Click beds to select them for batch cleaning, checkout or maintenance
+                          </span>
+                        )}
+                      </div>
                     </div>
 
                     {/* Individual Beds Visual Grid (per spec: visually distinct tiles/cards, NEVER a plain table) */}
                     <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-8 gap-2.5 pt-2">
                       {dorm.beds.map((bed) => {
+                        const isSelected = selectedBeds.has(bed.bed_uid);
                         let tileBg = 'bg-[#EBF3EC] border-[#CFE4D1] text-[#244E2C]';
                         if (bed.status === 'occupied') {
                           tileBg = 'bg-[#EEF2F6] border-[#CFDCEB] text-[#1E3A56]';
                         } else if (bed.status === 'cleaning') {
                           tileBg = 'bg-[#FEF3E8] border-[#FCD9BD] text-[#8C3F03]';
+                        } else if (bed.status === 'maintenance') {
+                          tileBg = 'bg-[#FDE8E8] border-[#F9C3C3] text-[#A32A2A]';
+                        } else if (bed.status === 'inactive') {
+                          tileBg = 'bg-[#F3EFE9] border-[#E2DDD5] text-[#8C867C]';
                         }
+
+                        const isBedSelectable = bed.status !== 'inactive';
 
                         return (
                           <div
                             key={bed.bed_uid}
-                            className={`p-3 rounded-[12px] border ${tileBg} select-none`}
-                            title={`Bed ${bed.bed_number}: ${bed.status}`}
+                            onClick={() => {
+                              if (isBedSelectable) toggleBedSelected(bed.bed_uid);
+                            }}
+                            className={`p-3 rounded-[12px] border ${tileBg} select-none transition-shadow ${
+                              isBedSelectable ? 'cursor-pointer' : 'cursor-not-allowed opacity-75'
+                            } ${
+                              isSelected
+                                ? 'ring-2 ring-[#386641] ring-offset-1 ring-offset-white'
+                                : isBedSelectable
+                                ? 'hover:shadow-xs'
+                                : ''
+                            }`}
+                            title={
+                              isBedSelectable
+                                ? `Bed ${bed.bed_number}: ${bed.status} — click to ${
+                                    isSelected ? 'deselect' : 'select'
+                                  }`
+                                : `Bed ${bed.bed_number}: inactive — not selectable`
+                            }
                           >
                             <div className="flex items-center justify-between text-xs font-bold">
-                              <span>{bed.bed_number}</span>
+                              <span className="flex items-center gap-1.5">
+                                <span
+                                  className={`w-3.5 h-3.5 rounded-[4px] border flex items-center justify-center shrink-0 transition-colors ${
+                                    isSelected
+                                      ? 'bg-[#386641] border-[#386641] text-white'
+                                      : 'border-current/40 bg-white/60'
+                                  }`}
+                                >
+                                  {isSelected && (
+                                    <Check className="w-2.5 h-2.5" strokeWidth={3.5} />
+                                  )}
+                                </span>
+                                {bed.bed_number}
+                              </span>
                               <span className="w-2 h-2 rounded-full bg-current" />
                             </div>
                             <span className="text-[11px] font-semibold capitalize block mt-1">
@@ -556,14 +761,15 @@ export const RoomsDormsView: React.FC = () => {
                               <span className="text-[9px] opacity-60 block mt-0.5">Vacant</span>
                             )}
 
-                            {/* Explicit status actions only — clicking the tile itself does nothing */}
+                            {/* Tile click = select; status changes stay on these explicit actions */}
                             <div className="mt-1.5 pt-1.5 border-t border-current/10 flex items-center justify-end">
                               {bed.status === 'occupied' ? (
                                 <button
                                   type="button"
-                                  onClick={() =>
-                                    bulkUpdateUnits({ action: 'checkout', bedUids: [bed.bed_uid] })
-                                  }
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    bulkUpdateUnits({ action: 'checkout', bedUids: [bed.bed_uid] });
+                                  }}
                                   className="text-[9px] font-semibold hover:underline cursor-pointer"
                                   title="Check out this bed"
                                 >
@@ -572,12 +778,13 @@ export const RoomsDormsView: React.FC = () => {
                               ) : (
                                 <button
                                   type="button"
-                                  onClick={() =>
+                                  onClick={(e) => {
+                                    e.stopPropagation();
                                     bulkUpdateUnits({
                                       action: bed.status === 'cleaning' ? 'available' : 'cleaning',
                                       bedUids: [bed.bed_uid],
-                                    })
-                                  }
+                                    });
+                                  }}
                                   className="text-[9px] font-semibold hover:underline cursor-pointer"
                                   title={
                                     bed.status === 'cleaning'
@@ -650,6 +857,19 @@ export const RoomsDormsView: React.FC = () => {
           onClose={() => setMaintenanceRoom(null)}
           onViewTicket={() => {
             setMaintenanceRoom(null);
+            navigate(`/property/${activeProperty?.property_uid}/maintenance`);
+          }}
+        />
+      )}
+
+      {/* Batch maintenance for selected beds — one ticket per bed */}
+      {bedMaintenanceTargets && (
+        <CreateMaintenanceModal
+          targets={bedMaintenanceTargets}
+          activeTicket={null}
+          onClose={() => setBedMaintenanceTargets(null)}
+          onViewTicket={() => {
+            setBedMaintenanceTargets(null);
             navigate(`/property/${activeProperty?.property_uid}/maintenance`);
           }}
         />

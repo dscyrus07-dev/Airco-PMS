@@ -5,7 +5,7 @@ Rules under test:
   - employee submit does NOT free the room; supervisor approve does
   - a room with other blocking work never goes to 'available'
   - maintenance batches group by room (same room → same employee)
-  - resolve doesn't release; close (acknowledgement) releases to cleaning
+  - resolve doesn't release; close (acknowledgement) releases to available
 """
 
 import uuid
@@ -261,11 +261,11 @@ async def test_maintenance_resolve_blocks_until_supervisor_close(client):
     assert res.status_code == 200
     assert await _room_status(client, h, room["room_uid"]) == "maintenance"
 
-    # supervisor closes (acknowledges) → post-maintenance → cleaning
+    # supervisor closes (acknowledges) → unit back to available
     res = await client.post(f"/api/v1/maintenance/{t['ticket_uid']}/close",
                             headers=h)
     assert res.status_code == 200
-    assert await _room_status(client, h, room["room_uid"]) == "cleaning"
+    assert await _room_status(client, h, room["room_uid"]) == "available"
 
 
 async def test_partial_maintenance_close_keeps_room_blocked(client):
@@ -295,10 +295,10 @@ async def test_partial_maintenance_close_keeps_room_blocked(client):
                       headers=h)
     assert await _room_status(client, h, room["room_uid"]) == "maintenance"
 
-    # close the last blocker → derives to cleaning (post-maintenance)
+    # close the last blocker → unit released to available
     await client.post(f"/api/v1/maintenance/{t2['ticket_uid']}/close",
                       headers=h)
-    assert await _room_status(client, h, room["room_uid"]) == "cleaning"
+    assert await _room_status(client, h, room["room_uid"]) == "available"
 
 
 # ---------------------------------------------------------------------------
@@ -478,13 +478,13 @@ async def test_maintenance_pending_check_and_disapprove(client):
     assert res.json()["count"] == 0
     assert await _room_status(client, h, room["room_uid"]) == "maintenance"
 
-    # rework → resubmit → approve (close) → cleaning
+    # rework → resubmit → approve (close) → available
     await client.post(f"/api/v1/maintenance/{t['ticket_uid']}/resolve",
                       headers=h, json={"resolution_notes": "fixed again",
                                        "photo_urls": []})
     await client.post(f"/api/v1/maintenance/{t['ticket_uid']}/close",
                       headers=h)
-    assert await _room_status(client, h, room["room_uid"]) == "cleaning"
+    assert await _room_status(client, h, room["room_uid"]) == "available"
 
 
 async def test_employee_cannot_bypass_review_via_complete(client):

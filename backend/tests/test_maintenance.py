@@ -67,9 +67,9 @@ async def test_maintenance_ticket_lifecycle(client, admin, prop):
     assert res.json()["status"] == "closed"
     assert res.json()["closed_at"]
 
-    # room is no longer maintenance (goes to cleaning post-work)
+    # room is released back to available once the work is approved
     res = await client.get("/api/v1/rooms", headers=h)
-    assert res.json()["items"][0]["status"] == "cleaning"
+    assert res.json()["items"][0]["status"] == "available"
 
     # timeline captured every step
     res = await client.get(f"/api/v1/maintenance/{t['ticket_uid']}", headers=h)

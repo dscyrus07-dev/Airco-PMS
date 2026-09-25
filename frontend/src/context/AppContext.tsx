@@ -321,6 +321,14 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     void loadWorkspace();
   }, [loadWorkspace]);
 
+  // Approving/rejecting/reopening work re-derives unit statuses server-side
+  // (bed released to available, room back to cleaning, ...) — the local
+  // rooms/dorms lists must be re-pulled or the UI shows stale states.
+  const refreshUnits = useCallback(() => {
+    void roomsApi.listRooms().then((r) => setRooms(r.items)).catch(() => {});
+    void dormsApi.listDorms().then((d) => setDorms(d.items)).catch(() => {});
+  }, []);
+
   // -------------------------------------------------------------------
   // Session bootstrap: token present → GET /auth/me → load workspace
   // -------------------------------------------------------------------
@@ -1371,6 +1379,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
           if (res.generated_task) next.unshift(res.generated_task);
           return next;
         });
+        if (res.task.room_uid || res.task.dorm_uid) refreshUnits();
         addToast({
           type: 'success',
           title: 'Task Completed',
@@ -1386,7 +1395,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         });
       }
     },
-    [addToast]
+    [addToast, refreshUnits]
   );
 
   const requestTaskRedo = useCallback(
@@ -1394,6 +1403,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       try {
         const updated = await tasksApi.requestTaskRedo(task_uid, note);
         setTasks((prev) => prev.map((t) => (t.task_uid === task_uid ? updated : t)));
+        if (updated.room_uid || updated.dorm_uid) refreshUnits();
         addToast({
           type: 'warning',
           title: 'Redo Requested',
@@ -1407,7 +1417,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         });
       }
     },
-    [addToast]
+    [addToast, refreshUnits]
   );
 
   const reassignTask = useCallback(
@@ -1467,6 +1477,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
           if (res.generated_task) next.unshift(res.generated_task);
           return next;
         });
+        if (res.task.room_uid || res.task.dorm_uid) refreshUnits();
         addToast({ type: 'success', title: 'Task Approved', description: 'Marked completed.' });
       } catch (err) {
         addToast({
@@ -1476,7 +1487,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         });
       }
     },
-    [addToast]
+    [addToast, refreshUnits]
   );
 
   const rejectTask = useCallback(
@@ -1484,6 +1495,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       try {
         const updated = await tasksApi.rejectTask(task_uid, reason);
         setTasks((prev) => prev.map((t) => (t.task_uid === task_uid ? updated : t)));
+        if (updated.room_uid || updated.dorm_uid) refreshUnits();
         addToast({ type: 'warning', title: 'Task Rejected', description: 'Reopened for the assignee.' });
       } catch (err) {
         addToast({
@@ -1493,7 +1505,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         });
       }
     },
-    [addToast]
+    [addToast, refreshUnits]
   );
 
   const reopenTask = useCallback(
@@ -1501,6 +1513,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       try {
         const updated = await tasksApi.reopenTask(task_uid, note);
         setTasks((prev) => prev.map((t) => (t.task_uid === task_uid ? updated : t)));
+        if (updated.room_uid || updated.dorm_uid) refreshUnits();
         addToast({ type: 'info', title: 'Task Reopened' });
       } catch (err) {
         addToast({
@@ -1510,7 +1523,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         });
       }
     },
-    [addToast]
+    [addToast, refreshUnits]
   );
 
   // -------------------------------------------------------------------
@@ -1556,7 +1569,11 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       for (const t of allTickets) _upsertTicket(t);
       const roomIds = new Set(allTickets.map((t) => t.room_uid).filter(Boolean));
       const bedIds = new Set(allTickets.map((t) => t.bed_uid).filter(Boolean));
-      const dormIds = new Set(allTickets.map((t) => t.dorm_uid).filter(Boolean));
+      // Bed-level tickets also carry dorm_uid as location context — only a
+      // ticket WITHOUT bed_uid flags the whole dorm.
+      const dormIds = new Set(
+        allTickets.filter((t) => !t.bed_uid).map((t) => t.dorm_uid).filter(Boolean)
+      );
       if (roomIds.size) {
         setRooms((prev) =>
           prev.map((r) =>
@@ -1594,13 +1611,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       try {
         const ticket = await fn();
         _upsertTicket(ticket);
-        if (ticket.room_uid && ['resolved', 'closed'].includes(ticket.status)) {
-          setRooms((prev) =>
-            prev.map((r) =>
-              r.room_uid === ticket.room_uid ? { ...r, status: 'cleaning' as RoomStatus } : r
-            )
-          );
-        }
+        // resolved keeps the unit blocked until the PM closes it; only
+        // close/cancel release server-side — refetch rather than guess
+        if (['closed', 'cancelled'].includes(ticket.status)) refreshUnits();
         addToast(successToast);
       } catch (err) {
         addToast({
@@ -1610,7 +1623,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         });
       }
     },
-    [_upsertTicket, addToast]
+    [_upsertTicket, addToast, refreshUnits]
   );
 
   const assignMaintenanceTicket = useCallback(
@@ -1685,13 +1698,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       try {
         const ticket = await maintenanceApi.updateMaintenanceTicket(ticket_uid, updates);
         _upsertTicket(ticket);
-        if (ticket.status === 'cancelled' && ticket.room_uid) {
-          setRooms((prev) =>
-            prev.map((r) =>
-              r.room_uid === ticket.room_uid ? { ...r, status: 'available' as RoomStatus } : r
-            )
-          );
-        }
+        // cancellation releases the unit server-side only when nothing else
+        // blocks it — refetch instead of assuming 'available'
+        if (ticket.status === 'cancelled') refreshUnits();
         addToast({ type: 'success', title: 'Ticket Updated' });
       } catch (err) {
         addToast({
@@ -1701,7 +1710,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         });
       }
     },
-    [_upsertTicket, addToast]
+    [_upsertTicket, addToast, refreshUnits]
   );
 
   // -------------------------------------------------------------------

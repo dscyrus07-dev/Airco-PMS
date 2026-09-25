@@ -1,7 +1,7 @@
 export type UserRole = 'super_admin' | 'property_manager' | 'employee';
 
 export type RoomStatus = 'available' | 'occupied' | 'cleaning' | 'maintenance';
-export type BedStatus = 'available' | 'occupied' | 'cleaning' | 'maintenance';
+export type BedStatus = 'available' | 'occupied' | 'cleaning' | 'maintenance' | 'inactive';
 export type DormType = 'Mixed Dorm' | 'Female Dorm' | 'Male Dorm';
 export type WashroomType =
   | 'Attached'
@@ -87,6 +87,9 @@ export interface Task {
   zone_uid?: string | null;
   room_uid?: string | null;
   room_number?: string;
+  dorm_uid?: string | null;
+  dorm_name?: string;
+  bed_uids?: string[] | null; // beds covered by a dorm task
   supervisor_uid?: string | null;
   supervisor_name?: string;
   employee_uid?: string; // assignee

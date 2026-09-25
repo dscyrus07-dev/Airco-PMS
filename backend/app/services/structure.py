@@ -622,10 +622,19 @@ class StructureService:
         dorm, _ = await self._get(
             Dorm, dorm_id, user, options=[selectinload(Dorm.beds)]
         )
-        for bed in dorm.beds:
-            if bed.status == "available":
-                bed.status = "cleaning"
+        changed = [b for b in dorm.beds if b.status == "available"]
+        for bed in changed:
+            bed.status = "cleaning"
         await self._commit()
+        if changed:
+            await self._fire_automation(user, dorm.property_id, "bed_marked_cleaning",
+                                        dorm.zone_id)
+            prop = await self.session.get(Property, dorm.property_id)
+            if prop:
+                # queueing a dorm for cleaning produces real allocated work —
+                # same as checkout / bulk-send
+                await self._generate_cleaning_tasks(user, prop, "cleaning", [], changed)
+                await self._commit()
         return await self._reload_dorm(dorm.id)
 
     async def update_bed_status(
@@ -641,7 +650,16 @@ class StructureService:
         if status not in BED_STATUSES:
             raise ValidationErr(f"Invalid bed status '{status}'.", field="status")
         prev = bed.status
-        bed.status = status
+        if status == "available" and prev in ("cleaning", "maintenance"):
+            # status is derived from open work — an open task/ticket keeps
+            # the bed blocked instead of being force-released
+            from app.services.ops_status import OpsStatusService
+            await OpsStatusService(self.session).refresh_bed(
+                bed.id, release_to="available", actor_name=user.name,
+                trigger="manual available request",
+            )
+        else:
+            bed.status = status
         bed.guest_name = guest_name if status == "occupied" else None
         await self._commit()
         prop_id = bed.property_id or bed.dorm.property_id
@@ -651,6 +669,12 @@ class StructureService:
         if status == "cleaning":
             await self._fire_automation(user, prop_id, "bed_marked_cleaning",
                                         bed.dorm.zone_id)
+            # sending a bed to housekeeping must spawn the allocated task,
+            # same as the bulk units path
+            prop = await self.session.get(Property, prop_id)
+            if prop:
+                await self._generate_cleaning_tasks(user, prop, "cleaning", [], [bed])
+                await self._commit()
         return await self._reload_dorm(bed.dorm_id)
 
     async def _reload_dorm(self, dorm_id: uuid.UUID) -> Dorm:
@@ -737,6 +761,8 @@ class StructureService:
                         b.guest_name = None
             else:
                 for b in beds:
+                    if b.status == "inactive":
+                        continue  # retired bunk — not an operational unit
                     b.status = target
             dorm_ids = {b.dorm_id for b in beds}
             res = await self.session.execute(
@@ -825,25 +851,30 @@ class StructureService:
             dorm = dorm_beds[0].dorm
             nums = ", ".join(sorted(b.bed_number for b in dorm_beds))
             title = f"{label} — {dorm.name or 'Dorm'} ({nums})"
-            if await self._has_open_cleaning(prop.id, None, title):
+            if await self._has_open_cleaning(prop.id, None, title,
+                                             dorm_id=dorm.id):
                 continue
             alloc = await alloc_for(dorm.zone_id)
             t = await self._spawn_cleaning_task(
                 user, prop, allocs, title=title, zone_id=dorm.zone_id,
-                room=None, alloc=alloc, today=today,
+                room=None, dorm=dorm, beds=dorm_beds, alloc=alloc, today=today,
             )
             if t:
                 generated.append(t)
         return generated
 
-    async def _has_open_cleaning(self, property_id, room_id, title) -> bool:
+    async def _has_open_cleaning(self, property_id, room_id, title,
+                                 dorm_id=None) -> bool:
         """Dedupe — an identical OPEN cleaning task means the unit is
         already queued for work; never create a second ticket."""
+        dorm_cond = Task.dorm_id.is_(None) if dorm_id is None \
+            else Task.dorm_id == dorm_id
         res = await self.session.execute(
             select(Task.id).where(
                 Task.property_id == property_id,
                 Task.title == title,
                 Task.room_id == room_id,
+                dorm_cond,
                 Task.status.not_in(("completed", "cancelled")),
             )
         )
@@ -852,6 +883,7 @@ class StructureService:
     async def _spawn_cleaning_task(
         self, user: User, prop: Property, allocs, *,
         title: str, zone_id, room, alloc, today: str,
+        dorm=None, beds=None,
     ) -> Task | None:
         """Create one cleaning task for the allocation result."""
         from sqlalchemy.exc import IntegrityError
@@ -867,6 +899,11 @@ class StructureService:
             zone_id=zone_id,
             room_id=room.id if room else None,
             room_number=room.room_number if room else None,
+            dorm_id=dorm.id if dorm else None,
+            dorm_name=dorm.name if dorm else None,
+            # bed links let supervisor approval release exactly the covered
+            # beds — and let ops_status block a bed while its task is open
+            bed_ids=[str(b.id) for b in beds] if beds else None,
             employee_id=emp_id,
             assigned_to_name=emp_name,
             title=title,

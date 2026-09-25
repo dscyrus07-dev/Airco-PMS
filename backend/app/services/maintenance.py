@@ -4,9 +4,9 @@ Rules:
   create  → ticket OPEN + room.status='maintenance' in ONE transaction
   assign  → ASSIGNED, records event
   start   → IN_PROGRESS, records event
-  resolve → RESOLVED + notes/photos + room → 'cleaning'
-            (post-maintenance cleaning, NOT blindly 'available')
-  close   → CLOSED + room → 'cleaning' if still maintenance
+  resolve → RESOLVED + notes/photos — the resource stays blocked until
+            the supervisor acknowledges (close)
+  close   → CLOSED + resource → 'available' when nothing else blocks it
   cancel  → CANCELLED + room → 'available' (nothing happened)
 
 Every transition appends a MaintenanceTicketEvent — the timeline is the
@@ -243,7 +243,9 @@ class MaintenanceService:
         else:
             dorm.status = "maintenance"
             for b in dorm.beds:
-                if b.status != "occupied":
+                # occupied beds keep their guest; inactive bunks are retired
+                # inventory — a dorm ticket doesn't resurrect them
+                if b.status not in ("occupied", "inactive"):
                     b.status = "maintenance"
         if commit:
             await self.session.commit()
@@ -524,8 +526,8 @@ class MaintenanceService:
         ticket.closed_at = datetime.now(timezone.utc)
         self._event(ticket, "closed", user)
         # Supervisor acknowledgement — derive the target's status from any
-        # remaining blocking work; post-maintenance a free target still needs
-        # cleaning, not a blind 'available'.
-        await self._refresh_target(user, ticket, release_to="cleaning")
+        # remaining blocking work; a free target goes straight back to
+        # 'available' once the PM approves the work.
+        await self._refresh_target(user, ticket, release_to="available")
         await self.session.commit()
         return await self._get_ticket(user, ticket.id)

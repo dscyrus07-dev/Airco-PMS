@@ -4,7 +4,6 @@ import {
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import * as tasksApi from '../../api/tasks';
-import * as maintenanceApi from '../../api/maintenance';
 import { PendingCheckItem, PendingCheckResponse } from '../../api/types';
 import { Badge } from '../ui/Badge';
 import { Button } from '../ui/Button';
@@ -32,7 +31,10 @@ function fmtSubmitted(iso?: string | null): string {
  * disapprove returns it to the employee with a required reason.
  */
 export const PendingCheckView: React.FC<Props> = ({ onOpenTask, onCountChange }) => {
-  const { activePropertyUid, addToast } = useApp();
+  const {
+    activePropertyUid, addToast,
+    approveTask, rejectTask, closeMaintenanceTicket, disapproveMaintenanceTicket,
+  } = useApp();
   const [data, setData] = useState<PendingCheckResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [acting, setActing] = useState<string | null>(null);
@@ -63,12 +65,11 @@ export const PendingCheckView: React.FC<Props> = ({ onOpenTask, onCountChange })
   const approve = async (item: PendingCheckItem) => {
     setActing(item.uid);
     try {
-      if (item.kind === 'task') await tasksApi.approveTask(item.uid);
-      else await maintenanceApi.closeMaintenanceTicket(item.uid);
-      addToast({ type: 'success', title: 'Approved', description: `${item.title} marked completed.` });
+      // context methods update task/ticket state AND re-fetch unit statuses
+      // (approval releases the room/dorm/bed server-side)
+      if (item.kind === 'task') await approveTask(item.uid);
+      else await closeMaintenanceTicket(item.uid);
       await load(true);
-    } catch (e) {
-      addToast({ type: 'error', title: 'Approval failed' });
     } finally {
       setActing(null);
     }
@@ -79,15 +80,12 @@ export const PendingCheckView: React.FC<Props> = ({ onOpenTask, onCountChange })
     setActing(disapproveItem.uid);
     try {
       if (disapproveItem.kind === 'task')
-        await tasksApi.rejectTask(disapproveItem.uid, reason.trim());
+        await rejectTask(disapproveItem.uid, reason.trim());
       else
-        await maintenanceApi.disapproveMaintenanceTicket(disapproveItem.uid, reason.trim());
-      addToast({ type: 'info', title: 'Returned for correction' });
+        await disapproveMaintenanceTicket(disapproveItem.uid, reason.trim());
       setDisapproveItem(null);
       setReason('');
       await load(true);
-    } catch (e) {
-      addToast({ type: 'error', title: 'Disapproval failed' });
     } finally {
       setActing(null);
     }

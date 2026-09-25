@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.models.employee import Employee
-from app.models.structure import Room, Zone
+from app.models.structure import Bed, Dorm, Room, Zone
 from app.models.task import Task, TaskHistoryEvent
 from app.models.user import User, UserRole
 from app.schemas.structure import (
@@ -421,8 +421,8 @@ class TaskService:
         # the resource derives its status now. An employee's completion does
         # NOT release the room: a supervisor still has to approve (approve
         # accepts 'completed' tasks that still hold a blocked resource).
-        if task.room_id and user.role != UserRole.EMPLOYEE:
-            await self._refresh_room(task, user, "approved via complete")
+        if (task.room_id or task.dorm_id) and user.role != UserRole.EMPLOYEE:
+            await self._refresh_unit(task, user, "approved via complete")
 
         generated = None
         if task.recurrence and task.task_type == "repetitive":
@@ -505,6 +505,9 @@ class TaskService:
             zone_id=task.zone_id,
             room_id=task.room_id,
             room_number=task.room_number,
+            dorm_id=task.dorm_id,
+            dorm_name=task.dorm_name,
+            bed_ids=task.bed_ids,
             supervisor_id=task.supervisor_id,
             supervisor_name=task.supervisor_name,
             employee_id=emp_id,
@@ -646,11 +649,29 @@ class TaskService:
         if already_completed:
             # the review already happened — only a still-blocked resource
             # (employee used /complete directly) can be acknowledged again
-            res = await self.session.execute(
-                select(Room.status).where(Room.id == task.room_id)
-            ) if task.room_id else None
-            room_status = res.scalar_one_or_none() if res else None
-            if room_status not in {"cleaning", "maintenance"}:
+            still_blocked = False
+            if task.room_id:
+                res = await self.session.execute(
+                    select(Room.status).where(Room.id == task.room_id)
+                )
+                still_blocked = res.scalar_one_or_none() in {"cleaning", "maintenance"}
+            elif task.dorm_id:
+                res = await self.session.execute(
+                    select(Dorm.status).where(Dorm.id == task.dorm_id)
+                )
+                still_blocked = res.scalar_one_or_none() in {"cleaning", "maintenance"}
+                if not still_blocked:
+                    # the dorm row may not be flagged — check covered beds
+                    # (bed_ids NULL = whole-dorm task → all its beds)
+                    cond = (Bed.dorm_id == task.dorm_id) if not task.bed_ids \
+                        else Bed.id.in_([uuid.UUID(x) for x in task.bed_ids])
+                    res = await self.session.execute(
+                        select(Bed.status).where(cond)
+                    )
+                    still_blocked = any(
+                        s in {"cleaning", "maintenance"} for s in res.scalars()
+                    )
+            if not still_blocked:
                 raise ConflictErr("Only submitted tasks can be approved.")
         elif task.status != "submitted":
             raise ConflictErr("Only submitted tasks can be approved.")
@@ -661,8 +682,8 @@ class TaskService:
 
         # Supervisor acknowledgement → the resource re-derives its status
         # from remaining blocking work (other tickets keep it unavailable).
-        if task.room_id:
-            await self._refresh_room(task, user, "supervisor approved")
+        if task.room_id or task.dorm_id:
+            await self._refresh_unit(task, user, "supervisor approved")
 
         generated = None
         if not already_completed and task.recurrence \
@@ -685,8 +706,8 @@ class TaskService:
         task.status = "reopened"
         task.submitted_at = None
         self._history(task, "rejected", user, note=reason)
-        if task.room_id:
-            await self._refresh_room(task, user, "work rejected — reopened")
+        if task.room_id or task.dorm_id:
+            await self._refresh_unit(task, user, "work rejected — reopened")
         await self.session.commit()
         return await self._get_task(user, task.id)
 
@@ -698,8 +719,8 @@ class TaskService:
         task.status = "assigned" if task.employee_id else "pending"
         task.completed_at = None
         self._history(task, "reopened", user, note=note)
-        if task.room_id:
-            await self._refresh_room(task, user, "task reopened")
+        if task.room_id or task.dorm_id:
+            await self._refresh_unit(task, user, "task reopened")
         await self.session.commit()
         return await self._get_task(user, task.id)
 
@@ -710,14 +731,14 @@ class TaskService:
         self._require_assignee(user, task)
         task.status = "pending"
         self._history(task, "redo_requested", user, note=note)
-        if task.room_id:
-            await self._refresh_room(task, user, "redo requested")
+        if task.room_id or task.dorm_id:
+            await self._refresh_unit(task, user, "redo requested")
         await self.session.commit()
         return await self._get_task(user, task.id)
 
-    async def _refresh_room(self, task: Task, user: User, trigger: str) -> None:
-        """Re-derive the task's room status via the central ops service and
-        record the transition on this task's history."""
+    async def _refresh_unit(self, task: Task, user: User, trigger: str) -> None:
+        """Re-derive the task's unit status (room or dorm+beds) via the
+        central ops service and record transitions on this task's history."""
         from app.services.ops_status import OpsStatusService
 
         def _audit(note: str) -> None:
@@ -725,12 +746,20 @@ class TaskService:
                 type="room_status_changed", actor_name=user.name, note=note,
             ))
 
-        await OpsStatusService(self.session).refresh_room(
-            task.room_id, release_to="available",
-            actor_name=user.name,
-            trigger=f"{trigger} ({task.ticket_number or task.title})",
-            audit=_audit,
-        )
+        ops = OpsStatusService(self.session)
+        trig = f"{trigger} ({task.ticket_number or task.title})"
+        if task.room_id:
+            await ops.refresh_room(
+                task.room_id, release_to="available",
+                actor_name=user.name, trigger=trig, audit=_audit,
+            )
+        elif task.dorm_id:
+            # refresh_dorm releases each covered bed that has no remaining
+            # blocker — beds still held by other open tasks/tickets stay
+            await ops.refresh_dorm(
+                task.dorm_id, release_to="available",
+                actor_name=user.name, trigger=trig, audit=_audit,
+            )
 
     async def reassign(
         self, user: User, task_id: uuid.UUID, employee_uid: uuid.UUID | None
