@@ -131,3 +131,11 @@ via `/health/db`.
 - CORS is explicit via `CORS_ORIGINS` — no `*` wildcard.
 - Error responses use a consistent `{ "error": { code, message } }` envelope;
   raw tracebacks are never exposed in production.
+
+## Deployment
+
+- Backend: Railway (service "Airco PMS" + "worker", root dir /backend, auto-deploys on push to main)
+- Frontend: Vercel (project airco-pms, auto-deploys on push to main)
+- Database: Supabase PostgreSQL (session pooler for IPv4)
+- Storage: Supabase Storage S3 (bucket: uploads)
+- Redis: Railway Redis (cache, rate limiting, arq job queue)
