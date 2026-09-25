@@ -234,6 +234,9 @@ class MaintenanceService:
             method=allocation.method, reason=allocation.reason,
             actor_name=user.name,
         )
+        # populate server_default timestamps (events' created_at) so
+        # commit=False callers serialize real times, not nulls
+        await self.session.flush()
 
         # Flag the target — same transaction, both or neither
         if room is not None:

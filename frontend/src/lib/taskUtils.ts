@@ -76,8 +76,11 @@ export function formatTaskDue(task: Task): string {
   return task.due_time ? `${label} · ${task.due_time}` : label;
 }
 
-export function formatEventTime(iso: string): string {
+export function formatEventTime(iso: string | null | undefined): string {
+  // missing/invalid timestamps must not render as epoch (Jan 1 1970)
+  if (!iso) return '—';
   const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '—';
   return d.toLocaleString(undefined, {
     month: 'short',
     day: 'numeric',
