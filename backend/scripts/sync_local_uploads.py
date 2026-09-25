@@ -24,6 +24,12 @@ import asyncpg
 ROOT = Path(__file__).resolve().parents[1]  # backend/
 sys.path.insert(0, str(ROOT))
 
+# pydantic resolves env_file=".env" against the CWD — this script is run from
+# the repo root, so load backend/.env explicitly BEFORE importing settings.
+from dotenv import load_dotenv  # noqa: E402
+
+load_dotenv(ROOT / ".env")
+
 from app.core.config import settings  # noqa: E402
 
 REF = "asuzvovuecxuztynidss"
@@ -60,25 +66,12 @@ async def connect(env: dict):
         ssl=ctx, timeout=8)
 
 
-def public_url(key: str) -> str:
-    base = settings.S3_PUBLIC_BASE_URL or (
-        f"{settings.SUPABASE_URL.rstrip('/')}/storage/v1/object/public/"
-        f"{settings.S3_BUCKET}")
-    return f"{base.rstrip('/')}/{key}"
+async def upload_to_bucket(key: str, path: Path, content_type: str) -> str:
+    """Upload via the app's resolved storage backend (Supabase REST, S3, …)
+    and return the public URL it reports — no S3 creds needed here."""
+    from app.core.storage import get_storage
 
-
-def upload_to_bucket(key: str, path: Path, content_type: str) -> None:
-    import boto3
-
-    client = boto3.client(
-        "s3",
-        endpoint_url=settings.S3_ENDPOINT_URL,
-        region_name=settings.S3_REGION,
-        aws_access_key_id=settings.S3_ACCESS_KEY,
-        aws_secret_access_key=settings.S3_SECRET_KEY,
-    )
-    client.put_object(Bucket=settings.S3_BUCKET, Key=key,
-                      Body=path.read_bytes(), ContentType=content_type)
+    return await get_storage().save(path.read_bytes(), key, content_type)
 
 
 CONTENT_TYPES = {".jpg": "image/jpeg", ".png": "image/png",
@@ -104,9 +97,9 @@ async def main() -> None:
             missing += 1
             print(f"  MISSING on this machine: {key}")
             continue
-        new_url = public_url(key)
-        upload_to_bucket(key, path, CONTENT_TYPES.get(path.suffix.lower(),
-                                                      "application/octet-stream"))
+        new_url = await upload_to_bucket(
+            key, path,
+            CONTENT_TYPES.get(path.suffix.lower(), "application/octet-stream"))
         await conn.execute(
             "UPDATE maintenance_ticket_attachments SET url = $1 WHERE url = $2",
             new_url, url)
