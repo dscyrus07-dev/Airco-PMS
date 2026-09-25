@@ -299,7 +299,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
           roomsApi.listRooms(),
           dormsApi.listDorms(),
           employeesApi.listEmployees(),
-          tasksApi.listTasks(),
+          tasksApi.listTasks({ limit: 500 }),
           maintenanceApi.listMaintenance(),
         ]);
       setProperties(propertiesRes.items);
@@ -802,7 +802,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       try {
         await updateRoom(room_uid, { status });
         // Status transitions may trigger task automation server-side
-        void tasksApi.listTasks().then((r) => setTasks(r.items)).catch(() => {});
+        void tasksApi.listTasks({ limit: 500 }).then((r) => setTasks(r.items)).catch(() => {});
       } catch {
         if (previous) {
           setRooms((prev) =>
@@ -947,7 +947,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         const dorm = await dormsApi.updateBedStatus(bed_uid, { status, guest_name });
         setDorms((prev) => prev.map((d) => (d.dorm_uid === dorm.dorm_uid ? dorm : d)));
         // Bed transitions may trigger automation rules → refresh tasks
-        void tasksApi.listTasks().then((r) => setTasks(r.items)).catch(() => {});
+        void tasksApi.listTasks({ limit: 500 }).then((r) => setTasks(r.items)).catch(() => {});
       } catch (err) {
         setDorms(prevDorms);
         addToast({
@@ -965,7 +965,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       try {
         const dorm = await dormsApi.checkoutDorm(dorm_uid);
         setDorms((prev) => prev.map((d) => (d.dorm_uid === dorm_uid ? dorm : d)));
-        void tasksApi.listTasks().then((r) => setTasks(r.items)).catch(() => {});
+        void tasksApi.listTasks({ limit: 500 }).then((r) => setTasks(r.items)).catch(() => {});
         addToast({
           type: 'success',
           title: 'Dorm Checked Out',
@@ -987,7 +987,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       try {
         const dorm = await dormsApi.markDormCleaning(dorm_uid);
         setDorms((prev) => prev.map((d) => (d.dorm_uid === dorm_uid ? dorm : d)));
-        void tasksApi.listTasks().then((r) => setTasks(r.items)).catch(() => {});
+        void tasksApi.listTasks({ limit: 500 }).then((r) => setTasks(r.items)).catch(() => {});
         addToast({
           type: 'info',
           title: 'Cleaning Requested',

@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.employee import Employee
@@ -66,6 +66,12 @@ class TaskOpsService:
         is_employee = user.role == UserRole.EMPLOYEE
 
         # ---- generated tasks due today (or created today) --------------
+        # Plus ANY still-open work due earlier — a disapproved ('reopened')
+        # or otherwise unfinished task must stay on the employee's list
+        # instead of silently dropping off once its due date passes.
+        # due_date is an ISO string, so a lexical compare against tomorrow's
+        # date works for both "YYYY-MM-DD" and full timestamps.
+        tomorrow_iso = (today_d + timedelta(days=1)).isoformat()
         q = (
             select(Task)
             .where(
@@ -73,6 +79,11 @@ class TaskOpsService:
                 or_(
                     Task.due_date.like(f"{today_iso}%"),
                     Task.created_at >= start_utc,
+                    and_(
+                        Task.due_date.is_not(None),
+                        Task.due_date < tomorrow_iso,
+                        Task.status.notin_(("completed", "cancelled")),
+                    ),
                 ),
             )
         )

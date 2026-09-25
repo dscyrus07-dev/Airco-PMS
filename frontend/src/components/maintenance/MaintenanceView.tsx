@@ -7,7 +7,6 @@ import {
   CheckCircle2,
   Clock,
   Camera,
-  Play,
   Pause,
   X,
   Filter,
@@ -76,7 +75,6 @@ export const TicketDrawer: React.FC<{
     activeProperty,
     currentRole,
     assignMaintenanceTicket,
-    startMaintenanceTicket,
     holdMaintenanceTicket,
     resolveMaintenanceTicket,
     closeMaintenanceTicket,
@@ -106,7 +104,6 @@ export const TicketDrawer: React.FC<{
   // start and resolve tickets assigned to them.
   const isStaff = currentRole !== 'employee';
   const canAssign = isStaff && isActiveTicket(ticket.status);
-  const canStart = ['open', 'assigned', 'on_hold'].includes(ticket.status);
   const canHold = isStaff && ['open', 'assigned', 'in_progress'].includes(ticket.status);
   const canResolve = !['resolved', 'closed', 'cancelled'].includes(ticket.status);
   const canClose = isStaff && ticket.status === 'resolved';
@@ -257,13 +254,8 @@ export const TicketDrawer: React.FC<{
         )}
 
         {/* Workflow actions */}
-        {(canStart || canHold || canResolve || canClose) && (
+        {(canHold || canResolve || canClose) && (
           <div className="flex flex-wrap gap-2">
-            {canStart && (
-              <Button variant="primary" size="sm" onClick={() => startMaintenanceTicket(ticket.ticket_uid)}>
-                <Play className="w-3.5 h-3.5 mr-1" /> Start Work
-              </Button>
-            )}
             {canHold && (
               <Button variant="outline" size="sm" onClick={() => holdMaintenanceTicket(ticket.ticket_uid)}>
                 <Pause className="w-3.5 h-3.5 mr-1" /> Hold

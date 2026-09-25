@@ -9,6 +9,7 @@ Rules under test:
 """
 
 import uuid
+from datetime import datetime, timedelta
 
 from tests.test_allocation import _employee_in_zone, _room_in_zone, _zone
 from tests.test_structure import _auth, _property, _signup
@@ -485,6 +486,115 @@ async def test_maintenance_pending_check_and_disapprove(client):
     await client.post(f"/api/v1/maintenance/{t['ticket_uid']}/close",
                       headers=h)
     assert await _room_status(client, h, room["room_uid"]) == "available"
+
+
+async def test_task_disapprove_repeated_rework_cycle(client):
+    """Submit → reject → rework → resubmit → reject → resubmit → approve —
+    the SAME task travels the whole cycle; no duplicates, assignee kept."""
+    h, pid, task, room = await _setup_cleaning_task(client)
+    eh = _auth(await _login_employee(client, "a@t.co"))
+    uid = task["task_uid"]
+
+    for i in range(2):
+        res = await client.post(f"/api/v1/tasks/{uid}/submit",
+                                headers=eh,
+                                json={"photo_urls": [f"/uploads/cycle{i}.jpg"]})
+        assert res.status_code == 200 and res.json()["status"] == "submitted"
+
+        res = await client.post(f"/api/v1/tasks/{uid}/reject",
+                                headers=h, json={"reason": f"redo #{i + 1}"})
+        assert res.status_code == 200, res.text
+        body = res.json()
+        assert body["task_uid"] == uid                # same task — no clone
+        assert body["status"] == "reopened"
+        assert body["assigned_to_name"] == "A"        # original assignee kept
+        assert body["submitted_at"] is None
+        rejected = [e for e in body["history"] if e["type"] == "rejected"]
+        assert len(rejected) == i + 1
+        assert rejected[-1]["note"] == f"redo #{i + 1}"
+
+        # not under review while it's back with the employee
+        res = await client.get("/api/v1/tasks/pending-check",
+                               headers=h, params={"property_uid": pid})
+        assert res.json()["count"] == 0
+        # and no duplicate task was spawned for the same work
+        res = await client.get("/api/v1/tasks", headers=h,
+                               params={"property_uid": pid, "limit": 100})
+        assert len([t for t in res.json()["items"]
+                    if t["title"] == task["title"]]) == 1
+
+    # third submission is finally approved — same task reaches 'completed'
+    res = await client.post(f"/api/v1/tasks/{uid}/submit",
+                            headers=eh, json={"photo_urls": ["/uploads/done.jpg"]})
+    assert res.json()["status"] == "submitted"
+    res = await client.post(f"/api/v1/tasks/{uid}/approve", headers=h, json={})
+    assert res.status_code == 200
+    assert res.json()["task"]["status"] == "completed"
+    assert await _room_status(client, h, room["room_uid"]) == "available"
+
+
+async def test_reopened_task_stays_on_today_list(client):
+    """A disapproved task must remain on the employee's Today list even when
+    its due date already passed — rework cannot silently disappear."""
+    admin = await _signup(client)
+    h = _auth(admin)
+    pid = (await _property(client, admin))["property_uid"]
+    z = await _zone(client, h, pid)
+    emp = await _employee_in_zone(client, h, pid, z["zone_uid"], "A", "a@t.co")
+
+    yesterday = (datetime.now() - timedelta(days=1)).date().isoformat()
+    res = await client.post("/api/v1/tasks", headers=h, json={
+        "property_uid": pid, "title": "Deep clean carpets",
+        "task_type": "fixed", "employee_uid": emp["employee_uid"],
+        "due_date": yesterday})
+    assert res.status_code == 201, res.text
+    task = res.json()
+
+    eh = _auth(await _login_employee(client, "a@t.co"))
+    await client.post(f"/api/v1/tasks/{task['task_uid']}/submit",
+                      headers=eh, json={"photo_urls": ["/uploads/a.jpg"]})
+    res = await client.post(f"/api/v1/tasks/{task['task_uid']}/reject",
+                            headers=h, json={"reason": "not done properly"})
+    assert res.json()["status"] == "reopened"
+
+    # employee's Today list keeps the rework visible + actionable
+    res = await client.get("/api/v1/tasks/today",
+                           headers=eh, params={"property_uid": pid})
+    items = {i["task_uid"]: i for i in res.json()["items"]}
+    assert task["task_uid"] in items
+    assert items[task["task_uid"]]["work_status"] == "reopened"
+    assert items[task["task_uid"]]["assignee"] == "A"
+
+
+async def test_task_status_cannot_be_patched_directly(client):
+    """PATCH /tasks/{id} must refuse `status` — 'completed' set directly
+    would fake approval without evidence, review, or unit release."""
+    h, pid, task, room = await _setup_cleaning_task(client)
+    res = await client.patch(f"/api/v1/tasks/{task['task_uid']}",
+                             headers=h, json={"status": "completed"})
+    assert res.status_code == 422
+    res = await client.get("/api/v1/tasks", headers=h,
+                           params={"property_uid": pid, "limit": 100})
+    t = next(t for t in res.json()["items"] if t["task_uid"] == task["task_uid"])
+    assert t["status"] == "assigned"
+    # ordinary field updates still work
+    res = await client.patch(f"/api/v1/tasks/{task['task_uid']}",
+                             headers=h, json={"priority": "high"})
+    assert res.status_code == 200 and res.json()["priority"] == "high"
+
+
+async def test_reopen_already_reopened_task_conflicts(client):
+    h, pid, task, room = await _setup_cleaning_task(client)
+    eh = _auth(await _login_employee(client, "a@t.co"))
+    await client.post(f"/api/v1/tasks/{task['task_uid']}/submit",
+                      headers=eh, json={"photo_urls": ["/uploads/a.jpg"]})
+    res = await client.post(f"/api/v1/tasks/{task['task_uid']}/reject",
+                            headers=h, json={"reason": "redo it"})
+    assert res.json()["status"] == "reopened"
+    # reopening an already-open task is a clean conflict, not a corrupt state
+    res = await client.post(f"/api/v1/tasks/{task['task_uid']}/reopen",
+                            headers=h, json={})
+    assert res.status_code == 409
 
 
 async def test_employee_cannot_bypass_review_via_complete(client):

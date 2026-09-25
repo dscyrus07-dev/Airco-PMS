@@ -9,6 +9,9 @@ import { Task, TaskStatus, AutomationTrigger, RecurrenceSchedule } from '../type
 export function getEffectiveTaskStatus(task: Task): TaskStatus {
   if (task.status === 'completed' || task.status === 'scheduled') return task.status;
   if (task.status === 'overdue') return 'overdue';
+  // Review workflow states outrank the due-date mask — a submitted task must
+  // stay reviewable and a returned task must show as rework even when late.
+  if (task.status === 'submitted' || task.status === 'reopened') return task.status;
   if (task.due_date) {
     const due = new Date(task.due_date);
     let cmp: Date;

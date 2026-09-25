@@ -610,7 +610,7 @@ export const TaskDetailDrawer: React.FC<TaskDetailDrawerProps> = ({ task, onClos
                 </h4>
 
                 <div className="flex items-center gap-2 flex-wrap">
-                  {['completed', 'cancelled', 'reopened'].includes(status) && (
+                  {['completed', 'cancelled'].includes(status) && (
                     <Button
                       variant="outline"
                       size="sm"

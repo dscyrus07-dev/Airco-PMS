@@ -327,6 +327,15 @@ class TaskService:
     ) -> Task:
         task = await self._get_task(user, task_id)
         data = payload.model_dump(exclude_unset=True)
+        if "status" in data:
+            # Status is workflow state — it must move through the lifecycle
+            # endpoints (start/submit/approve/reject/reopen) so evidence
+            # gates, review and unit-status derivation are never bypassed.
+            raise ValidationErr(
+                "Task status can only change via the lifecycle endpoints "
+                "(start, submit, approve, reject, reopen).",
+                field="status",
+            )
         if "employee_uid" in data:
             emp_id, emp_name = await self._employee_or_none(
                 data.pop("employee_uid"), task.property_id
@@ -714,7 +723,7 @@ class TaskService:
     async def reopen_task(self, user: User, task_id: uuid.UUID, note=None) -> Task:
         """Manually reopen a completed/cancelled task."""
         task = await self._get_task(user, task_id)
-        if task.status not in {"completed", "cancelled", "rejected"}:
+        if task.status not in {"completed", "cancelled"}:
             raise ConflictErr(f"Cannot reopen a {task.status} task.")
         task.status = "assigned" if task.employee_id else "pending"
         task.completed_at = None

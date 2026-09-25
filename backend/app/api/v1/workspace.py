@@ -209,6 +209,8 @@ async def list_tasks(
     status_: str | None = Query(default=None, alias="status"),
     task_type: str | None = Query(default=None),
     search: str | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    limit: int = Query(default=20, ge=1, le=500),
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ):
@@ -220,6 +222,8 @@ async def list_tasks(
         status=status_,
         task_type=task_type,
         search=search,
+        page=page,
+        limit=limit,
     )
     res["items"] = [ws.task_out(t) for t in res["items"]]
     return res

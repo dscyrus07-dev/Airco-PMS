@@ -19,6 +19,8 @@ export interface TaskListParams {
   status?: string;
   task_type?: string;
   search?: string;
+  page?: number;
+  limit?: number;
 }
 
 export async function listTasks(params: TaskListParams = {}): Promise<ListResponse<Task>> {
