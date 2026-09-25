@@ -168,18 +168,18 @@ app.add_middleware(RequestIDMiddleware)
 
 register_exception_handlers(app)
 
-# Local media storage — task evidence uploads are served from /uploads.
-# Skipped entirely when STORAGE_BACKEND=s3 (objects live in the bucket).
-if settings.STORAGE_BACKEND.lower() == "local":
-    from pathlib import Path  # noqa: E402
+# Serve /uploads unconditionally — rows created under local storage carry
+# relative /uploads/* URLs, and the mount resolves them whenever the files
+# exist on this host's disk (object-storage backends return absolute URLs).
+from pathlib import Path  # noqa: E402
 
-    from fastapi.staticfiles import StaticFiles  # noqa: E402
+from fastapi.staticfiles import StaticFiles  # noqa: E402
 
-    from app.core.storage import LocalStorage  # noqa: E402
+from app.core.storage import LocalStorage  # noqa: E402
 
-    _uploads = LocalStorage().dir
-    _uploads.mkdir(parents=True, exist_ok=True)
-    app.mount("/uploads", StaticFiles(directory=str(_uploads)), name="uploads")
+_uploads = LocalStorage().dir
+_uploads.mkdir(parents=True, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=str(_uploads)), name="uploads")
 
 
 @app.get("/health", tags=["health"])

@@ -81,16 +81,60 @@ class S3Storage(StorageBackend):
         return f"https://{self.bucket}.s3.{settings.S3_REGION}.amazonaws.com/{key}"
 
 
+class SupabaseStorage(StorageBackend):
+    """Supabase Storage via its REST API — needs only SUPABASE_SECRET_KEY,
+    which deployments already carry for the database. Objects land in a
+    public bucket so the returned URL renders without signing."""
+
+    def __init__(self):
+        if not settings.SUPABASE_SECRET_KEY:
+            raise RuntimeError("supabase storage requires SUPABASE_SECRET_KEY")
+        self.base = f"{settings.SUPABASE_URL.rstrip('/')}/storage/v1"
+        self.bucket = settings.SUPABASE_STORAGE_BUCKET
+
+    async def save(self, data: bytes, key: str, content_type: str) -> str:
+        import httpx  # deferred — only needed when this backend is selected
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            res = await client.post(
+                f"{self.base}/object/{self.bucket}/{key}",
+                content=data,
+                headers={
+                    "Authorization": f"Bearer {settings.SUPABASE_SECRET_KEY}",
+                    "apikey": settings.SUPABASE_SECRET_KEY,
+                    "Content-Type": content_type,
+                },
+            )
+            res.raise_for_status()
+        return f"{self.base}/object/public/{self.bucket}/{key}"
+
+
+def _s3_ready() -> bool:
+    return bool(
+        settings.S3_BUCKET and settings.S3_ACCESS_KEY and settings.S3_SECRET_KEY
+    )
+
+
 _backend: StorageBackend | None = None
 
 
 def get_storage() -> StorageBackend:
+    """Resolve the effective backend. `auto` prefers durable object storage
+    (S3 creds, then the Supabase service key) and only falls back to the
+    local filesystem when nothing persistent is configured — writing to a
+    container's disk silently loses every upload on the next deploy."""
     global _backend
     if _backend is None:
-        _backend = (
-            S3Storage() if settings.STORAGE_BACKEND.lower() == "s3"
-            else LocalStorage()
-        )
+        mode = settings.STORAGE_BACKEND.lower()
+        if mode == "s3" or (mode == "auto" and _s3_ready()):
+            _backend = S3Storage()
+        elif mode == "supabase" or (
+            mode == "auto" and settings.SUPABASE_SECRET_KEY
+        ):
+            _backend = SupabaseStorage()
+        else:
+            _backend = LocalStorage()
+        logger.info("storage backend: %s", type(_backend).__name__)
     return _backend
 
 

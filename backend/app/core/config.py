@@ -73,11 +73,13 @@ class Settings(BaseSettings):
     # token bucket otherwise (single-process only).
     RATE_LIMIT_ENABLED: bool = True
 
-    # Media storage — "local" (UPLOAD_DIR volume) or "s3" (S3-compatible:
-    # AWS S3, Supabase Storage, MinIO). S3 keeps uploads off disposable
-    # container filesystems in production.
-    STORAGE_BACKEND: str = "local"
+    # Media storage — "auto" picks durable object storage when credentials
+    # exist (S3_BUCKET+keys, else the Supabase service key) and falls back to
+    # UPLOAD_DIR otherwise. "local"/"s3"/"supabase" force a backend.
+    # Container filesystems are disposable — prod must not land on local.
+    STORAGE_BACKEND: str = "auto"
     UPLOAD_DIR: str = "uploads"
+    SUPABASE_STORAGE_BUCKET: str = "uploads"
     S3_ENDPOINT_URL: str | None = None  # leave unset for AWS; set for Supabase/MinIO
     S3_REGION: str = "us-east-1"
     S3_BUCKET: str | None = None
