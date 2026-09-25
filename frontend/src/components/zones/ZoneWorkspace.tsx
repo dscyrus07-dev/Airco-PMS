@@ -719,12 +719,37 @@ export const ZoneWorkspace: React.FC<ZoneWorkspaceProps> = ({ zone, onBack }) =>
                           <Button
                             variant="outline"
                             size="sm"
-                            onClick={() =>
-                              setMaintenanceTarget({ kind: 'dorm', dorm })
-                            }
+                            onClick={() => {
+                              if (someBedsInDormSelected) {
+                                // Selection-scoped — a ticket per selected bed,
+                                // or ONE dorm ticket when every bed is picked.
+                                setMaintenanceTargetList(
+                                  allBedsInDormSelected
+                                    ? [{ kind: 'dorm', dorm }]
+                                    : selectableBeds
+                                        .filter((b) =>
+                                          selectedBedUids.includes(b.bed_uid)
+                                        )
+                                        .map((bed) => ({
+                                          kind: 'bed' as const,
+                                          dorm,
+                                          bed,
+                                        }))
+                                );
+                                setSelectedBedUids((prev) =>
+                                  prev.filter((id) => !dormBedUids.includes(id))
+                                );
+                              } else {
+                                setMaintenanceTarget({ kind: 'dorm', dorm });
+                              }
+                            }}
                             title={
                               ticketsByDorm.has(dorm.dorm_uid)
                                 ? `Active ticket ${ticketsByDorm.get(dorm.dorm_uid)?.ticket_number} — click to view`
+                                : someBedsInDormSelected
+                                ? allBedsInDormSelected
+                                  ? 'Raise one maintenance ticket for the whole dorm'
+                                  : 'Raise a maintenance ticket per selected bed'
                                 : 'Send the whole dorm to maintenance'
                             }
                             className={
@@ -734,7 +759,11 @@ export const ZoneWorkspace: React.FC<ZoneWorkspaceProps> = ({ zone, onBack }) =>
                             }
                           >
                             <Wrench className="w-3.5 h-3.5 mr-1" />
-                            {ticketsByDorm.has(dorm.dorm_uid) ? 'Maintenance ●' : 'Maintenance'}
+                            {ticketsByDorm.has(dorm.dorm_uid)
+                              ? 'Maintenance ●'
+                              : someBedsInDormSelected
+                              ? `Maintenance (${selectedBedsInDorm.length})`
+                              : 'Maintenance'}
                           </Button>
                         </div>
                       </div>
