@@ -546,7 +546,7 @@ async def test_reopened_task_stays_on_today_list(client):
     res = await client.post("/api/v1/tasks", headers=h, json={
         "property_uid": pid, "title": "Deep clean carpets",
         "task_type": "fixed", "employee_uid": emp["employee_uid"],
-        "due_date": yesterday})
+        "zone_uid": z["zone_uid"], "due_date": yesterday})
     assert res.status_code == 201, res.text
     task = res.json()
 
@@ -564,6 +564,8 @@ async def test_reopened_task_stays_on_today_list(client):
     assert task["task_uid"] in items
     assert items[task["task_uid"]]["work_status"] == "reopened"
     assert items[task["task_uid"]]["assignee"] == "A"
+    # zone filter must work on real tasks — the item carries the zone name
+    assert items[task["task_uid"]]["zone_name"] == z["name"]
 
 
 async def test_task_status_cannot_be_patched_directly(client):

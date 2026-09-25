@@ -147,10 +147,21 @@ class TaskOpsService:
                     items.append(self._occurrence_item(t, tgt, occ, key, gen_task))
 
         # ---- manual/one-time generated tasks (not from templates) ------
+        # Resolve zone names so the Today zone filter works — template
+        # occurrences get theirs from target expansion, task rows carry
+        # only zone_id.
+        zids = {t.zone_id for t in tasks if t.zone_id}
+        zmap: dict[uuid.UUID, str] = {}
+        if zids:
+            res = await self.session.execute(
+                select(Zone).where(Zone.id.in_(zids))
+            )
+            zmap = {z.id: z.name for z in res.scalars()}
         for t in tasks:
             if t.template_id:
                 continue  # already represented via its occurrence row
-            items.append(self._task_item(t, source="manual"))
+            items.append(self._task_item(t, source="manual",
+                                         zone_name=zmap.get(t.zone_id)))
 
         items.sort(key=lambda x: (x["scheduled_at"] or "", x["title"]))
         return {"date": today_iso, "summary": self._summary(items), "items": items}
@@ -204,7 +215,7 @@ class TaskOpsService:
             "allocation_method": t.allocation_method,
         }
 
-    def _task_item(self, t: Task, source: str) -> dict:
+    def _task_item(self, t: Task, source: str, zone_name=None) -> dict:
         return {
             "item_type": "task",
             "occurrence_key": None,
@@ -215,7 +226,7 @@ class TaskOpsService:
             "source": source,
             "priority": t.priority,
             "scheduled_at": t.due_date,
-            "zone_name": None,
+            "zone_name": zone_name,
             "target_label": (f"Room {t.room_number}" if t.room_number
                              else t.dorm_name),
             "room_number": t.room_number or t.dorm_name,
