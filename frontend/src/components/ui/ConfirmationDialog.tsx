@@ -11,6 +11,9 @@ export interface ConfirmationDialogProps {
   entityName: string; // e.g. "Zone A — Ground Floor"
   impactMessage: string; // e.g. "Deleting this zone will un-assign all 4 rooms and 7 employees. They will not be deleted."
   isLoading?: boolean;
+  title?: string; // overrides the default "Delete {entityType}?"
+  confirmLabel?: string; // overrides the default "Delete {entityType}"
+  question?: string; // overrides the default "permanently delete" line
 }
 
 export const ConfirmationDialog: React.FC<ConfirmationDialogProps> = ({
@@ -21,12 +24,15 @@ export const ConfirmationDialog: React.FC<ConfirmationDialogProps> = ({
   entityName,
   impactMessage,
   isLoading = false,
+  title,
+  confirmLabel,
+  question,
 }) => {
   return (
     <Modal
       isOpen={isOpen}
       onClose={onClose}
-      title={`Delete ${entityType}?`}
+      title={title ?? `Delete ${entityType}?`}
       maxWidth="sm"
     >
       <div className="space-y-4">
@@ -39,7 +45,7 @@ export const ConfirmationDialog: React.FC<ConfirmationDialogProps> = ({
         </div>
 
         <p className="text-sm text-[#544F47] font-body">
-          Are you sure you want to permanently delete{' '}
+          {question ?? 'Are you sure you want to permanently delete'}{' '}
           <strong className="text-[#24221F] font-semibold">{entityName}</strong>?
         </p>
 
@@ -55,7 +61,7 @@ export const ConfirmationDialog: React.FC<ConfirmationDialogProps> = ({
             }}
             isLoading={isLoading}
           >
-            Delete {entityType}
+            {confirmLabel ?? `Delete ${entityType}`}
           </Button>
         </div>
       </div>

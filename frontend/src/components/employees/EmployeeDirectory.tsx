@@ -29,6 +29,7 @@ export const EmployeeDirectory: React.FC = () => {
     currentPropertyAreas,
     updateEmployee,
     deactivateEmployee,
+    deleteEmployee,
     assignEmployeeToZone,
     assignEmployeeToArea,
     navigate,
@@ -42,6 +43,7 @@ export const EmployeeDirectory: React.FC = () => {
 
   const [activeMenuEmpUid, setActiveMenuEmpUid] = useState<string | null>(null);
   const [empToDeactivate, setEmpToDeactivate] = useState<Employee | null>(null);
+  const [empToDelete, setEmpToDelete] = useState<Employee | null>(null);
 
   // Edit employee modal state
   const [editingEmp, setEditingEmp] = useState<Employee | null>(null);
@@ -252,6 +254,16 @@ export const EmployeeDirectory: React.FC = () => {
                               <span>Deactivate Staff</span>
                             </button>
                           )}
+                          <button
+                            onClick={() => {
+                              setEmpToDelete(emp);
+                              setActiveMenuEmpUid(null);
+                            }}
+                            className="w-full px-3 py-1.5 text-xs text-[#C53B3B] hover:bg-[#FDE8E8] flex items-center gap-2 text-left cursor-pointer"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                            <span>Delete Permanently</span>
+                          </button>
                         </div>
                       )}
                     </div>
@@ -422,7 +434,22 @@ export const EmployeeDirectory: React.FC = () => {
           onConfirm={() => deactivateEmployee(empToDeactivate.employee_uid)}
           entityType="Employee"
           entityName={empToDeactivate.name}
-          impactMessage={`Deactivating ${empToDeactivate.name} will unassign them from their zone, preserve their task history, and move them to inactive status.`}
+          title="Deactivate Employee?"
+          confirmLabel="Deactivate"
+          question="Are you sure you want to deactivate"
+          impactMessage={`Deactivating ${empToDeactivate.name} will unassign them from their zone, preserve their task history, and move them to inactive status. Their login will be disabled until they are reactivated.`}
+        />
+      )}
+
+      {/* Permanent Delete Confirmation */}
+      {empToDelete && (
+        <ConfirmationDialog
+          isOpen={!!empToDelete}
+          onClose={() => setEmpToDelete(null)}
+          onConfirm={() => deleteEmployee(empToDelete.employee_uid)}
+          entityType="Employee"
+          entityName={empToDelete.name}
+          impactMessage={`Permanently deleting ${empToDelete.name} removes their record and login, unassigns their open tasks, and preserves past task history. This cannot be undone.`}
         />
       )}
     </div>

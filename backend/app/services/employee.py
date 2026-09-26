@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.security import hash_password, slugify_username
 from app.models.allocation import AllocationEvent
 from app.models.employee import Employee
+from app.models.property import Property
 from app.models.structure import Zone
 from app.models.task import Task
 from app.models.user import User, UserRole
@@ -194,12 +195,27 @@ class EmployeeService:
 
     async def deactivate(self, user: User, employee_id: uuid.UUID) -> Employee:
         emp = await self._get_employee(user, employee_id)
-        emp.status = "Inactive" if emp.status not in ("Inactive", "inactive") else "Active"
+        activating = emp.status in ("Inactive", "inactive")
+        emp.status = "Active" if activating else "Inactive"
+        from_zone, from_area = emp.zone_id, emp.area_id
+        if not activating:
+            # the dialog promises unassignment — free the zone/area slot so
+            # allocation stops routing work to inactive staff
+            emp.zone_id = None
+            emp.area_id = None
+            self.session.add(AllocationEvent(
+                entity_type="employee", entity_id=emp.id,
+                property_id=emp.property_id,
+                from_zone_id=from_zone, to_zone_id=None,
+                from_area_id=from_area, to_area_id=None,
+                actor_user_id=user.id, actor_name=user.name,
+            ))
         res = await self.session.execute(
             select(User).where(User.employee_id == emp.id)
         )
         for u in res.scalars():
-            u.is_active = emp.status.lower() == "active"
+            u.is_active = activating
+            u.zone_id = emp.zone_id
         await self.session.commit()
         return emp
 
@@ -214,10 +230,18 @@ class EmployeeService:
         for t in res.scalars():
             t.employee_id = None
             t.assigned_to_name = None
+        # remove the linked login accounts entirely — keeping them would hold
+        # the email/username hostage and 409 any re-create of the same person
         res = await self.session.execute(
             select(User).where(User.employee_id == emp.id)
         )
         for u in res.scalars():
-            u.is_active = False  # revoke access, keep the audit trail
+            await self.session.delete(u)
+        # a deleted employee can no longer manage the property
+        res = await self.session.execute(
+            select(Property).where(Property.manager_employee_id == emp.id)
+        )
+        for p in res.scalars():
+            p.manager_employee_id = None
         await self.session.delete(emp)
         await self.session.commit()
