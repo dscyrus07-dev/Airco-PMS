@@ -428,6 +428,8 @@ export interface TaskCreateRequest {
   title: string;
   description?: string;
   task_type: TaskType;
+  /** cleaning | maintenance | inspection | housekeeping | other */
+  work_type?: string;
   employee_uid?: string;
   supervisor_uid?: string | null;
   room_uid?: string | null;
@@ -458,6 +460,7 @@ export interface TaskUpdateRequest {
   title?: string;
   description?: string;
   task_type?: TaskType;
+  work_type?: string;
   employee_uid?: string;
   supervisor_uid?: string | null;
   room_uid?: string | null;

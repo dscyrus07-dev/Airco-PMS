@@ -120,7 +120,7 @@ Supabase (Postgres + S3 storage). CI: `.github/workflows/ci.yml`.
 
 ## Gotchas
 
-- `cd backend && python -m pytest tests/ -x -q` — 111 tests (sqlite,
+- `cd backend && python -m pytest tests/ -x -q` — 127 tests (sqlite,
   pytest-asyncio) covering allocation fairness, occupancy, lifecycle, and
   the resource-state pipeline.
 - `SUPABASE_DB_HOST` has a hardcoded project default in config.py.

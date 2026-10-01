@@ -22,13 +22,25 @@ const STEPS = [
   { key: 'review', label: 'Review', icon: Eye, q: 'Everything look right?' },
 ];
 
-const TEMPLATE_TYPES = [
-  { v: 'housekeeping', l: 'Housekeeping' }, { v: 'maintenance', l: 'Maintenance' },
-  { v: 'operations', l: 'Operations' }, { v: 'inspection', l: 'Inspection' },
-  { v: 'other', l: 'Other' },
+// Work Type — the domain kind of the generated work items. It decides the
+// ticket/task kind, the default category and department eligibility for
+// zone allocation (cleaning/housekeeping → housekeeping staff only,
+// maintenance → maintenance/engineering).
+const WORK_TYPES: { v: WorkTemplate['template_type']; l: string; hint: string }[] = [
+  { v: 'cleaning', l: 'Cleaning', hint: 'Housekeeping staff only' },
+  { v: 'maintenance', l: 'Maintenance', hint: 'Maintenance / engineering staff' },
+  { v: 'inspection', l: 'Inspection', hint: 'Any eligible staff' },
+  { v: 'housekeeping', l: 'Housekeeping', hint: 'Housekeeping staff only' },
+  { v: 'other', l: 'Other', hint: 'Any eligible staff' },
 ];
+// Templates saved before the Work Type model keep their legacy type —
+// render it as an extra selected chip instead of silently rewriting it.
 const LEGACY_TYPE_LABELS: Record<string, string> = {
-  task: 'Task', cleaning: 'Cleaning', checklist: 'Checklist',
+  task: 'Task', operations: 'Operations', checklist: 'Checklist',
+};
+const WORK_TYPE_CATEGORY: Record<string, string> = {
+  cleaning: 'housekeeping', housekeeping: 'housekeeping',
+  maintenance: 'maintenance', inspection: 'inspection', other: 'other',
 };
 const CATEGORIES = ['housekeeping', 'maintenance', 'operations', 'safety', 'inspection', 'guest_services', 'inventory', 'security', 'other'];
 const TEAMS = ['Housekeeping', 'Maintenance', 'Front Desk', 'Security', 'Operations'];
@@ -97,7 +109,7 @@ export const TemplateWizard: React.FC<Props> = ({ editTemplate, onClose, onSaved
   const [form, setForm] = useState<WorkTemplateCreateRequest>(() => ({
     property_uid: activePropertyUid,
     name: editTemplate?.name || '',
-    template_type: editTemplate?.template_type || 'task',
+    template_type: editTemplate?.template_type || 'cleaning',
     description: editTemplate?.description || '',
     category: editTemplate?.category || 'housekeeping',
     priority: editTemplate?.priority || 'medium',
@@ -405,25 +417,51 @@ export const TemplateWizard: React.FC<Props> = ({ editTemplate, onClose, onSaved
       {step === 0 && (
         <div className="space-y-4">
           <div>
-            <label className={labelCls}>Template Name *</label>
-            <input value={form.name} onChange={(e) => set({ name: e.target.value })}
-              placeholder="e.g. Daily Room Inspection" className={inputCls} autoFocus />
-          </div>
-          <div>
-            <label className={labelCls}>Template Type</label>
+            <label className={labelCls}>Work Type *</label>
             <div className="flex flex-wrap gap-2">
-              {TEMPLATE_TYPES.map((t) => (
+              {[
+                ...WORK_TYPES,
+                ...(WORK_TYPES.some((t) => t.v === form.template_type)
+                  ? []
+                  : [{
+                      v: form.template_type,
+                      l: LEGACY_TYPE_LABELS[form.template_type] || form.template_type,
+                      hint: 'Legacy type',
+                    }]),
+              ].map((t) => (
                 <button key={t.v} type="button"
-                  onClick={() => set({ template_type: t.v as WorkTemplate['template_type'] })}
-                  className={`px-3.5 py-2 rounded-[10px] border text-[13px] font-medium cursor-pointer transition-all ${
+                  onClick={() => {
+                    // Keep category in step with the work kind while it still
+                    // holds the previous kind's default — never clobber a
+                    // category the user deliberately picked.
+                    const prevDefault = WORK_TYPE_CATEGORY[form.template_type];
+                    const patch: Partial<WorkTemplateCreateRequest> = { template_type: t.v };
+                    if (!form.category || form.category === prevDefault)
+                      patch.category = WORK_TYPE_CATEGORY[t.v] || 'other';
+                    set(patch);
+                  }}
+                  className={`px-3.5 py-2 rounded-[10px] border text-left cursor-pointer transition-all ${
                     form.template_type === t.v
                       ? 'bg-[#EBF3EC] border-[#386641] text-[#244E2C]'
                       : 'bg-white border-[#E2DCD0] text-[#58534C] hover:border-[#C8C1B4]'
                   }`}>
-                  {t.l}
+                  <span className="block text-[13px] font-medium">{t.l}</span>
+                  <span className={`block text-[10.5px] mt-0.5 ${
+                    form.template_type === t.v ? 'text-[#386641]' : 'text-[#A59F95]'
+                  }`}>{t.hint}</span>
                 </button>
               ))}
             </div>
+            <p className="text-[11px] text-[#8C867C] mt-1.5">
+              Sets the kind of work and which employees are eligible. On each
+              scheduled run the system creates an individual work item per
+              matching room, dorm bed or unit — then allocates them zone by zone.
+            </p>
+          </div>
+          <div>
+            <label className={labelCls}>Template Name *</label>
+            <input value={form.name} onChange={(e) => set({ name: e.target.value })}
+              placeholder="e.g. Daily Room Inspection" className={inputCls} autoFocus />
           </div>
           <div>
             <label className={labelCls}>Description</label>
@@ -1112,7 +1150,7 @@ export const TemplateWizard: React.FC<Props> = ({ editTemplate, onClose, onSaved
             </div>
             <dl className="divide-y divide-[#F0ECE4] text-[13px]">
               {[
-                ['TYPE', `${TEMPLATE_TYPES.find((t) => t.v === form.template_type)?.l} · ${(form.category || '').replace('_', ' ')} · ${form.priority} priority`],
+                ['WORK TYPE', `${WORK_TYPES.find((t) => t.v === form.template_type)?.l || LEGACY_TYPE_LABELS[form.template_type] || form.template_type} · ${(form.category || '').replace('_', ' ')} · ${form.priority} priority`],
                 ['ASSIGNMENT', assign.mode === 'automatic'
                   ? `Automatic — ${assign.method === 'zone_round_robin' ? 'zone round-robin' : assign.method?.replace(/_/g, ' ')}`
                   : assign.mode === 'individual'

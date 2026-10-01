@@ -1060,7 +1060,7 @@ class TemplateService:
             supervisor_id=sup_uid, supervisor_name=sup_name,
             employee_id=emp_id, assigned_to_name=emp_name,
             title=t.name, description=t.description,
-            task_type="fixed", origin="template",
+            task_type="fixed", work_type=t.template_type, origin="template",
             status=status_, priority=t.priority,
             due_date=due, due_time=(t.schedule or {}).get("time"),
             start_time=(t.schedule or {}).get("start_time"),
@@ -1349,6 +1349,12 @@ class TemplateService:
         # whole property (e.g. all occupied rooms → one task each); without
         # a target it stays a single property-level task.
         target = loc.get("target")
+        if target in (None, "none") and occupancy in ("occupied", "unoccupied"):
+            # Legacy condition templates saved before `target` existed —
+            # an occupancy filter only makes sense over units, so expand to
+            # rooms instead of collapsing into ONE property-wide task handed
+            # to a single employee.
+            target = "rooms"
         if target in ("rooms", "units", "rooms_beds"):
             for r in st["rooms"]:
                 if not keep_room(r):

@@ -81,6 +81,11 @@ class Task(Base):
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(String(2000), nullable=True)
     task_type: Mapped[str] = mapped_column(String(32), nullable=False, default="fixed")
+    # Domain work kind (cleaning | maintenance | inspection | housekeeping |
+    # other | …) — stamped at creation; drives department eligibility for
+    # allocation/reassignment. task_type is the lifecycle shape
+    # (fixed/repetitive/automated); work_type is the operating department.
+    work_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
     # Why the task exists — 'manual' | 'checkout' | 'template' |
     # 'automation'. Checkout-generated cleaning must be identifiable by
     # DATA, not by matching on the title string.

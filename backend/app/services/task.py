@@ -208,6 +208,8 @@ class TaskService:
 
     async def _task_work_type(self, task: Task) -> str:
         """Resolve the domain work kind from durable task provenance."""
+        if task.work_type:
+            return task.work_type
         template_type = allocation_work_type = None
         if task.template_id:
             from app.models.template import WorkTemplate
@@ -422,8 +424,14 @@ class TaskService:
             raise ValidationErr("Invalid task_type.", field="task_type")
         if payload.priority and payload.priority not in PRIORITIES:
             raise ValidationErr("Invalid priority.", field="priority")
+        from app.models.template import TEMPLATE_TYPES
         from app.services.work_allocation import infer_task_work_type
-        work_type = infer_task_work_type(title=payload.title)
+        if payload.work_type is not None:
+            work_type = payload.work_type.strip().lower()
+            if work_type not in TEMPLATE_TYPES:
+                raise ValidationErr("Invalid work_type.", field="work_type")
+        else:
+            work_type = infer_task_work_type(title=payload.title)
         emp_id, emp_name = await self._employee_or_none(
             payload.employee_uid, prop.id, work_type=work_type
         )
@@ -503,6 +511,7 @@ class TaskService:
             title=payload.title.strip(),
             description=payload.description,
             task_type=payload.task_type,
+            work_type=work_type,
             origin="automation" if payload.task_type == "automated"
                   else "manual",
             # automated rules are templates — scheduled until triggered;
@@ -577,6 +586,15 @@ class TaskService:
                 "(start, submit, approve, reject, reopen).",
                 field="status",
             )
+        if "work_type" in data:
+            wt = data.pop("work_type")
+            if wt is not None:
+                from app.models.template import TEMPLATE_TYPES
+                wt = str(wt).strip().lower()
+                if wt not in TEMPLATE_TYPES:
+                    raise ValidationErr(
+                        "Invalid work_type.", field="work_type")
+            task.work_type = wt
         if "employee_uid" in data:
             emp_id, emp_name = await self._employee_or_none(
                 data.pop("employee_uid"), task.property_id,
@@ -930,6 +948,7 @@ class TaskService:
             title=task.title,
             description=task.description,
             task_type="repetitive",
+            work_type=task.work_type,
             origin=task.origin or "manual",
             status="assigned" if emp_id else "pending",
             priority=task.priority,

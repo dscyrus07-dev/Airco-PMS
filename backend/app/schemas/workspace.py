@@ -427,6 +427,7 @@ def task_out(t: Task) -> dict:
         "title": t.title,
         "description": t.description,
         "task_type": t.task_type,
+        "work_type": t.work_type,
         "origin": t.origin,
         "status": t.status,
         "priority": t.priority,

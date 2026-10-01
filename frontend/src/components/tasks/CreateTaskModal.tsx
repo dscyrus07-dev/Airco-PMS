@@ -24,6 +24,16 @@ const inputCls =
 const labelCls =
   'block text-xs font-semibold text-[#45413B] uppercase tracking-wider mb-1 font-body';
 
+// Domain work kind — drives which departments are eligible for assignment
+// and is stored on the task. Task Type below is the lifecycle shape.
+const WORK_TYPE_OPTIONS = [
+  { value: 'cleaning', label: 'Cleaning' },
+  { value: 'maintenance', label: 'Maintenance' },
+  { value: 'inspection', label: 'Inspection' },
+  { value: 'housekeeping', label: 'Housekeeping' },
+  { value: 'other', label: 'Other' },
+];
+
 const TYPE_OPTIONS: { value: TaskType; label: string; hint: string; icon: React.ReactNode }[] = [
   {
     value: 'fixed',
@@ -58,6 +68,7 @@ export const CreateTaskModal: React.FC<CreateTaskModalProps> = ({ isOpen, onClos
 
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
+  const [workType, setWorkType] = useState('other');
   const [taskType, setTaskType] = useState<TaskType>('fixed');
   const [employeeUid, setEmployeeUid] = useState('');
   const [supervisorUid, setSupervisorUid] = useState('');
@@ -88,6 +99,7 @@ export const CreateTaskModal: React.FC<CreateTaskModalProps> = ({ isOpen, onClos
     if (editTask) {
       setTitle(editTask.title);
       setDescription(editTask.description || '');
+      setWorkType(editTask.work_type || 'other');
       setTaskType(editTask.task_type);
       setEmployeeUid(editTask.employee_uid || editTask.assigned_to_uid || '');
       setSupervisorUid(editTask.supervisor_uid || '');
@@ -115,6 +127,7 @@ export const CreateTaskModal: React.FC<CreateTaskModalProps> = ({ isOpen, onClos
   const reset = () => {
     setTitle('');
     setDescription('');
+    setWorkType('other');
     setTaskType('fixed');
     setEmployeeUid('');
     setSupervisorUid('');
@@ -158,6 +171,7 @@ export const CreateTaskModal: React.FC<CreateTaskModalProps> = ({ isOpen, onClos
         title: title.trim(),
         description: description.trim() || undefined,
         task_type: taskType,
+        work_type: workType,
         employee_uid: assigneeUid,
         supervisor_uid: taskType === 'automated' ? undefined : supervisorUid || null,
         room_uid: taskType === 'automated' ? undefined : roomUid || null,
@@ -217,6 +231,27 @@ export const CreateTaskModal: React.FC<CreateTaskModalProps> = ({ isOpen, onClos
       maxWidth="lg"
     >
       <form onSubmit={handleSubmit} className="space-y-4">
+        {/* Work Type — the domain kind; decides eligible departments */}
+        <div>
+          <label className={labelCls}>Work Type *</label>
+          <div className="flex flex-wrap gap-2">
+            {WORK_TYPE_OPTIONS.map((opt) => (
+              <button
+                key={opt.value}
+                type="button"
+                onClick={() => setWorkType(opt.value)}
+                className={`px-3.5 py-2 rounded-[10px] border text-[13px] font-medium cursor-pointer transition-all ${
+                  workType === opt.value
+                    ? 'border-[#386641] bg-[#EBF3EC] text-[#244E2C] ring-1 ring-[#386641]/30'
+                    : 'border-[#DDD7CB] bg-[#FAF8F5] text-[#555047] hover:bg-[#F2ECE3]'
+                }`}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
         {/* Task Type selector */}
         <div>
           <label className={labelCls}>Task Type *</label>

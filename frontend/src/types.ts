@@ -142,6 +142,9 @@ export interface Task {
   title: string;
   description?: string;
   task_type: TaskType;
+  /** domain work kind (cleaning | maintenance | inspection | housekeeping |
+   *  other) — drives department eligibility for allocation */
+  work_type?: string;
   /** provenance: 'manual' | 'checkout' | 'template' | 'automation' —
    *  checkout-generated cleaning is identified by data, not title text */
   origin?: 'manual' | 'checkout' | 'template' | 'automation';

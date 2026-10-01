@@ -299,6 +299,9 @@ class TaskCreateRequest(BaseModel):
     title: str = Field(min_length=1, max_length=255)
     description: str | None = None
     task_type: str = "fixed"  # fixed | repetitive | automated
+    # cleaning | maintenance | inspection | housekeeping | other — decides
+    # which departments are eligible; inferred from the title when omitted
+    work_type: str | None = None
     employee_uid: uuid.UUID | None = None
     supervisor_uid: uuid.UUID | None = None
     room_uid: uuid.UUID | None = None
@@ -322,6 +325,7 @@ class TaskUpdateRequest(BaseModel):  # noqa: D401 - partial update payload
     title: str | None = Field(default=None, min_length=1, max_length=255)
     description: str | None = None
     task_type: str | None = None
+    work_type: str | None = None
     employee_uid: uuid.UUID | None = None
     supervisor_uid: uuid.UUID | None = None
     room_uid: uuid.UUID | None = None

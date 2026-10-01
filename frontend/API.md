@@ -1095,6 +1095,7 @@ Optimistic update with **rollback on error** (the card snaps back if the request
   "title": "Clean Room 101",
   "description": "...",
   "task_type": "repetitive",
+  "work_type": "cleaning",
   "status": "pending",
   "priority": "high",
   "due_date": "2024-06-01" /* or ISO datetime for hourly recurrences */,
@@ -1132,6 +1133,7 @@ Optimistic update with **rollback on error** (the card snaps back if the request
   "title": "Clean Room 101",
   "description": "...",
   "task_type": "fixed",
+  "work_type": "cleaning",
   "employee_uid": "emp_...",
   "zone_uid": "zone_...",
   "priority": "medium",
@@ -1143,6 +1145,7 @@ Optimistic update with **rollback on error** (the card snaps back if the request
 }
 ```
 `recurrence*` only for `repetitive`; `automation_rule` only for `automated` (which has no `due_date`/`employee_uid` — the rule generates instances).
+`work_type` (`cleaning`/`maintenance`/`inspection`/`housekeeping`/`other` or any `template_type` value) is the domain work kind — stored on the task and used for department eligibility in allocation; when omitted it is inferred from the title.
 
 ### Response — `200` — `Task` (with initial `allocated`/`auto_generated` history event; backend assigns `task_uid`, `status`, `created_by_name`)
 

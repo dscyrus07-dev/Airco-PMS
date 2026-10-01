@@ -363,6 +363,97 @@ async def test_generation_is_idempotent(session, seed, four_zones):
 
 
 @pytest.mark.asyncio
+async def test_four_rooms_four_employees_each_gets_one(session, seed):
+    """4 occupied rooms in one zone + 4 eligible employees → 4 separate
+    work items, one per employee (nobody doubled up while a colleague
+    idles)."""
+    z = _zone(session, seed["prop"], "Even Zone")
+    await session.flush()
+    rooms = [_room(session, seed["prop"], f"E{i}", z) for i in range(4)]
+    emps = [_emp(session, seed, f"EV{i}", zone=z) for i in range(4)]
+    await session.flush()
+    for r in rooms:
+        _occupy(session, seed["prop"], room=r)
+    await session.flush()
+
+    t = await _tmpl(session, seed["prop"], {
+        "scope": "property", "target": "rooms", "occupancy": "occupied"})
+    n = await TemplateService(session)._generate(
+        t, _dt.datetime.now(_dt.timezone.utc))
+    assert n == 4
+    tasks = [tk for tk in await _tasks_for(session, t)
+             if tk.zone_id == z.id]
+    assert len(tasks) == 4
+    # one work item per room — and four DISTINCT assignees
+    assert {tk.room_id for tk in tasks} == {r.id for r in rooms}
+    assert {tk.employee_id for tk in tasks} == {e.id for e in emps}
+    assert all(tk.work_type == "cleaning" for tk in tasks)
+
+
+@pytest.mark.asyncio
+async def test_occupancy_evaluated_at_generation_time(session, seed):
+    """The condition must read LIVE occupancy — a room occupied after the
+    template was created is included; one vacated before the run is not."""
+    z = _zone(session, seed["prop"], "Live Zone")
+    await session.flush()
+    r1 = _room(session, seed["prop"], "L1", z)
+    r2 = _room(session, seed["prop"], "L2", z)
+    _emp(session, seed, "LE1", zone=z)
+    await session.flush()
+
+    # template created while ONLY r2 is occupied
+    _occupy(session, seed["prop"], room=r2)
+    await session.flush()
+    t = await _tmpl(session, seed["prop"], {
+        "scope": "property", "target": "rooms", "occupancy": "occupied"})
+
+    # occupancy flips before the scheduled run: r1 checks in, r2 checks out
+    _occupy(session, seed["prop"], room=r1)
+    res = await session.execute(
+        select(Occupancy).where(
+            Occupancy.room_id == r2.id, Occupancy.checked_out_at.is_(None))
+    )
+    res.scalar_one().checked_out_at = _dt.datetime.now(_dt.timezone.utc)
+    await session.flush()
+
+    n = await TemplateService(session)._generate(
+        t, _dt.datetime.now(_dt.timezone.utc))
+    tasks = await _tasks_for(session, t)
+    assert n == 1
+    assert [tk.room_id for tk in tasks] == [r1.id]
+
+
+@pytest.mark.asyncio
+async def test_maintenance_type_uses_maintenance_eligibility(session, seed):
+    """A maintenance work type produces maintenance TICKETS and only pulls
+    from maintenance/engineering staff — housekeeping is never picked."""
+    from app.models.maintenance import MaintenanceTicket
+
+    z = _zone(session, seed["prop"], "Maint Zone")
+    await session.flush()
+    _room(session, seed["prop"], "MT1", z)
+    _room(session, seed["prop"], "MT2", z)
+    _emp(session, seed, "HK-ONLY", zone=z)                      # housekeeping
+    eng = _emp(session, seed, "ENG", zone=z,
+               dept="Maintenance & Engineering")
+    await session.flush()
+
+    t = await _tmpl(session, seed["prop"],
+                    {"scope": "property", "target": "rooms"},
+                    ttype="maintenance")
+    n = await TemplateService(session)._generate(
+        t, _dt.datetime.now(_dt.timezone.utc))
+    assert n == 3  # MT1 + MT2 + the zone-less seed room (property pool)
+    res = await session.execute(
+        select(MaintenanceTicket).where(MaintenanceTicket.template_id == t.id))
+    tickets = list(res.scalars())
+    assert len(tickets) == 3
+    assert {tk.assigned_to for tk in tickets} == {eng.id}
+    # no Task rows — maintenance work type generates tickets
+    assert await _tasks_for(session, t) == []
+
+
+@pytest.mark.asyncio
 async def test_multi_property_tick_uses_own_structure(session, seed):
     """The structure snapshot is keyed per property — a second property's
     template must NOT expand against the first property's rooms."""
