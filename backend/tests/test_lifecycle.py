@@ -592,3 +592,52 @@ async def test_transition_deleted_resource_not_found(session, seed):
             "room", seed["room"].id, "cleaning", user=seed["admin"],
             source="task_start",
         )
+
+
+async def test_deactivate_delete_recreate_employee(session, seed):
+    """Service-layer port of the legacy HTTP repro: deactivate must free the
+    zone/area assignment, permanent delete must remove linked logins, and
+    re-creating the same person must not collide on email/username."""
+    from app.models.structure import Zone
+    from app.models.user import User, UserRole
+    from app.schemas.structure import EmployeeCreateRequest
+    from app.services.employee import EmployeeService
+    from sqlalchemy import select
+
+    zone = Zone(
+        property_id=seed["prop"].id, name="Z9", code="Z9", zone_type="stay")
+    session.add(zone)
+    emp = seed["employee"]
+    emp.zone_id = zone.id
+    login = User(
+        company_id=seed["company"].id, property_id=seed["prop"].id,
+        name="Worker One", email=emp.email, username="worker1",
+        password_hash="x", role=UserRole.EMPLOYEE, employee_id=emp.id,
+    )
+    session.add(login)
+    await session.commit()
+
+    svc = EmployeeService(session)
+
+    emp = await svc.deactivate(seed["admin"], emp.id)
+    assert emp.status.lower() == "deactivated"
+    assert emp.zone_id is None and emp.area_id is None
+    await session.refresh(login)
+    assert login.is_active is False
+
+    await svc.delete_employee(seed["admin"], emp.id)
+    assert (await session.execute(
+        select(User).where(User.employee_id == emp.id))).scalars().all() == []
+    assert (await session.execute(
+        select(type(emp)).where(type(emp).id == emp.id))
+    ).scalar_one_or_none() is None
+
+    # re-create with the same email must not 409 — the login is gone
+    new_emp = await svc.create_employee(
+        seed["admin"],
+        EmployeeCreateRequest(
+            property_uid=seed["prop"].id, name="Baljyot", email=emp.email,
+            password="Staff@1234", job_title="Housekeeping",
+        ),
+    )
+    assert new_emp.email == emp.email

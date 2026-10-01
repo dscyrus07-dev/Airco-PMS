@@ -243,19 +243,34 @@ class EmployeeService:
         return list(res.scalars())
 
     async def deactivate(self, user: User, employee_id: uuid.UUID) -> Employee:
-        """Pause the staff account without deleting employment/work history."""
+        """Pause the staff account without deleting employment/work history.
+
+        Deactivation also frees the zone/area assignment — allocation must
+        stop routing work to deactivated staff — and disables linked logins."""
         emp = await self._get_employee(user, employee_id)
         if emp.status.lower() != "deactivated":
+            from_zone, from_area = emp.zone_id, emp.area_id
             emp.status = EMPLOYEE_STATUS_DEACTIVATED
             emp.deactivated_at = datetime.now(timezone.utc)
             emp.reactivated_at = None
+            emp.zone_id = None
+            emp.area_id = None
             for linked in await self._linked_users(emp.id):
                 linked.is_active = False
+                linked.zone_id = None
             self.audit.record(
                 user, entity_type="employee", entity_id=emp.id,
                 entity_name=emp.name, action="employee_deactivated",
                 property_id=emp.property_id,
             )
+            if from_zone or from_area:
+                self.session.add(AllocationEvent(
+                    entity_type="employee", entity_id=emp.id,
+                    property_id=emp.property_id,
+                    from_zone_id=from_zone, to_zone_id=None,
+                    from_area_id=from_area, to_area_id=None,
+                    actor_user_id=user.id, actor_name=user.name,
+                ))
             await self.session.commit()
         return emp
 
@@ -351,6 +366,8 @@ class EmployeeService:
         for batch in res.scalars():
             batch.employee_id = None  # employee_name remains for audit
 
+        # remove the linked login accounts entirely — keeping them would hold
+        # the email/username hostage and 409 any re-create of the same person
         for linked in await self._linked_users(emp.id):
             await self.session.delete(linked)  # refresh tokens cascade
         self.audit.record(

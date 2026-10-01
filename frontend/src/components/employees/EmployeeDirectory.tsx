@@ -288,7 +288,7 @@ export const EmployeeDirectory: React.FC<{ deactivated?: boolean }> = ({
                             className="w-full px-3 py-1.5 text-xs text-[#C53B3B] hover:bg-[#FDE8E8] flex items-center gap-2 text-left cursor-pointer"
                           >
                             <Trash2 className="w-3.5 h-3.5" />
-                            <span>Delete Staff</span>
+                            <span>Delete Permanently</span>
                           </button>
                         </div>
                       )}
@@ -467,8 +467,8 @@ export const EmployeeDirectory: React.FC<{ deactivated?: boolean }> = ({
           entityName={empToDeactivate.name}
           title="Deactivate Staff?"
           warningTitle="Staff access will be paused."
-          impactMessage="This staff member will no longer be available for zone allocation, task assignment, or new work until they are reactivated."
-          promptMessage="Existing assignments and task history remain unchanged."
+          impactMessage="This staff member will be unassigned from their zone and no longer available for allocation, task assignment, or new work until they are reactivated."
+          promptMessage="Existing assignments and task history remain unchanged. Their login will be disabled until they are reactivated."
           confirmLabel="Deactivate"
           confirmVariant="primary"
         />
@@ -483,7 +483,7 @@ export const EmployeeDirectory: React.FC<{ deactivated?: boolean }> = ({
           entityType="Staff"
           entityName={empToDelete.name}
           title="Permanently Delete Staff?"
-          impactMessage="This action permanently removes the staff account from the database and cannot be undone."
+          impactMessage={`Permanently deleting ${empToDelete.name} removes their record and login, unassigns their open tasks, and preserves past task history. This cannot be undone.`}
           promptMessage={`Type ${empToDelete.name} to permanently delete this staff account.`}
           confirmLabel="Permanently Delete"
           confirmationText={empToDelete.name}
