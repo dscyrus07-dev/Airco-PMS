@@ -1006,6 +1006,13 @@ class TemplateService:
         out: list[dict] = []
         st = await self._structure(pid)
 
+        # A uid-scope whose uid is blank (or whose unit was deleted) widens
+        # to the whole property — never emit a phantom zone/area target.
+        if scope == "zone" and _uid(loc.get("zone_uid")) not in st["zones"]:
+            scope = "property"
+        if scope == "area" and _uid(loc.get("area_uid")) not in st["areas"]:
+            scope = "property"
+
         # occupancy condition — ALL | OCCUPIED | UNOCCUPIED, resolved
         # against the CURRENT open-occupancy rows (rooms/beds direct;
         # dorms derive from their beds). `occupied_only` is a legacy alias.

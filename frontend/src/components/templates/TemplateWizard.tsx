@@ -6,7 +6,7 @@ import {
 import { useApp } from '../../context/AppContext';
 import * as templatesApi from '../../api/templates';
 import {
-  WorkTemplate, WorkTemplateCreateRequest, TemplateChecklistItem,
+  WorkTemplate, WorkTemplateCreateRequest, TemplateChecklistItem, TemplateLocation,
 } from '../../api/types';
 import { Modal } from '../ui/Modal';
 import { Button } from '../ui/Button';
@@ -74,6 +74,15 @@ interface Props {
   onSaved: (t: WorkTemplate) => void;
 }
 
+// "All areas" + "All zones" IS property scope — a uid-scope left without
+// its uid means "everywhere", so widen it instead of blocking the wizard.
+const normalizeLocation = (l?: TemplateLocation | null): TemplateLocation => {
+  const loc: TemplateLocation = l ? { ...l } : { scope: 'property', target: 'rooms' };
+  if (loc.scope === 'zone' && !loc.zone_uid) loc.scope = loc.area_uid ? 'area' : 'property';
+  if (loc.scope === 'area' && !loc.area_uid) loc.scope = 'property';
+  return loc;
+};
+
 export const TemplateWizard: React.FC<Props> = ({ editTemplate, onClose, onSaved }) => {
   const {
     activePropertyUid, activeProperty, currentPropertyEmployees,
@@ -95,7 +104,7 @@ export const TemplateWizard: React.FC<Props> = ({ editTemplate, onClose, onSaved
     duration_minutes: editTemplate?.duration_minutes,
     status: 'draft',
     assignment: editTemplate?.assignment || { mode: 'automatic', method: 'zone_round_robin' },
-    location: editTemplate?.location || { scope: 'zone', target: 'rooms' },
+    location: normalizeLocation(editTemplate?.location),
     schedule: editTemplate?.schedule || { kind: 'recurring', frequency: 'daily', time: '10:00', timezone: 'Asia/Kolkata' },
     checklist: editTemplate?.checklist || [],
     verification: editTemplate?.verification || { checklist_required: true },
@@ -301,6 +310,7 @@ export const TemplateWizard: React.FC<Props> = ({ editTemplate, onClose, onSaved
       if (payload.template_type === 'operations') {
         payload.location = { scope: 'property' };
       }
+      payload.location = normalizeLocation(payload.location);
       const t = editTemplate
         ? await templatesApi.updateTemplate(editTemplate.template_uid, payload)
         : await templatesApi.createTemplate(payload);
