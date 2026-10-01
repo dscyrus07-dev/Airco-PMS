@@ -1,4 +1,9 @@
-export type UserRole = 'super_admin' | 'property_manager' | 'employee';
+export type UserRole =
+  | 'super_admin'
+  | 'property_manager'
+  | 'human_resource'
+  | 'department_manager'
+  | 'employee';
 
 export type RoomStatus = 'available' | 'occupied' | 'cleaning' | 'maintenance';
 export type BedStatus = 'available' | 'occupied' | 'cleaning' | 'maintenance' | 'inactive';
@@ -9,12 +14,16 @@ export type WashroomType =
   | 'No Washroom'
   | 'Attached Washroom'
   | 'Shared Washroom';
+export type WashroomResourceType = 'male' | 'female' | 'unisex';
+export type WashroomStatus = 'available' | 'cleaning' | 'maintenance' | 'inactive';
 export type EmployeeStatus =
   | 'Active'
+  | 'Deactivated'
   | 'On Leave'
   | 'Off Duty'
   | 'Probation'
   | 'active'
+  | 'deactivated'
   | 'inactive';
 
 export type TaskPriority = 'low' | 'medium' | 'high' | 'urgent' | 'critical';
@@ -69,7 +78,8 @@ export type TaskEventType =
   | 'redo_requested'
   | 'reassigned'
   | 'edited'
-  | 'auto_generated';
+  | 'auto_generated'
+  | 'evidence_deleted';
 
 export interface TaskHistoryEvent {
   event_uid: string;
@@ -80,16 +90,50 @@ export interface TaskHistoryEvent {
   photos?: string[]; // evidence photos attached to completion events
 }
 
+export interface TaskCompletionImage {
+  image_uid?: string | null;
+  task_uid?: string;
+  event_uid?: string | null;
+  submission_uid?: string | null;
+  url: string;
+  file_name?: string | null;
+  created_by_name?: string | null;
+  created_at?: string;
+}
+
+export type CompletionSubmissionStatus = 'pending' | 'approved' | 'disapproved' | string;
+
+export interface TaskCompletionSubmission {
+  submission_uid: string;
+  task_uid: string;
+  event_uid?: string | null;
+  attempt_number: number;
+  employee_uid?: string | null;
+  employee_name?: string | null;
+  submitted_at?: string | null;
+  status: CompletionSubmissionStatus;
+  reviewed_at?: string | null;
+  reviewer_uid?: string | null;
+  reviewed_by_name?: string | null;
+  review_comment?: string | null;
+  images: TaskCompletionImage[];
+}
+
 export interface Task {
   task_uid: string;
   ticket_number?: string; // TASK-YYYY-NNNNN — generated server-side
   property_uid?: string;
   zone_uid?: string | null;
+  area_uid?: string | null;
   room_uid?: string | null;
   room_number?: string;
   dorm_uid?: string | null;
   dorm_name?: string;
   bed_uids?: string[] | null; // beds covered by a dorm task
+  washroom_uid?: string | null;
+  washroom_name?: string;
+  washroom_fixture_uid?: string | null;
+  washroom_fixture_label?: string;
   supervisor_uid?: string | null;
   supervisor_name?: string;
   employee_uid?: string; // assignee
@@ -98,6 +142,9 @@ export interface Task {
   title: string;
   description?: string;
   task_type: TaskType;
+  /** provenance: 'manual' | 'checkout' | 'template' | 'automation' —
+   *  checkout-generated cleaning is identified by data, not title text */
+  origin?: 'manual' | 'checkout' | 'template' | 'automation';
   status: TaskStatus;
   priority: TaskPriority;
   due_date?: string;
@@ -111,6 +158,8 @@ export interface Task {
   recurrence_interval_days?: number; // used when recurrence === 'custom'
   automation_rule?: AutomationRule;
   history: TaskHistoryEvent[];
+  completion_images?: TaskCompletionImage[];
+  completion_submissions?: TaskCompletionSubmission[];
   submitted_at?: string;
   completed_at?: string;
   created_at?: string;
@@ -138,6 +187,7 @@ export interface MaintenanceAttachment {
   mime_type?: string;
   size_bytes?: number;
   kind: 'issue' | 'resolution';
+  attempt?: number | null;
   uploaded_by_name?: string;
   created_at?: string;
 }
@@ -161,7 +211,11 @@ export interface MaintenanceTicket {
   dorm_name?: string;
   bed_uid?: string | null;
   bed_number?: string;
-  location_label?: string; // server-computed: "Room 103" | "Dorm A · Bed 03" | "Dorm A"
+  washroom_uid?: string | null;
+  washroom_name?: string;
+  washroom_fixture_uid?: string | null;
+  washroom_fixture_label?: string;
+  location_label?: string; // server-computed target label
   zone_uid?: string | null;
   allocation_batch_id?: string | null;
   allocation_status?: 'auto_assigned' | 'manually_assigned' | 'unassigned' | string;
@@ -247,18 +301,57 @@ export interface Zone {
   created_at: string;
 }
 
-export interface Bed {
+/**
+ * Canonical two-axis state contract — resolved server-side by
+ * ResourceStateService and serialized identically on every resource
+ * payload. The frontend must never recompute these from task/ticket
+ * arrays or guess them from `status`.
+ *
+ *   status            materialized projection (legacy single column)
+ *   is_occupied       occupancy axis — open occupancy record
+ *   occupancy_state   'occupied' | 'unoccupied' | null (no occupancy axis)
+ *   operational_state 'available'|'cleaning'|'maintenance'|'inactive'
+ *                     (fixture also 'operational')
+ *   visual_state      the ONE visual classification: 'maintenance' → red,
+ *                     'cleaning' → beige, 'inactive' → neutral,
+ *                     'occupied' → violet, 'available' → green
+ */
+export type OccupancyState = 'occupied' | 'unoccupied';
+export type OperationalState =
+  | 'available'
+  | 'occupied'
+  | 'cleaning'
+  | 'maintenance'
+  | 'inactive'
+  | 'operational';
+export type VisualState =
+  | 'available'
+  | 'occupied'
+  | 'cleaning'
+  | 'maintenance'
+  | 'inactive';
+
+export interface ResourceStateContract {
+  is_occupied?: boolean;
+  occupancy_state?: OccupancyState | null;
+  operational_state?: OperationalState | null;
+  visual_state?: VisualState | null;
+}
+
+export interface Bed extends ResourceStateContract {
   bed_uid: string;
   dorm_uid: string;
   bed_number: string; // e.g. "Bed 01"
   status: BedStatus;
+  /** occupancy axis — open occupancy record; survives a maintenance flag */
   guest_name?: string;
 }
 
-export interface Room {
+export interface Room extends ResourceStateContract {
   room_uid: string;
   property_uid: string;
   zone_uid?: string | null; // null if unassigned
+  area_uid?: string | null;
   room_number: string; // e.g. "101"
   type: string;
   area_sqft?: number;
@@ -269,17 +362,63 @@ export interface Room {
   created_at: string;
 }
 
-export interface Dorm {
+/** Real per-fixture record inside a washroom (washroom_fixtures table). */
+export interface WashroomFixture extends ResourceStateContract {
+  fixture_uid: string;
+  washroom_uid: string;
+  /** 'shower' | 'stall' | 'urinal' | 'sink' | 'mirror' | custom label */
+  fixture_type: string;
+  fixture_number: number;
+  /** Display label, e.g. "Stall 02" */
+  label: string;
+  /** canonical: operational | maintenance | inactive (needs_cleaning is
+   *  task-driven — see cleaning tasks, not a stored fixture state) */
+  status: 'operational' | 'maintenance' | 'inactive';
+  last_cleaned_at?: string | null;
+  last_maintenance_at?: string | null;
+}
+
+export interface Washroom extends ResourceStateContract {
+  washroom_uid: string;
+  property_uid: string;
+  zone_uid?: string | null;
+  area_uid?: string | null;
+  /** Set → attached washroom owned by ONE dorm (independent config).
+   *  null → zone-level/common facility shared by the zone. */
+  dorm_uid?: string | null;
+  name: string;
+  washroom_type: WashroomResourceType;
+  /** Derived from real fixture rows — convenience counters, not columns */
+  stall_count: number;
+  urinal_count: number;
+  shower_count: number;
+  sink_count: number;
+  mirror_count: number;
+  bath_tub_count: number;
+  jacuzzi_count: number;
+  /** Extra named fixture types, e.g. { "Hand Dryer": 2 } — derived */
+  custom_fixtures?: Record<string, number>;
+  /** Real fixture records — the single source of truth */
+  fixtures: WashroomFixture[];
+  status: WashroomStatus;
+  created_at: string;
+}
+
+export interface Dorm extends ResourceStateContract {
   dorm_uid: string;
   property_uid: string;
   zone_uid?: string | null; // null if unassigned
+  area_uid?: string | null;
   name: string; // e.g. "Ganga Dorm A"
   dorm_type: DormType;
   washroom: WashroomType;
   floor?: string;
   area_sqft?: number;
   description?: string;
-  status?: 'active' | 'maintenance' | string;
+  /** operational status — same model as room (available|occupied|cleaning|maintenance) */
+  status: 'available' | 'occupied' | 'cleaning' | 'maintenance';
+  /** lifecycle flag — NOT operational status (spec §10: never conflated) */
+  is_active?: boolean;
   beds: Bed[];
   created_at: string;
 }
@@ -313,6 +452,8 @@ export interface Employee {
   avatar_color?: string;
   leave_balance_days?: number;
   leave_status?: boolean;
+  deactivated_at?: string | null;
+  reactivated_at?: string | null;
 }
 
 export interface AuthUser {

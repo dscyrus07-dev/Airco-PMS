@@ -71,9 +71,15 @@ export const Header: React.FC = () => {
   // Navigation Items per role / context
   let navItems: { label: string; path: string; icon: React.ReactNode }[] = [];
 
-  if (currentRole === 'employee') {
+  if (currentRole === 'human_resource') {
+    navItems = [
+      { label: 'Employee Management', path: '/hr/employee-management', icon: <Users className="w-4 h-4" /> },
+      { label: 'Task Management', path: '/hr/task-management', icon: <CheckSquare className="w-4 h-4" /> },
+    ];
+  } else if (currentRole === 'employee') {
     navItems = [
       { label: 'My Tasks', path: '/employee/tasks', icon: <CheckSquare className="w-4 h-4" /> },
+      { label: 'Raise Maintenance Ticket', path: '/employee/raise-maintenance-ticket', icon: <Wrench className="w-4 h-4" /> },
       { label: 'Profile', path: '/employee/profile', icon: <User className="w-4 h-4" /> },
     ];
   } else if (isInsideProperty) {

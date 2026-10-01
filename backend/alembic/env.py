@@ -11,8 +11,9 @@ import sys
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy.ext.asyncio import async_engine_from_config
 from sqlalchemy import pool
+from sqlalchemy.engine import make_url
+from sqlalchemy.ext.asyncio import async_engine_from_config
 
 # Make `app` importable when running `alembic` from backend/
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -26,6 +27,17 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata
+
+
+def _pgbouncer_connect_args() -> dict:
+    """Disable asyncpg prepared-statement cache when using a pgbouncer pooler."""
+    try:
+        parsed = make_url(settings.database_url)
+        if parsed.host and "pooler" in parsed.host:
+            return {"prepared_statement_cache_size": 0}
+    except Exception:
+        pass
+    return {}
 
 
 def run_migrations_offline() -> None:
@@ -52,6 +64,7 @@ async def run_async_migrations() -> None:
         configuration,
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
+        connect_args=_pgbouncer_connect_args(),
     )
     async with connectable.connect() as connection:
         await connection.run_sync(do_run_migrations)

@@ -11,6 +11,7 @@ import {
   Shield,
   Layers,
   Bed,
+  Bath,
   Users,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
@@ -19,7 +20,10 @@ import { Button } from '../ui/Button';
 import { Badge } from '../ui/Badge';
 import { CreatePropertyModal } from './CreatePropertyModal';
 import { ConfirmationDialog } from '../ui/ConfirmationDialog';
-import { Property } from '../../types';
+import { Property, Employee } from '../../types';
+import { listEmployees } from '../../api/employees';
+import { PropertyUpdateRequest } from '../../api/types';
+import { isEmployeeAssignable } from '../../lib/employeeUtils';
 
 export const PropertiesView: React.FC = () => {
   const {
@@ -27,6 +31,7 @@ export const PropertiesView: React.FC = () => {
     zones,
     rooms,
     dorms,
+    washrooms,
     setActivePropertyUid,
     navigate,
     deleteProperty,
@@ -41,6 +46,13 @@ export const PropertiesView: React.FC = () => {
   const [editingProperty, setEditingProperty] = useState<Property | null>(null);
   const [editName, setEditName] = useState('');
   const [editLocation, setEditLocation] = useState('');
+  const [editEmployees, setEditEmployees] = useState<Employee[]>([]);
+  const [editEmployeesLoading, setEditEmployeesLoading] = useState(false);
+  const [editManagerUid, setEditManagerUid] = useState('');
+  const [editManagerEmail, setEditManagerEmail] = useState('');
+  const [editManagerPassword, setEditManagerPassword] = useState('');
+  const [editPwError, setEditPwError] = useState('');
+  const [editEmailError, setEditEmailError] = useState('');
 
   const handleOpenProperty = (property_uid: string) => {
     setActivePropertyUid(property_uid);
@@ -51,17 +63,57 @@ export const PropertiesView: React.FC = () => {
     setEditingProperty(prop);
     setEditName(prop.name);
     setEditLocation(prop.location);
+    setEditManagerUid(prop.manager_employee_uid ?? '');
+    setEditManagerEmail(prop.manager_email ?? '');
+    setEditManagerPassword('');
+    setEditPwError('');
+    setEditEmailError('');
     setActiveMenuPropUid(null);
+    setEditEmployeesLoading(true);
+    listEmployees({ property_uid: prop.property_uid })
+      .then((r) => setEditEmployees(r.items))
+      .catch(() => setEditEmployees([]))
+      .finally(() => setEditEmployeesLoading(false));
   };
 
   const handleSaveEdit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!editingProperty || !editName.trim()) return;
+    if (editManagerPassword && editManagerPassword.length < 8) {
+      setEditPwError('Password must be at least 8 characters.');
+      return;
+    }
+    const mgrEmail = editManagerEmail.trim();
+    if (mgrEmail && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(mgrEmail)) {
+      setEditEmailError('Enter a valid email address.');
+      return;
+    }
+    const payload: PropertyUpdateRequest = {
+      name: editName.trim(),
+      location: editLocation.trim(),
+    };
+    const selectedIsRealEmployee = editEmployees.some(
+      (emp) => emp.employee_uid === editManagerUid
+    );
+    const managerChanged =
+      selectedIsRealEmployee &&
+      editManagerUid !== (editingProperty.manager_employee_uid ?? '');
+    const emailChanged =
+      mgrEmail.toLowerCase() !==
+      (editingProperty.manager_email ?? '').toLowerCase();
+    if (
+      managerChanged ||
+      (mgrEmail !== '' && emailChanged) ||
+      editManagerPassword
+    ) {
+      payload.manager = {
+        ...(managerChanged ? { employee_uid: editManagerUid } : {}),
+        ...(mgrEmail ? { email: mgrEmail } : {}),
+        ...(editManagerPassword ? { password: editManagerPassword } : {}),
+      };
+    }
     try {
-      await updateProperty(editingProperty.property_uid, {
-        name: editName.trim(),
-        location: editLocation.trim(),
-      });
+      await updateProperty(editingProperty.property_uid, payload);
       setEditingProperty(null);
     } catch {
       // Error toast handled by the context layer — keep dialog open
@@ -121,6 +173,9 @@ export const PropertiesView: React.FC = () => {
             const propZones = zones.filter((z) => z.property_uid === property.property_uid);
             const propRooms = rooms.filter((r) => r.property_uid === property.property_uid);
             const propDorms = dorms.filter((d) => d.property_uid === property.property_uid);
+            const propWashrooms = washrooms.filter(
+              (w) => w.property_uid === property.property_uid
+            );
 
             const totalBedsInDorms = propDorms.reduce((acc, d) => acc + d.beds.length, 0);
             const totalRoomBeds = propRooms.reduce((acc, r) => acc + r.bed_count, 0);
@@ -228,6 +283,11 @@ export const PropertiesView: React.FC = () => {
                     </div>
                     <span className="text-[#C5BFAF]">·</span>
                     <div className="flex items-center gap-1.5">
+                      <Bath className="w-3.5 h-3.5 text-[#2D5D7B]" />
+                      <span><strong>{propWashrooms.length}</strong> Washrooms</span>
+                    </div>
+                    <span className="text-[#C5BFAF]">·</span>
+                    <div className="flex items-center gap-1.5">
                       <span className="w-2 h-2 rounded-full bg-[#7C6DAF]" />
                       <span><strong>{totalBeds}</strong> Total Beds</span>
                     </div>
@@ -307,6 +367,110 @@ export const PropertiesView: React.FC = () => {
                   onChange={(e) => setEditLocation(e.target.value)}
                   className="w-full px-3.5 py-2 bg-[#FAF8F5] border border-[#DDD7CB] rounded-[10px] text-sm text-[#24221F] focus:outline-none focus:ring-2 focus:ring-[#386641]"
                 />
+              </div>
+
+              {/* Property Manager reassignment + password reset */}
+              <div className="pt-1 border-t border-[#F0ECE4] space-y-3">
+                <div>
+                  <label className="block text-xs font-semibold text-[#45413B] uppercase tracking-wider mb-1 mt-3">
+                    Property Manager
+                  </label>
+                  <select
+                    value={editManagerUid}
+                    disabled={editEmployeesLoading}
+                    onChange={(e) => {
+                      const uid = e.target.value;
+                      setEditManagerUid(uid);
+                      const emp = editEmployees.find(
+                        (x) => x.employee_uid === uid
+                      );
+                      if (emp) setEditManagerEmail(emp.email);
+                    }}
+                    className="w-full px-3.5 py-2 bg-[#FAF8F5] border border-[#DDD7CB] rounded-[10px] text-sm text-[#24221F] focus:outline-none focus:ring-2 focus:ring-[#386641] disabled:opacity-60"
+                  >
+                    {editManagerUid === '' && (
+                      <option value="">Unassigned</option>
+                    )}
+                    {editManagerUid !== '' &&
+                      !editEmployeesLoading &&
+                      !editEmployees.some(
+                        (e) => e.employee_uid === editManagerUid
+                      ) && (
+                        <option value={editManagerUid}>
+                          {editingProperty.manager_name} (current)
+                        </option>
+                      )}
+                    {editEmployees.filter(isEmployeeAssignable).map((emp) => (
+                      <option key={emp.employee_uid} value={emp.employee_uid}>
+                        {emp.name}
+                        {emp.employee_uid ===
+                        editingProperty.manager_employee_uid
+                          ? ' (current)'
+                          : ''}
+                      </option>
+                    ))}
+                  </select>
+                  <p className="mt-1.5 text-[11px] text-[#736E65] font-body">
+                    {editEmployeesLoading
+                      ? 'Loading employees…'
+                      : 'Pick any employee of this property to make them the manager.'}
+                  </p>
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold text-[#45413B] uppercase tracking-wider mb-1">
+                    Manager Email
+                  </label>
+                  <input
+                    type="email"
+                    value={editManagerEmail}
+                    onChange={(e) => {
+                      setEditManagerEmail(e.target.value);
+                      setEditEmailError('');
+                    }}
+                    className={`w-full px-3.5 py-2 bg-[#FAF8F5] border rounded-[10px] text-sm text-[#24221F] focus:outline-none focus:ring-2 focus:ring-[#386641] ${
+                      editEmailError ? 'border-[#C53B3B]' : 'border-[#DDD7CB]'
+                    }`}
+                  />
+                  {editEmailError ? (
+                    <p className="mt-1.5 text-[11px] text-[#C53B3B] font-body">
+                      {editEmailError}
+                    </p>
+                  ) : (
+                    <p className="mt-1.5 text-[11px] text-[#736E65] font-body">
+                      Login email for the selected manager — editable.
+                    </p>
+                  )}
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold text-[#45413B] uppercase tracking-wider mb-1">
+                    New Manager Password
+                  </label>
+                  <input
+                    type="password"
+                    value={editManagerPassword}
+                    onChange={(e) => {
+                      setEditManagerPassword(e.target.value);
+                      setEditPwError('');
+                    }}
+                    placeholder="Leave blank to keep current password"
+                    autoComplete="new-password"
+                    className={`w-full px-3.5 py-2 bg-[#FAF8F5] border rounded-[10px] text-sm text-[#24221F] focus:outline-none focus:ring-2 focus:ring-[#386641] ${
+                      editPwError ? 'border-[#C53B3B]' : 'border-[#DDD7CB]'
+                    }`}
+                  />
+                  {editPwError ? (
+                    <p className="mt-1.5 text-[11px] text-[#C53B3B] font-body">
+                      {editPwError}
+                    </p>
+                  ) : (
+                    <p className="mt-1.5 text-[11px] text-[#736E65] font-body">
+                      The current password is stored hashed and can't be
+                      displayed — enter a new one to replace it. If no manager
+                      account exists, the email + password above will create
+                      it.
+                    </p>
+                  )}
+                </div>
               </div>
               <div className="flex justify-end gap-2.5 pt-3">
                 <Button

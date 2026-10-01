@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   Armchair, Building2, Camera, CheckCircle2, Droplets, Hammer,
   MoreHorizontal, Paintbrush, Plus, ShieldAlert, SprayCan, Ticket, Tv, Waves,
@@ -8,7 +8,7 @@ import { useApp } from '../../context/AppContext';
 import { Modal } from '../ui/Modal';
 import { Button } from '../ui/Button';
 import { Badge } from '../ui/Badge';
-import { MaintenanceTicket, MaintenancePriority, Room, Dorm, Bed } from '../../types';
+import { MaintenanceTicket, MaintenancePriority, Room, Dorm, Bed, Washroom } from '../../types';
 import * as mediaApi from '../../api/media';
 import {
   MAINTENANCE_TYPE_OPTIONS,
@@ -43,11 +43,12 @@ interface Complaint {
 }
 const emptyComplaint = (): Complaint => ({ type: '', issueChoice: '', issue: '' });
 
-/** What the ticket is raised against — a room, a whole dorm, or a single bed. */
+/** What the ticket is raised against — a room, dorm, bed, or washroom. */
 export type MaintenanceTarget =
   | { kind: 'room'; room: Room }
   | { kind: 'dorm'; dorm: Dorm }
-  | { kind: 'bed'; dorm: Dorm; bed: Bed };
+  | { kind: 'bed'; dorm: Dorm; bed: Bed }
+  | { kind: 'washroom'; washroom: Washroom };
 
 interface CreateMaintenanceModalProps {
   /** One or more units — bulk selections create a ticket per unit. */
@@ -79,6 +80,13 @@ export const CreateMaintenanceModal: React.FC<CreateMaintenanceModalProps> = ({
   const [photos, setPhotos] = useState<{ file: File; previewUrl: string }[]>([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const photosRef = useRef(photos);
+  photosRef.current = photos;
+
+  useEffect(
+    () => () => photosRef.current.forEach((photo) => URL.revokeObjectURL(photo.previewUrl)),
+    []
+  );
 
   if (!targets || targets.length === 0) return null;
 
@@ -87,10 +95,12 @@ export const CreateMaintenanceModal: React.FC<CreateMaintenanceModalProps> = ({
 
   const labelFor = (t: MaintenanceTarget): string =>
     t.kind === 'room'
-      ? `Room ${t.room.room_number}`
+      ? t.room.room_number
       : t.kind === 'bed'
         ? `${t.dorm.name} · ${t.bed.bed_number}`
-        : t.dorm.name;
+        : t.kind === 'washroom'
+          ? t.washroom.name
+          : t.dorm.name;
 
   // Context line shown under the title + used in the active-ticket guard
   const targetLabel = isBulk
@@ -136,6 +146,7 @@ export const CreateMaintenanceModal: React.FC<CreateMaintenanceModalProps> = ({
             room_uid: t.kind === 'room' ? t.room.room_uid : undefined,
             dorm_uid: t.kind === 'dorm' ? t.dorm.dorm_uid : undefined,
             bed_uid: t.kind === 'bed' ? t.bed.bed_uid : undefined,
+            washroom_uid: t.kind === 'washroom' ? t.washroom.washroom_uid : undefined,
             maintenance_type: c.type,
             issue: c.issue,
             description: description.trim() || undefined,
@@ -612,7 +623,10 @@ export const CreateMaintenanceModal: React.FC<CreateMaintenanceModalProps> = ({
                   <button
                     type="button"
                     aria-label={`Remove ${p.file.name}`}
-                    onClick={() => setPhotos((prev) => prev.filter((_, j) => j !== i))}
+                    onClick={() => setPhotos((prev) => {
+                      URL.revokeObjectURL(prev[i].previewUrl);
+                      return prev.filter((_, j) => j !== i);
+                    })}
                     className="w-7 h-7 rounded-[7px] flex items-center justify-center text-[#8C867C] hover:text-[#B3372C] hover:bg-[#F7EDEB] transition-colors cursor-pointer shrink-0"
                   >
                     <X className="w-3.5 h-3.5" />

@@ -19,7 +19,7 @@ import {
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import * as templatesApi from '../../api/templates';
-import { WorkTemplate } from '../../api/types';
+import { WorkTemplate, WorkTemplateCreateRequest } from '../../api/types';
 import { Button } from '../ui/Button';
 import { Badge } from '../ui/Badge';
 import { Modal } from '../ui/Modal';
@@ -28,25 +28,77 @@ import { TemplateDetailDrawer } from './TemplateDetailDrawer';
 
 const TYPE_LABELS: Record<string, string> = {
   task: 'Task', maintenance: 'Maintenance', inspection: 'Inspection',
-  cleaning: 'Cleaning', checklist: 'Checklist', other: 'Other',
+  cleaning: 'Cleaning', housekeeping: 'Housekeeping',
+  operations: 'Operations', checklist: 'Checklist', other: 'Other',
 };
+
+// Legacy template_type values (task/cleaning/checklist) keep rendering
+// on existing rows — the wizard no longer offers them.
 
 const STATUS_VARIANT: Record<string, 'sage' | 'orange' | 'neutral' | 'red'> = {
   active: 'sage', paused: 'orange', draft: 'neutral', archived: 'red',
 };
 
+/** Premade recipes — one-click install; each becomes a real property
+    template the scheduler runs. `occupied_only` is honored server-side. */
+const PREMADE_TEMPLATES: {
+  key: string;
+  name: string;
+  description: string;
+  template_type: WorkTemplate['template_type'];
+  locationLabel: string;
+  scheduleLabel: string;
+  build: () => Omit<WorkTemplateCreateRequest, 'property_uid'>;
+}[] = [
+  {
+    key: 'daily-occupied-room-cleaning',
+    name: 'Daily Occupied-Room Cleaning',
+    description:
+      'Every occupied room is sent to cleaning at 8:00 AM IST, every day — ' +
+      'allocated to housekeeping via zone round-robin.',
+    template_type: 'cleaning',
+    locationLabel: 'All occupied rooms',
+    scheduleLabel: 'Every day · 08:00 IST',
+    build: () => ({
+      name: 'Daily Occupied-Room Cleaning',
+      template_type: 'cleaning',
+      description:
+        'Every occupied room is sent to cleaning at 8:00 AM IST every day.',
+      category: 'Housekeeping',
+      priority: 'medium',
+      status: 'active',
+      assignment: { mode: 'automatic', method: 'zone_round_robin' },
+      location: { scope: 'property', target: 'rooms', occupancy: 'occupied' },
+      schedule: {
+        kind: 'recurring',
+        frequency: 'daily',
+        every: 1,
+        time: '08:00',
+        timezone: 'Asia/Kolkata',
+      },
+    }),
+  },
+];
+
 function locationLabel(t: WorkTemplate): string {
   const loc = t.location || {};
   switch (loc.scope) {
     case 'zone': {
-      const tgt = { rooms: 'All rooms', dorms: 'All dorms', beds: 'All beds', units: 'All units' }[loc.target || 'units'] || 'Zone';
+      const tgt = { rooms: 'All rooms', dorms: 'All dorms', beds: 'All beds', washrooms: 'All washrooms', rooms_beds: 'All units', units: 'All units' }[loc.target || 'units'] || 'Zone';
       return `Zone · ${tgt}`;
     }
     case 'area': return 'Area';
     case 'rooms': return `${(loc.room_uids || []).length} room(s)`;
     case 'dorms': return `${(loc.dorm_uids || []).length} dorm(s)`;
     case 'beds': return `${(loc.bed_uids || []).length} bed(s)`;
-    default: return 'Entire property';
+    default: {
+      const occ = loc.occupancy || (loc.occupied_only ? 'occupied' : undefined);
+      if (loc.target) {
+        const tgt = { rooms: 'rooms', dorms: 'dorms', beds: 'beds', washrooms: 'washrooms', rooms_beds: 'rooms + beds', units: 'units' }[loc.target] || loc.target;
+        return occ ? `${occ === 'unoccupied' ? 'Unoccupied' : 'Occupied'} ${tgt}` : `All ${tgt}`;
+      }
+      return 'Entire property';
+    }
   }
 }
 
@@ -147,6 +199,25 @@ export const TemplatesView: React.FC = () => {
     }
   };
 
+  const usePremade = async (p: (typeof PREMADE_TEMPLATES)[number]) => {
+    if (!activePropertyUid) return;
+    if (items.some((t) => t.name === p.name)) {
+      addToast({ type: 'error', title: 'Already added', description: 'This template already exists for the property.' });
+      return;
+    }
+    try {
+      const created = await templatesApi.createTemplate({
+        property_uid: activePropertyUid,
+        ...p.build(),
+      });
+      upsert(created);
+      setStatusFilter('');
+      addToast({ type: 'success', title: 'Template added', description: 'Active — runs on schedule from the next occurrence.' });
+    } catch (err) {
+      addToast({ type: 'error', title: 'Could not add template', description: err instanceof Error ? err.message : '' });
+    }
+  };
+
   const upsert = (t: WorkTemplate) => {
     setItems((prev) => {
       const i = prev.findIndex((x) => x.template_uid === t.template_uid);
@@ -199,7 +270,7 @@ export const TemplatesView: React.FC = () => {
           ))}
         </select>
         <div className="flex items-center gap-1 bg-[#F0EDE6] rounded-[10px] p-1">
-          {['', 'active', 'paused', 'draft', 'archived'].map((s) => (
+          {['', 'premade', 'active', 'paused', 'draft', 'archived'].map((s) => (
             <button
               key={s}
               onClick={() => setStatusFilter(s)}
@@ -214,7 +285,53 @@ export const TemplatesView: React.FC = () => {
       </div>
 
       {/* Cards */}
-      {loading ? (
+      {statusFilter === 'premade' ? (
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+          {PREMADE_TEMPLATES.map((p) => {
+            const installed = items.some((t) => t.name === p.name);
+            return (
+              <div
+                key={p.key}
+                className="bg-white rounded-[14px] border border-[#EAE5DC] p-4 flex flex-col gap-3 hover:border-[#D5CFC3] hover:shadow-sm transition-all"
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <p className="font-semibold text-[15px] text-[#24221F] truncate">{p.name}</p>
+                    <p className="text-xs text-[#8C867C] mt-0.5">
+                      {TYPE_LABELS[p.template_type] || p.template_type} · Premade
+                    </p>
+                  </div>
+                  <Badge variant={installed ? 'sage' : 'neutral'} size="sm">
+                    {installed ? 'Added' : 'Premade'}
+                  </Badge>
+                </div>
+                <p className="text-xs text-[#58534C] leading-relaxed">{p.description}</p>
+                <div className="space-y-1.5 text-[12.5px] text-[#58534C]">
+                  <p className="flex items-center gap-2">
+                    <MapPin className="w-3.5 h-3.5 text-[#A59F95]" /> {p.locationLabel}
+                  </p>
+                  <p className="flex items-center gap-2">
+                    <RefreshCw className="w-3.5 h-3.5 text-[#A59F95]" /> {p.scheduleLabel}
+                  </p>
+                </div>
+                <div className="flex items-center gap-1.5 pt-2 border-t border-[#F0ECE4] mt-auto">
+                  <button
+                    onClick={() => void usePremade(p)}
+                    disabled={installed}
+                    className={`px-3 py-1.5 text-xs font-semibold rounded-[8px] inline-flex items-center gap-1 transition-colors ${
+                      installed
+                        ? 'text-[#8C867C] bg-[#F2ECE3] cursor-not-allowed'
+                        : 'text-white bg-[#386641] hover:bg-[#2E5536] cursor-pointer'
+                    }`}
+                  >
+                    <Plus className="w-3.5 h-3.5" /> {installed ? 'Added' : 'Add template'}
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ) : loading ? (
         <p className="text-sm text-[#8C867C] py-12 text-center">Loading templates…</p>
       ) : filtered.length === 0 ? (
         <div className="py-16 text-center">

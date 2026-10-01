@@ -1,261 +1,360 @@
-"""Work allocation engine tests — zone round-robin, batches, audit trail."""
+"""Acceptance tests for the unified work-allocation engine.
 
-import pytest_asyncio
-from httpx import AsyncClient
+Covers the zone + area combined-pool contract:
+  - area employees participate even when a zone has its own staff
+  - workload is the primary factor; rotation breaks ties
+  - department gating is applied to the combined pool
+  - dedup of employees appearing at both levels
+  - deactivated / on-leave employees are excluded
+  - zones with no direct staff allocate to the area pool
+"""
+import uuid
 
-from tests.test_structure import _auth, _property, _signup
+import pytest
 
-
-@pytest_asyncio.fixture
-async def admin(client):
-    return await _signup(client)
-
-
-@pytest_asyncio.fixture
-async def prop(client, admin):
-    return await _property(client, admin)
-
-
-async def _zone(client, h, pid, name="Zone B"):
-    res = await client.post("/api/v1/zones", headers=h, json={
-        "property_uid": pid, "name": name, "zone_type": "stay"})
-    assert res.status_code == 201, res.text
-    return res.json()
+from app.models.employee import Employee
+from app.models.structure import Area, Zone
+from app.models.task import Task
+from app.services.work_allocation import WorkAllocationService
 
 
-async def _room_in_zone(client, h, pid, zid, number):
-    res = await client.post("/api/v1/rooms", headers=h, json={
-        "property_uid": pid, "room_number": number,
-        "type": "Private Room", "zone_uid": zid})
-    assert res.status_code == 201, res.text
-    return res.json()
+def _emp(session, seed, name, dept, *, zone=None, area=None,
+         status="Active", leave=False):
+    e = Employee(
+        company_id=seed["company"].id, property_id=seed["prop"].id,
+        name=name, email=f"{name.lower()}@acme.test",
+        department=dept, status=status, leave_status=leave,
+        zone_id=zone.id if zone else None,
+        area_id=area.id if area else None,
+    )
+    session.add(e)
+    return e
 
 
-async def _employee_in_zone(client, h, pid, zid, name, email):
-    res = await client.post("/api/v1/employees", headers=h, json={
-        "property_uid": pid, "name": name, "email": email,
-        "password": "Staff@1234", "job_title": "Housekeeping"})
-    assert res.status_code == 201, res.text
-    emp = res.json()
-    res = await client.patch(
-        f"/api/v1/employees/{emp['employee_uid']}/allocation",
-        headers=h, json={"zone_uid": zid})
-    assert res.status_code == 200, res.text
-    return emp
+async def _alloc(session, seed, *, zone, work_type="cleaning"):
+    """allocate + record — the same pair production callers run."""
+    svc = WorkAllocationService(session)
+    res = await svc.allocate(
+        seed["admin"],
+        property_id=seed["prop"].id,
+        zone_id=zone.id,
+        zone_name=zone.name,
+        work_type=work_type,
+    )
+    await svc.record(
+        property_id=seed["prop"].id, zone_id=zone.id, batch=res.batch,
+        ticket_kind="task", ticket_id=uuid.uuid4(), ticket_number=None,
+        employee_id=res.employee.id if res.employee else None,
+        employee_name=res.employee.name if res.employee else None,
+        method=res.method, reason=res.reason,
+    )
+    return res
 
 
-async def _ticket(client, h, pid, room_uid, issue="Issue x"):
-    res = await client.post("/api/v1/maintenance", headers=h, json={
-        "property_uid": pid, "room_uid": room_uid,
-        "maintenance_type": "plumbing", "issue": issue, "priority": "medium"})
-    assert res.status_code == 201, res.text
-    return res.json()
+@pytest.fixture
+async def staffed_area(session, seed):
+    """Area A with Zone A (3 housekeeping staff) + 2 area-level staff."""
+    area = Area(property_id=seed["prop"].id, name="Floor A", code="FA")
+    session.add(area)
+    await session.flush()  # area.id (uuid default) materializes on flush
+    zone = Zone(property_id=seed["prop"].id, area_id=area.id,
+                name="Zone A", code="ZA", floor="Floor A")
+    session.add(zone)
+    await session.flush()
+    staff = {
+        "e1": _emp(session, seed, "E1", "Housekeeping", zone=zone),
+        "e2": _emp(session, seed, "E2", "Housekeeping", zone=zone),
+        "e3": _emp(session, seed, "E3", "Housekeeping", zone=zone),
+        "e5": _emp(session, seed, "E5", "Housekeeping", area=area),
+        "e7": _emp(session, seed, "E7", "Housekeeping", area=area),
+    }
+    await session.flush()
+    return {"area": area, "zone": zone, "staff": staff}
 
 
-# -- Test 1: three single tickets rotate Rahul → Priya → Amit ---------------
-async def test_round_robin_single_tickets(client, admin, prop):
-    h = _auth(admin)
-    pid = prop["property_uid"]
-    z = await _zone(client, h, pid)
-    for i, (n, e) in enumerate([("Rahul", "r1@t.co"), ("Priya", "p2@t.co"), ("Amit", "a3@t.co")]):
-        await _employee_in_zone(client, h, pid, z["zone_uid"], n, e)
-    room = await _room_in_zone(client, h, pid, z["zone_uid"], "101")
-
-    names = []
-    for i in range(3):
-        t = await _ticket(client, h, pid, room["room_uid"], f"Leak {i}")
-        names.append(t["assigned_to_name"])
-        assert t["allocation_status"] == "auto_assigned"
-        assert t["allocation_method"] == "round_robin"
-        assert t["allocation_batch_id"]
-        assert t["status"] == "assigned"  # auto-assigned ticket starts assigned
-    assert names == ["Rahul", "Priya", "Amit"]
-
-    # wrap-around
-    t = await _ticket(client, h, pid, room["room_uid"], "Leak 4")
-    assert t["assigned_to_name"] == "Rahul"
+@pytest.mark.asyncio
+async def test_area_staff_participate_beside_zone_staff(session, seed, staffed_area):
+    """4 allocations across 3 zone + 2 area staff → 4 distinct picks."""
+    chosen = set()
+    for _ in range(4):
+        res = await _alloc(session, seed, zone=staffed_area["zone"])
+        chosen.add(res.employee.name)
+    assert len(chosen) == 4
 
 
-# -- Test 2+3: batch across 3 rooms → per-room groups rotate the pointer ----
-async def test_batch_same_employee_pointer_once(client, admin, prop):
-    h = _auth(admin)
-    pid = prop["property_uid"]
-    z = await _zone(client, h, pid)
-    await _employee_in_zone(client, h, pid, z["zone_uid"], "Rahul", "r1@t.co")
-    await _employee_in_zone(client, h, pid, z["zone_uid"], "Priya", "p2@t.co")
-    rooms = [await _room_in_zone(client, h, pid, z["zone_uid"], n)
-             for n in ("101", "102", "103")]
-
-    res = await client.post("/api/v1/work-batches", headers=h, json={
-        "property_uid": pid,
-        "tickets": [
-            {"kind": "maintenance", "room_uid": r["room_uid"],
-             "maintenance_type": "plumbing", "issue": f"Batch issue {i}"}
-            for i, r in enumerate(rooms)
-        ]})
-    assert res.status_code == 201, res.text
-    batches = res.json()["batches"]
-    # each room is its own allocation group → 3 batches rotating the pool
-    assert len(batches) == 3
-    assert [b["employee_name"] for b in batches] == ["Rahul", "Priya", "Rahul"]
-    assert all(b["batch_number"].startswith("WB-") for b in batches)
-    assert all(len(b["tickets"]) == 1 for b in batches)
-
-    # pointer advanced per room → next single ticket goes to Priya
-    t = await _ticket(client, h, pid, rooms[0]["room_uid"], "Next one")
-    assert t["assigned_to_name"] == "Priya"
+@pytest.mark.asyncio
+async def test_full_pool_distribution_over_many_tasks(session, seed, staffed_area):
+    """10 allocations spread across all 5 eligible employees — nobody
+    hoards; each carries exactly 2."""
+    counts: dict[str, int] = {}
+    for _ in range(10):
+        res = await _alloc(session, seed, zone=staffed_area["zone"])
+        # bulk allocations inside one txn see in-flight workload via flush
+        counts[res.employee.name] = counts.get(res.employee.name, 0) + 1
+        t = Task(property_id=seed["prop"].id, employee_id=res.employee.id,
+                 title="Cleaning", status="assigned")
+        session.add(t)
+        await session.flush()
+    assert set(counts) == {"E1", "E2", "E3", "E5", "E7"}
+    assert all(c == 2 for c in counts.values())
 
 
-# -- Test 4: inactive employee is skipped ------------------------------------
-async def test_inactive_employee_skipped(client, admin, prop):
-    h = _auth(admin)
-    pid = prop["property_uid"]
-    z = await _zone(client, h, pid)
-    await _employee_in_zone(client, h, pid, z["zone_uid"], "Rahul", "r1@t.co")
-    priya = await _employee_in_zone(client, h, pid, z["zone_uid"], "Priya", "p2@t.co")
-    await _employee_in_zone(client, h, pid, z["zone_uid"], "Amit", "a3@t.co")
-    room = await _room_in_zone(client, h, pid, z["zone_uid"], "101")
-
-    # first ticket → Rahul
-    t = await _ticket(client, h, pid, room["room_uid"], "one")
-    assert t["assigned_to_name"] == "Rahul"
-
-    # deactivate Priya → next is Amit (not Priya)
-    res = await client.patch(f"/api/v1/employees/{priya['employee_uid']}",
-                             headers=h, json={"status": "Inactive"})
-    assert res.status_code == 200, res.text
-    t = await _ticket(client, h, pid, room["room_uid"], "two")
-    assert t["assigned_to_name"] == "Amit"
+@pytest.mark.asyncio
+async def test_zone_without_staff_uses_area_pool(session, seed, staffed_area):
+    """Zone C has no direct employees — the area pool covers it."""
+    zone_c = Zone(property_id=seed["prop"].id,
+                  area_id=staffed_area["area"].id,
+                  name="Zone C", code="ZC", floor="Floor A")
+    session.add(zone_c)
+    await session.flush()
+    res = await _alloc(session, seed, zone=zone_c)
+    assert res.employee.name in ("E5", "E7")
 
 
-# -- Test 5: employee zone transfer makes them eligible ----------------------
-async def test_employee_transfer_eligible(client, admin, prop):
-    h = _auth(admin)
-    pid = prop["property_uid"]
-    za = await _zone(client, h, pid, "Zone A")
-    zb = await _zone(client, h, pid, "Zone B")
-    rahul = await _employee_in_zone(client, h, pid, za["zone_uid"], "Rahul", "r1@t.co")
-    room_b = await _room_in_zone(client, h, pid, zb["zone_uid"], "201")
-
-    # Zone B has nobody → unassigned
-    t = await _ticket(client, h, pid, room_b["room_uid"], "before move")
-    assert t["allocation_status"] == "unassigned"
-    assert t["allocation_reason"] == "no_eligible_employee"
-    assert t["assigned_to"] is None
-
-    # move Rahul to Zone B → he becomes eligible
-    res = await client.patch(
-        f"/api/v1/employees/{rahul['employee_uid']}/allocation",
-        headers=h, json={"zone_uid": zb["zone_uid"]})
-    assert res.status_code == 200
-    t = await _ticket(client, h, pid, room_b["room_uid"], "after move")
-    assert t["assigned_to_name"] == "Rahul"
+@pytest.mark.asyncio
+async def test_workload_beats_zone_membership(session, seed, staffed_area):
+    """E1 loaded with open tasks → next pick goes to the least-loaded
+    area employee, not a zone member."""
+    e1 = staffed_area["staff"]["e1"]
+    for _ in range(5):
+        session.add(Task(property_id=seed["prop"].id, employee_id=e1.id,
+                         title="Cleaning", status="assigned"))
+    await session.flush()
+    # Force E2/E3 to carry work too so the least-loaded pick is an area one
+    e2, e3 = staffed_area["staff"]["e2"], staffed_area["staff"]["e3"]
+    for emp, n in ((e2, 2), (e3, 3)):
+        for _ in range(n):
+            session.add(Task(property_id=seed["prop"].id, employee_id=emp.id,
+                             title="Cleaning", status="assigned"))
+    await session.flush()
+    res = await _alloc(session, seed, zone=staffed_area["zone"])
+    assert res.employee.name in ("E5", "E7")  # load 0 area staff win
 
 
-# -- Test 6: room zone transfer resolves the NEW zone -------------------------
-async def test_room_transfer_uses_new_zone(client, admin, prop):
-    h = _auth(admin)
-    pid = prop["property_uid"]
-    za = await _zone(client, h, pid, "Zone A")
-    zb = await _zone(client, h, pid, "Zone B")
-    await _employee_in_zone(client, h, pid, za["zone_uid"], "ZoneAGuy", "za@t.co")
-    await _employee_in_zone(client, h, pid, zb["zone_uid"], "ZoneBGal", "zb@t.co")
-    room = await _room_in_zone(client, h, pid, za["zone_uid"], "301")
-
-    # move the room to Zone B — backend resolves zone from the DB row
-    res = await client.patch(f"/api/v1/rooms/{room['room_uid']}/allocation",
-                             headers=h, json={"zone_uid": zb["zone_uid"]})
-    assert res.status_code == 200, res.text
-    t = await _ticket(client, h, pid, room["room_uid"], "moved room")
-    assert t["assigned_to_name"] == "ZoneBGal"
-    assert t["zone_uid"] == zb["zone_uid"]
-
-
-# -- Test 7: manual reassign doesn't disturb the pointer ----------------------
-async def test_manual_reassign_preserves_pointer(client, admin, prop):
-    h = _auth(admin)
-    pid = prop["property_uid"]
-    z = await _zone(client, h, pid)
-    await _employee_in_zone(client, h, pid, z["zone_uid"], "Rahul", "r1@t.co")
-    priya = await _employee_in_zone(client, h, pid, z["zone_uid"], "Priya", "p2@t.co")
-    room = await _room_in_zone(client, h, pid, z["zone_uid"], "101")
-
-    t = await _ticket(client, h, pid, room["room_uid"], "auto")  # → Rahul
-    assert t["assigned_to_name"] == "Rahul"
-
-    # manual reassign Rahul → Priya; pointer must still hand the NEXT ticket
-    # to Priya (round-robin sequence unaffected by the override)
-    res = await client.post(f"/api/v1/maintenance/{t['ticket_uid']}/assign",
-                            headers=h, json={"employee_uid": priya["employee_uid"]})
-    assert res.status_code == 200, res.text
-    assert res.json()["allocation_status"] == "manually_assigned"
-    assert res.json()["allocation_method"] == "reassign"
-
-    t2 = await _ticket(client, h, pid, room["room_uid"], "next auto")
-    assert t2["assigned_to_name"] == "Priya"  # pointer moved Rahul → Priya
+@pytest.mark.asyncio
+async def test_department_gating_on_combined_pool(session, seed):
+    """Maintenance work never lands on housekeeping staff, zone or area."""
+    area = Area(property_id=seed["prop"].id, name="Floor B", code="FB")
+    session.add(area)
+    await session.flush()  # area.id (uuid default) materializes on flush
+    zone = Zone(property_id=seed["prop"].id, area_id=area.id,
+                name="Zone B", code="ZB", floor="Floor B")
+    session.add(zone)
+    await session.flush()
+    _emp(session, seed, "HK1", "Housekeeping", zone=zone)
+    m = _emp(session, seed, "MN1", "Maintenance & Engineering", zone=zone)
+    ma = _emp(session, seed, "MN2", "Maintenance & Engineering", area=area)
+    _emp(session, seed, "HK2", "Housekeeping", area=area)
+    await session.flush()
+    for _ in range(4):
+        res = await _alloc(session, seed, zone=zone, work_type="maintenance")
+        assert res.employee.id in (m.id, ma.id)
+        # mark done so rotation continues through the pool
+        res.batch  # noqa
+        session.add(Task(property_id=seed["prop"].id,
+                         employee_id=res.employee.id,
+                         title="Maintenance", status="assigned"))
+        await session.flush()
 
 
-# -- Test 8: no-zone ticket → UNASSIGNED, no random scatter -------------------
-async def test_no_zone_unassigned(client, admin, prop):
-    h = _auth(admin)
-    pid = prop["property_uid"]
-    res = await client.post("/api/v1/rooms", headers=h, json={
-        "property_uid": pid, "room_number": "999", "type": "Private Room"})
-    room = res.json()
-    t = await _ticket(client, h, pid, room["room_uid"], "zoneless")
-    assert t["allocation_status"] == "unassigned"
-    assert t["allocation_reason"] == "no_zone"
-    assert t["assigned_to"] is None
-    assert t["allocation_batch_id"]  # single ticket = batch of one
+@pytest.mark.asyncio
+async def test_employee_in_both_pools_deduplicated(session, seed, staffed_area):
+    """An employee carrying zone_id AND area_id is counted once."""
+    staff = staffed_area["staff"]
+    staff["e1"].area_id = staffed_area["area"].id  # dual assignment
+    await session.flush()
+    pool, _ = await WorkAllocationService(session).eligible_employees(
+        seed["prop"].id, staffed_area["zone"].id,
+        area_id=staffed_area["area"].id,
+        departments=("housekeeping",),
+    )
+    ids = [e.id for e in pool]
+    assert ids.count(staff["e1"].id) == 1
 
 
-# -- Task allocation uses the same engine -------------------------------------
-async def test_task_auto_allocation(client, admin, prop):
-    h = _auth(admin)
-    pid = prop["property_uid"]
-    z = await _zone(client, h, pid)
-    await _employee_in_zone(client, h, pid, z["zone_uid"], "Rahul", "r1@t.co")
-    await _employee_in_zone(client, h, pid, z["zone_uid"], "Priya", "p2@t.co")
-
-    # maintenance ticket first → Rahul (shared zone pointer)
-    room = await _room_in_zone(client, h, pid, z["zone_uid"], "101")
-    await _ticket(client, h, pid, room["room_uid"], "shared pointer")
-
-    # task without employee → auto-allocated to next (Priya) on same pointer
-    res = await client.post("/api/v1/tasks", headers=h, json={
-        "property_uid": pid, "title": "Clean 101", "task_type": "fixed",
-        "zone_uid": z["zone_uid"], "priority": "medium"})
-    assert res.status_code == 201, res.text
-    task = res.json()
-    assert task["assigned_to_name"] == "Priya"
-    assert task["allocation_status"] == "auto_assigned"
-    assert task["allocation_method"] == "round_robin"
+@pytest.mark.asyncio
+async def test_deactivated_and_on_leave_excluded(session, seed, staffed_area):
+    _emp(session, seed, "INACTIVE", "Housekeeping",
+         zone=staffed_area["zone"], status="Deactivated")
+    _emp(session, seed, "ONLEAVE", "Housekeeping",
+         zone=staffed_area["zone"], leave=True)
+    await session.flush()
+    pool, _ = await WorkAllocationService(session).eligible_employees(
+        seed["prop"].id, staffed_area["zone"].id,
+        area_id=staffed_area["area"].id,
+        departments=("housekeeping",),
+    )
+    names = {e.name for e in pool}
+    assert "INACTIVE" not in names and "ONLEAVE" not in names
 
 
-# -- Batch fetch + audit -------------------------------------------------------
-async def test_batch_fetch_and_history(client, admin, prop):
-    h = _auth(admin)
-    pid = prop["property_uid"]
-    z = await _zone(client, h, pid)
-    await _employee_in_zone(client, h, pid, z["zone_uid"], "Rahul", "r1@t.co")
-    rooms = [await _room_in_zone(client, h, pid, z["zone_uid"], n)
-             for n in ("101", "102")]
+@pytest.mark.asyncio
+async def test_no_eligible_reports_reason(session, seed):
+    """Empty pool → UNASSIGNED with reason, not a scattered pick."""
+    zone = Zone(property_id=seed["prop"].id, name="Empty", code="ZE",
+                floor="Nowhere")
+    session.add(zone)
+    await session.flush()
+    res = await _alloc(session, seed, zone=zone, work_type="maintenance")
+    assert res.employee is None
+    assert res.reason == "no_eligible_employee"
+    assert res.batch.allocation_status == "unassigned"
 
-    res = await client.post("/api/v1/work-batches", headers=h, json={
-        "property_uid": pid,
-        "tickets": [
-            {"kind": "maintenance", "room_uid": rooms[0]["room_uid"],
-             "maintenance_type": "hvac", "issue": "AC issue"},
-            {"kind": "maintenance", "room_uid": rooms[0]["room_uid"],
-             "maintenance_type": "hvac", "issue": "Thermostat"},
-        ]})
-    bid = res.json()["batches"][0]["batch_id"]
 
-    res = await client.get(f"/api/v1/work-batches/{bid}", headers=h)
-    assert res.status_code == 200, res.text
-    b = res.json()
-    assert b["employee_name"] == "Rahul"
-    assert len(b["tickets"]) == 2  # same room → same batch → same employee
+@pytest.mark.asyncio
+async def test_unified_pool_order_is_scope_agnostic(session, seed, staffed_area):
+    """Coverage determines eligibility, never priority — the merged pool
+    is ordered by created_at, not zone-first. An area employee created
+    BEFORE the zone staff must head the tie order."""
+    import datetime as _dt
+    area_emp = _emp(session, seed, "E0", "Housekeeping",
+                    area=staffed_area["area"])
+    session.flush()
+    # force a strictly earlier timestamp than the zone staff
+    area_emp.created_at = _dt.datetime(2024, 1, 1)
+    zone_emp = staffed_area["staff"]["e1"]
+    zone_emp.created_at = _dt.datetime(2024, 1, 2)
+    for e in staffed_area["staff"].values():
+        if e is not area_emp and e.created_at is None:
+            e.created_at = _dt.datetime(2024, 1, 2)
+    await session.flush()
 
-    res = await client.get(f"/api/v1/properties/{pid}/work-batches", headers=h)
-    assert res.json()["total"] >= 1
+    svc = WorkAllocationService(session)
+    _, _, pool, level = await svc._eligible_pools(
+        seed["prop"].id, staffed_area["zone"].id,
+        manager_employee_id=None,
+        departments=("housekeeping",),
+    )
+    names = [e.name for e in pool]
+    assert level == "zone+area"
+    assert len(names) == len(set(names))          # deduped
+    assert names[0] == "E0"                        # earliest-created leads
+    # zone and area staff interleave by created_at, not by coverage scope
+    assert set(names) == {"E0", "E1", "E2", "E3", "E5", "E7"}
+
+
+async def _alloc_scoped(session, seed, *, zone=None, area=None,
+                        work_type="cleaning"):
+    """allocate at any level — zone / area / property (all None)."""
+    svc = WorkAllocationService(session)
+    res = await svc.allocate(
+        seed["admin"],
+        property_id=seed["prop"].id,
+        zone_id=zone.id if zone else None,
+        zone_name=zone.name if zone else None,
+        area_id=area.id if area else None,
+        area_name=area.name if area else None,
+        work_type=work_type,
+    )
+    await svc.record(
+        property_id=seed["prop"].id,
+        zone_id=zone.id if zone else None,
+        batch=res.batch,
+        ticket_kind="task", ticket_id=uuid.uuid4(), ticket_number=None,
+        employee_id=res.employee.id if res.employee else None,
+        employee_name=res.employee.name if res.employee else None,
+        method=res.method, reason=res.reason,
+    )
+    return res
+
+
+@pytest.mark.asyncio
+async def test_property_level_task_uses_property_pool(session, seed,
+                                                      staffed_area):
+    """No zone, no area → the ENTIRE property's eligible staff form the
+    pool (dept-gated) and rotate fairly — not 'no_zone' unassigned."""
+    chosen = []
+    for _ in range(5):
+        res = await _alloc_scoped(session, seed, work_type="cleaning")
+        assert res.level == "property"
+        assert res.employee is not None
+        chosen.append(res.employee.name)
+        session.add(Task(property_id=seed["prop"].id,
+                         employee_id=res.employee.id,
+                         title="Ops", status="assigned"))
+        await session.flush()
+    # all 5 housekeeping staff in the property participate
+    assert set(chosen) == {"E1", "E2", "E3", "E5", "E7"}
+
+
+@pytest.mark.asyncio
+async def test_area_task_includes_zone_staff(session, seed, staffed_area):
+    """Area-level task pool = area-wide staff UNION staff of zones
+    inside the area — a zone-only employee is eligible for area work."""
+    res = await _alloc_scoped(session, seed, area=staffed_area["area"],
+                              work_type="cleaning")
+    assert res.employee is not None
+    assert res.level == "area"
+    # the unified area pool holds all 5 housekeeping employees
+    assert {e.name for e in res.pool_employees} == \
+        {"E1", "E2", "E3", "E5", "E7"}
+
+    # rotate over all 5
+    chosen = set()
+    for _ in range(5):
+        res = await _alloc_scoped(session, seed, area=staffed_area["area"])
+        chosen.add(res.employee.name)
+        session.add(Task(property_id=seed["prop"].id,
+                         employee_id=res.employee.id,
+                         title="Ops", status="assigned"))
+        await session.flush()
+    assert len(chosen) == 5
+
+
+@pytest.mark.asyncio
+async def test_property_task_no_eligible_still_unassigned(session, seed):
+    """A property-level maintenance task with no maintenance staff stays
+    UNASSIGNED — eligibility is never bypassed."""
+    res = await _alloc_scoped(session, seed, work_type="maintenance")
+    assert res.employee is None
+    assert res.reason == "no_eligible_employee"
+    assert res.level == "property"
+
+
+@pytest.mark.asyncio
+async def test_allocate_people_named_employees(session, seed, staffed_area):
+    """Operations → specific employees: the named list IS the pool.
+    An ineligible (wrong-department) name is silently excluded."""
+    staff = staffed_area["staff"]
+    pool = [staff["e1"], staff["e5"]]  # housekeeping pair, mixed coverage
+    chosen = set()
+    for _ in range(4):
+        res = await WorkAllocationService(session).allocate_people(
+            seed["admin"], property_id=seed["prop"].id,
+            employees=pool, work_type="cleaning",
+            pool_label="2 named employees",
+        )
+        chosen.add(res.employee.name)
+        session.add(Task(property_id=seed["prop"].id,
+                         employee_id=res.employee.id,
+                         title="Ops", status="assigned"))
+        await session.flush()
+    assert chosen == {"E1", "E5"}
+    assert res.level == "people"
+
+
+@pytest.mark.asyncio
+async def test_allocate_people_department_gating(session, seed,
+                                                 staffed_area):
+    """A 'maintenance' people-pool task: housekeeping members are
+    filtered out even though the caller passed them."""
+    maint = _emp(session, seed, "M1", "Maintenance",
+                 area=staffed_area["area"])
+    await session.flush()
+    staff = staffed_area["staff"]
+    res = await WorkAllocationService(session).allocate_people(
+        seed["admin"], property_id=seed["prop"].id,
+        employees=[staff["e1"], staff["e5"], maint],
+        work_type="maintenance", pool_label="dept:Maintenance",
+    )
+    assert res.employee.name == "M1"
+
+
+@pytest.mark.asyncio
+async def test_allocate_people_empty_pool_unassigned(session, seed):
+    res = await WorkAllocationService(session).allocate_people(
+        seed["admin"], property_id=seed["prop"].id,
+        employees=[], work_type="cleaning",
+    )
+    assert res.employee is None
+    assert res.reason == "no_eligible_employee"

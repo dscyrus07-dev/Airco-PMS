@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     # Database — password injected via SUPABASE_DB_PASSWORD or a full URL
     DATABASE_URL: str | None = None
     SUPABASE_DB_PASSWORD: str | None = None
-    SUPABASE_DB_HOST: str = "db.asuzvovuecxuztynidss.supabase.co"
+    SUPABASE_DB_HOST: str = "db.lqaejzcipdozffpftllp.supabase.co"
     SUPABASE_DB_PORT: int = 5432
     SUPABASE_DB_NAME: str = "postgres"
     SUPABASE_DB_USER: str = "postgres"
@@ -43,11 +43,11 @@ class Settings(BaseSettings):
     DB_POOL_TIMEOUT: int = 30
 
     # Supabase services (storage configured, not yet implemented)
-    SUPABASE_URL: str = "https://asuzvovuecxuztynidss.supabase.co"
+    SUPABASE_URL: str = "https://lqaejzcipdozffpftllp.supabase.co"
     SUPABASE_PUBLISHABLE_KEY: str | None = None
     SUPABASE_SECRET_KEY: str | None = None
     SUPABASE_STORAGE_S3_URL: str = (
-        "https://asuzvovuecxuztynidss.storage.supabase.co/storage/v1/s3"
+        "https://lqaejzcipdozffpftllp.storage.supabase.co/storage/v1/s3"
     )
 
     # Auth / JWT
@@ -79,6 +79,7 @@ class Settings(BaseSettings):
     # Container filesystems are disposable — prod must not land on local.
     STORAGE_BACKEND: str = "auto"
     UPLOAD_DIR: str = "uploads"
+    MAX_TASK_COMPLETION_IMAGES: int = 10
     SUPABASE_STORAGE_BUCKET: str = "uploads"
     S3_ENDPOINT_URL: str | None = None  # leave unset for AWS; set for Supabase/MinIO
     S3_REGION: str = "us-east-1"
@@ -101,6 +102,18 @@ class Settings(BaseSettings):
                 warnings.append("no database configured (DATABASE_URL or SUPABASE_DB_PASSWORD)")
             if self.DEBUG:
                 warnings.append("DEBUG=true in production")
+            if self.STORAGE_BACKEND == "local" or (
+                self.STORAGE_BACKEND == "auto"
+                and not (
+                    self.S3_BUCKET and self.S3_ACCESS_KEY and self.S3_SECRET_KEY
+                )
+                and not self.SUPABASE_SECRET_KEY
+            ):
+                warnings.append(
+                    "media storage resolves to local in production — uploads "
+                    "land on an ephemeral filesystem (set S3_* or "
+                    "SUPABASE_SECRET_KEY, or STORAGE_BACKEND=s3/supabase)"
+                )
         return warnings
 
     @field_validator(

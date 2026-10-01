@@ -82,7 +82,7 @@ def register_exception_handlers(app: FastAPI) -> None:
             for e in exc.errors()
         ]
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=422,
             content={
                 "detail": details,
                 "error": _error_body(
@@ -95,8 +95,13 @@ def register_exception_handlers(app: FastAPI) -> None:
     async def database_error_handler(
         request: Request, exc: SQLAlchemyError
     ) -> JSONResponse:
-        # Log the real error internally; never expose DB internals to clients.
-        logger.error("Database error on %s %s: %s", request.method, request.url.path, type(exc).__name__)
+        # Log the REAL error server-side (type + message, truncated) — a
+        # type-only log ("ProgrammingError") is undiagnosable. The client
+        # still gets the sanitized 503 — never expose DB internals.
+        logger.error(
+            "Database error on %s %s: %s",
+            request.method, request.url.path, str(exc)[:500],
+        )
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             content=_error_body(
@@ -107,7 +112,13 @@ def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(Exception)
     async def unhandled_error_handler(request: Request, exc: Exception) -> JSONResponse:
         logger.exception("Unhandled error on %s %s", request.method, request.url.path)
-        message = "An unexpected error occurred." if not settings.DEBUG else str(exc)
+        # Detail leaks only in real development — a misconfigured DEBUG=true
+        # in production must never expose internals to clients.
+        message = (
+            str(exc)
+            if settings.DEBUG and not settings.is_production
+            else "An unexpected error occurred."
+        )
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content=_error_body("INTERNAL_ERROR", message),

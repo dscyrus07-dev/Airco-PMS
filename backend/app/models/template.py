@@ -25,7 +25,10 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models import Base
 
-TEMPLATE_TYPES = {"task", "maintenance", "inspection", "cleaning", "checklist", "other"}
+TEMPLATE_TYPES = {
+    "task", "maintenance", "inspection", "cleaning", "checklist",
+    "operations", "housekeeping", "other",
+}
 TEMPLATE_STATUSES = {"draft", "active", "paused", "archived"}
 
 

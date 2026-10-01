@@ -17,24 +17,34 @@ import {
   GripVertical,
   MapPinOff,
   CheckCircle2,
+  Bath,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
-import { Room, Dorm, Zone } from '../../types';
+import { Room, Dorm, Washroom, Zone } from '../../types';
 import { RoomStatusBadge, Badge } from '../ui/Badge';
 import { zoneSupportsUnits, ZONE_TYPE_LABELS } from '../../lib/zoneUtils';
 
-type DragItem = { kind: 'room' | 'dorm'; item: Room | Dorm };
+type DragItem = {
+  kind: 'room' | 'dorm' | 'washroom';
+  item: Room | Dorm | Washroom;
+};
 
 // ---------------------------------------------------------------------------
 // Draggable unit cards (room or dorm)
 // ---------------------------------------------------------------------------
 
 const DraggableUnitCard: React.FC<{
-  kind: 'room' | 'dorm';
-  item: Room | Dorm;
+  kind: DragItem['kind'];
+  item: DragItem['item'];
   isOverlay?: boolean;
 }> = ({ kind, item, isOverlay = false }) => {
-  const dragId = `${kind}-${kind === 'room' ? (item as Room).room_uid : (item as Dorm).dorm_uid}`;
+  const itemUid =
+    kind === 'room'
+      ? (item as Room).room_uid
+      : kind === 'dorm'
+      ? (item as Dorm).dorm_uid
+      : (item as Washroom).washroom_uid;
+  const dragId = `${kind}-${itemUid}`;
   const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
     id: dragId,
     data: { kind, item } satisfies DragItem | unknown,
@@ -60,25 +70,37 @@ const DraggableUnitCard: React.FC<{
             className={`w-7 h-7 rounded-[8px] flex items-center justify-center shrink-0 ${
               kind === 'room'
                 ? 'bg-[#EBF3EC] text-[#386641]'
-                : 'bg-[#F2EFF9] text-[#554388]'
+                : kind === 'dorm'
+                ? 'bg-[#F2EFF9] text-[#554388]'
+                : 'bg-[#EFF6FA] text-[#2D5D7B]'
             }`}
           >
             {kind === 'room' ? (
               <Building2 className="w-3.5 h-3.5" />
-            ) : (
+            ) : kind === 'dorm' ? (
               <Bed className="w-3.5 h-3.5" />
+            ) : (
+              <Bath className="w-3.5 h-3.5" />
             )}
           </div>
           <div className="min-w-0">
             <h4 className="font-semibold text-xs text-[#24221F] leading-tight truncate">
               {kind === 'room'
-                ? `Room ${(item as Room).room_number}`
-                : (item as Dorm).name}
+                ? (item as Room).room_number
+                : kind === 'dorm'
+                ? (item as Dorm).name
+                : (item as Washroom).name}
             </h4>
             <p className="text-[11px] text-[#6C675F] font-body truncate">
               {kind === 'room'
                 ? (item as Room).type
-                : `${(item as Dorm).beds.length} beds · ${(item as Dorm).dorm_type}`}
+                : kind === 'dorm'
+                ? `${(item as Dorm).beds.length} beds · ${(item as Dorm).dorm_type}`
+                : `${(item as Washroom).washroom_type} · ${
+                    (item as Washroom).stall_count
+                  } stalls · ${(item as Washroom).urinal_count} urinals · ${
+                    (item as Washroom).shower_count
+                  } showers`}
             </p>
           </div>
         </div>
@@ -88,11 +110,19 @@ const DraggableUnitCard: React.FC<{
 
       <div className="flex items-center justify-between pt-2 mt-2 border-t border-[#F5F2EC]">
         <span className="text-[9px] uppercase tracking-wider font-semibold text-[#8C867C]">
-          {kind === 'room' ? 'Private Room' : 'Shared Dorm'}
+          {kind === 'room'
+            ? 'Private Room'
+            : kind === 'dorm'
+            ? 'Shared Dorm'
+            : 'Washroom'}
         </span>
-        {kind === 'room' && (
+        {kind === 'room' ? (
           <RoomStatusBadge status={(item as Room).status} />
-        )}
+        ) : kind === 'washroom' ? (
+          <span className="text-[10px] capitalize text-[#6C675F]">
+            {(item as Washroom).status.replace('_', ' ')}
+          </span>
+        ) : null}
       </div>
     </div>
   );
@@ -170,13 +200,19 @@ const DroppableZoneColumn: React.FC<{
               {isUnallocated ? 'Everything is allocated' : 'No units in this zone'}
             </p>
             <p className="text-[11px] mt-0.5 opacity-80">
-              Drag a room or dorm here
+              Drag a room, dorm, or washroom here
             </p>
           </div>
         ) : (
           units.map((u) => (
             <DraggableUnitCard
-              key={`${u.kind}-${u.kind === 'room' ? (u.item as Room).room_uid : (u.item as Dorm).dorm_uid}`}
+              key={`${u.kind}-${
+                u.kind === 'room'
+                  ? (u.item as Room).room_uid
+                  : u.kind === 'dorm'
+                  ? (u.item as Dorm).dorm_uid
+                  : (u.item as Washroom).washroom_uid
+              }`}
               kind={u.kind}
               item={u.item}
             />
@@ -196,8 +232,11 @@ export const UnitZoneBoard: React.FC = () => {
     currentPropertyZones,
     currentPropertyRooms,
     currentPropertyDorms,
+    currentPropertyWashrooms,
     assignRoomToZone,
     assignDormToZone,
+    moveWashroomToZone,
+    addToast,
   } = useApp();
 
   const [activeDrag, setActiveDrag] = useState<DragItem | null>(null);
@@ -206,19 +245,18 @@ export const UnitZoneBoard: React.FC = () => {
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } })
   );
 
-  const stayZones = currentPropertyZones.filter((z) => zoneSupportsUnits(z));
+  const allocationZones = currentPropertyZones;
 
   const allUnits: DragItem[] = [
     ...currentPropertyRooms.map((r): DragItem => ({ kind: 'room', item: r })),
     ...currentPropertyDorms.map((d): DragItem => ({ kind: 'dorm', item: d })),
+    ...currentPropertyWashrooms.map(
+      (w): DragItem => ({ kind: 'washroom', item: w })
+    ),
   ];
 
   const unitsForZone = (zoneUid: string | null) =>
-    allUnits.filter((u) =>
-      u.kind === 'room'
-        ? (u.item as Room).zone_uid === zoneUid
-        : (u.item as Dorm).zone_uid === zoneUid
-    );
+    allUnits.filter((u) => (u.item.zone_uid ?? null) === zoneUid);
 
   const handleDragStart = (event: DragStartEvent) => {
     const data = event.active.data.current as DragItem | undefined;
@@ -234,16 +272,31 @@ export const UnitZoneBoard: React.FC = () => {
     if (!data) return;
 
     const targetZoneUid = over.id === 'unallocated' ? null : (over.id as string);
-    const currentZone =
-      data.kind === 'room'
-        ? (data.item as Room).zone_uid
-        : (data.item as Dorm).zone_uid;
+    const currentZone = data.item.zone_uid ?? null;
     if (currentZone === targetZoneUid) return;
+
+    const targetZone = targetZoneUid
+      ? currentPropertyZones.find((z) => z.zone_uid === targetZoneUid)
+      : null;
+    if (
+      targetZone &&
+      !zoneSupportsUnits(targetZone) &&
+      data.kind !== 'washroom'
+    ) {
+      addToast({
+        type: 'warning',
+        title: 'Stay Zone Required',
+        description: 'Only washrooms can be assigned to non-stay zones.',
+      });
+      return;
+    }
 
     if (data.kind === 'room') {
       assignRoomToZone((data.item as Room).room_uid, targetZoneUid);
-    } else {
+    } else if (data.kind === 'dorm') {
       assignDormToZone((data.item as Dorm).dorm_uid, targetZoneUid);
+    } else {
+      moveWashroomToZone((data.item as Washroom).washroom_uid, targetZoneUid);
     }
   };
 
@@ -256,8 +309,8 @@ export const UnitZoneBoard: React.FC = () => {
         <div className="flex items-center gap-2">
           <CheckCircle2 className="w-3.5 h-3.5 text-[#386641]" />
           <span>
-            <strong>Zone Allocation Board:</strong> drag rooms and dorms into a
-            zone column — or drop them into <strong>Unallocated</strong>.
+            <strong>Zone Allocation Board:</strong> drag rooms, dorms, and
+            washrooms into a zone column — or drop them into <strong>Unallocated</strong>.
           </span>
         </div>
         <span className="text-[11px] text-[#8C867C]">
@@ -265,9 +318,9 @@ export const UnitZoneBoard: React.FC = () => {
         </span>
       </div>
 
-      {stayZones.length === 0 && unallocatedCount === 0 ? (
+      {allocationZones.length === 0 && unallocatedCount === 0 ? (
         <div className="p-12 text-center border-2 border-dashed border-[#DDD7CB] rounded-[16px] text-sm text-[#8C867C]">
-          No units or zones yet. Create rooms/dorms, then assign them to stay zones.
+          No units or zones yet. Create rooms, dorms, or washrooms, then assign them to zones.
         </div>
       ) : (
         <DndContext
@@ -285,8 +338,8 @@ export const UnitZoneBoard: React.FC = () => {
               units={unitsForZone(null)}
             />
 
-            {/* One column per stay zone */}
-            {stayZones.map((zone) => (
+            {/* One column per property zone */}
+            {allocationZones.map((zone) => (
               <DroppableZoneColumn
                 key={zone.zone_uid}
                 id={zone.zone_uid}

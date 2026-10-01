@@ -486,8 +486,18 @@ Required. `super_admin`; `property_manager` for their own property (non-structur
 
 ### Request Body
 ```json
-{ "name": "...", "location": "...", "city": "...", "state": "...", "status": "Active", "manager_name": "...", "manager_email": "...", "manager_phone": "..." }
+{ "name": "...", "location": "...", "city": "...", "state": "...", "status": "Active", "manager_name": "...", "manager_email": "...", "manager_phone": "...", "manager": { "employee_uid": "emp_...", "email": "...", "password": "..." } }
 ```
+
+`manager` is optional. `manager.employee_uid` promotes an existing employee of
+the same property to Property Manager — their login is elevated to
+`property_manager` and the previous manager's account is demoted to `employee`
+(kept for audit). `manager.email` updates the manager's login email on the
+User account, the Employee record, and the property's `manager_email` (must be
+unique across users). `manager.password` (min 8 chars) resets the manager's
+login password; it works alone for the current manager or together with
+`employee_uid`. Selecting an employee without a login account requires a
+password so one can be provisioned.
 
 ### Response — `200` — updated `Property`
 
@@ -695,8 +705,10 @@ Range creation (`src/components/rooms/BulkCreateRoomsModal.tsx`) — e.g. rooms 
 
 ### Request Body
 ```json
-{ "property_uid": "prop_...", "start": 201, "end": 209, "type": "Private Room", "area_sqft": 260, "zone_uid": "zone_..." }
+{ "property_uid": "prop_...", "start": 201, "end": 209, "type": "Private Room", "area_sqft": 260, "zone_uid": "zone_...", "prefix": "Special" }
 ```
+
+`prefix` is optional — when set, room names become `"<prefix> <n>"` (e.g. "Special 201"). Max 20 chars; the combined name must fit `room_number`'s 32-char column.
 
 ### Response — `200`
 ```json
@@ -707,7 +719,7 @@ Range creation (`src/components/rooms/BulkCreateRoomsModal.tsx`) — e.g. rooms 
 ```
 
 ### Notes
-The modal previews duplicates client-side, but the backend is authoritative — per-number failures go in `errors`.
+The modal previews duplicates client-side, but the backend is authoritative — per-number failures go in `errors`. Duplicate checks apply to the full prefixed name.
 
 ---
 
@@ -719,17 +731,20 @@ The modal previews duplicates client-side, but the backend is authoritative — 
 `PATCH /rooms/{room_uid}`
 
 ### Purpose
-Single-source endpoint for room edits: details, **status transitions** (`updateRoomStatus` — Check Out → `cleaning`, Clean Room → `available`/`cleaning`), and **zone assignment** (`zone_uid`, `null` = unallocated).
+Room edits and **zone assignment** (`zone_uid`, `null` = unallocated). Operational
+status is NOT updatable here — it is derived and moves only via the command
+endpoints: `POST /rooms/{uid}/check-in`, `POST /rooms/{uid}/check-out`,
+`POST /units/bulk-status`, and the Super Admin `POST /resources/room/{uid}/transition`.
 
 ### Request Body
 ```json
-{ "status": "cleaning", "zone_uid": "zone_...", "current_guest": null, "cleaning_note": "..." }
+{ "room_number": "305", "type": "Private Room", "area_sqft": 260, "zone_uid": "zone_...", "cleaning_note": "..." }
 ```
 
 ### Response — `200` — `Room`
 
 ### Notes
-Status transitions may trigger task automation rules (see Automation). Restrict `zone_uid` to stay zones.
+Restrict `zone_uid` to stay zones.
 
 ---
 
@@ -771,6 +786,40 @@ Status transitions may trigger task automation rules (see Automation). Restrict 
 
 ### Response — `200` — `Dorm` **with `beds` auto-generated** (`Bed 01`…`Bed N`, status `available`).
 
+**Uniqueness:** `name` is unique per property (case-insensitive) — duplicates → `409` `{ "detail": { "field": "name" } }`.
+
+---
+
+## Bulk Create Dorms
+
+**Status: IMPLEMENTED** (backend `app/api/v1/workspace.py`).
+
+### Method
+`POST /dorms/bulk`
+
+### Purpose
+Line-item creation (`src/components/rooms/BulkCreateDormsModal.tsx`) — up to 50 dorms in one call. **All-or-nothing:** every row is validated (name required + unique per property and within the batch, zone must exist and be a `stay` type) before anything is written; any failure → `422` and no dorms are created.
+
+### Request Body
+```json
+{
+  "property_uid": "prop_...",
+  "dorms": [
+    { "name": "Male Dorm 1", "dorm_type": "Male Dorm", "washroom": "Attached Washroom", "bed_count": 8, "zone_uid": "zone_...", "area_sqft": 450, "description": "8-bed male dorm" },
+    { "name": "Female Dorm 1", "dorm_type": "Female Dorm", "washroom": "Shared Washroom", "bed_count": 8, "zone_uid": "zone_...", "area_sqft": 450 }
+  ]
+}
+```
+
+Each item accepts the same fields as `POST /dorms` (`name`, `dorm_type`, `washroom`, `bed_count` 1–200, `zone_uid`, `area_uid`, `floor`, `area_sqft`, `description`).
+
+### Response — `201`
+```json
+{ "created": [ { "...Dorm with beds" } ], "errors": [] }
+```
+
+### Response — `422` — `detail.message` lists every offending row, e.g. `"Row 2: 'Staff Dorm' already exists in this property; Row 4 ('X'): Zone not found in this property."`
+
 ---
 
 ## Update Dorm
@@ -788,6 +837,43 @@ Status transitions may trigger task automation rules (see Automation). Restrict 
 
 ### Method
 `DELETE /dorms/{dorm_uid}` → `204`. Beds are deleted with it.
+
+---
+
+# Washroom APIs
+
+## List Washrooms
+
+**Status: IMPLEMENTED** (backend `app/api/v1/workspace.py`).
+
+### Method
+`GET /washrooms` — params: `property_uid`, `zone_uid`, `status`, `search` → `ListResponse<Washroom>`.
+
+```json
+{ "washroom_uid": "washroom_...", "property_uid": "prop_...", "zone_uid": "zone_...", "area_uid": "area_...", "name": "W-001", "washroom_type": "male", "stall_count": 3, "urinal_count": 2, "shower_count": 1, "status": "available", "created_at": "..." }
+```
+
+`washroom_type`: `male` | `female` | `unisex`. `status`: `available` | `cleaning` | `maintenance` | `inactive` — derived, never set directly. Washrooms may be assigned to any zone type; rooms and dorms remain stay-zone only.
+
+## Create / Bulk Create Washrooms
+
+`POST /washrooms` → `201 Washroom`.
+
+```json
+{ "property_uid": "prop_...", "name": "W-001", "washroom_type": "male", "stall_count": 3, "urinal_count": 2, "shower_count": 1, "zone_uid": "zone_...", "area_uid": "area_..." }
+```
+
+`POST /washrooms/bulk` → `201 { "created": [Washroom], "errors": [] }`. Bulk creation is all-or-nothing: duplicate names, cross-property zones/areas, or invalid types abort the batch.
+
+## Get / Update / Allocate / Delete
+
+- `GET /washrooms/{washroom_uid}` → `Washroom`
+- `PATCH /washrooms/{washroom_uid}` — `name`, `washroom_type`, fixture counts (`stall_count`, `urinal_count`, `shower_count`, `sink_count`, `mirror_count`, `bath_tub_count`, `jacuzzi_count`), `custom_fixtures`, `zone_uid`, `area_uid`, `dorm_uid` → `Washroom` (no `status` — derived)
+- `PATCH /washrooms/{washroom_uid}/allocation` — `{ "zone_uid": "zone_..." | null }` → `Washroom`
+- `DELETE /washrooms/{washroom_uid}` → `204`
+- `GET /washrooms/{washroom_uid}/maintenance` → ticket history for that washroom
+
+`name` is unique per property (case-insensitive). Deleting a washroom removes the live link from tasks/tickets while retaining their denormalized `washroom_name`, so maintenance and task history remain readable.
 
 ---
 
@@ -822,22 +908,26 @@ May trigger `room_checked_out`/`bed_marked_cleaning` automation rules → task g
 
 ---
 
-## Update Bed Status
+## Bed Check-In / Check-Out
 
 **Status: IMPLEMENTED** (backend `app/api/v1/workspace.py`).
 
 ### Method
-`PATCH /beds/{bed_uid}/status`
+`POST /beds/{bed_uid}/check-in` · `POST /beds/{bed_uid}/check-out`
 
 ### Purpose
-Per-bed explicit actions on the dorm bed grid — `Check out` (occupied→cleaning), `Clean` (cleaning→available / queue cleaning), occupy with optional guest name.
+Per-bed occupancy actions on the dorm bed grid. Check-in requires the bed to be
+`available` (creates an open occupancy row, bed → `occupied`; dorm aggregates).
+Check-out closes the open occupancy, spawns the checkout-cleaning task and flips
+the bed → `cleaning` atomically. Bed operational status is never set directly —
+release flows go through the Super Admin `POST /resources/bed/{uid}/transition`.
 
-### Request Body
+### Request Body (check-in only)
 ```json
-{ "status": "cleaning", "guest_name": "optional guest name when occupying" }
+{ "guest_name": "optional guest name" }
 ```
 
-### Response — `200` — the **containing `Dorm`** (so nested bed state stays consistent)
+### Response — `200` — the **containing `Dorm`** (so nested bed state stays consistent). Check-out returns the dorm plus `generated_tasks`.
 
 ---
 
@@ -915,7 +1005,7 @@ Backend creates a corresponding `AuthUser` (`role=employee`, `employee_uid`, `pr
 **Status: IMPLEMENTED** (backend `app/api/v1/workspace.py`).
 
 ### Method
-`PATCH /employees/{employee_uid}` — subset of `name`, `job_title`, `department`, `phone`, `email`, `zone_uid`, `salary`, `shift`, `status` → `Employee`. Used by the directory edit modal.
+`PATCH /employees/{employee_uid}` — subset of `name`, `job_title`, `department`, `phone`, `email`, `zone_uid`, `salary`, `shift` → `Employee`. Used by the directory edit modal. Lifecycle status changes must use the deactivate/reactivate endpoints below.
 
 ---
 
@@ -950,7 +1040,19 @@ Optimistic update with **rollback on error** (the card snaps back if the request
 `POST /employees/{employee_uid}/deactivate` → `200` `Employee`.
 
 ### Purpose
-"Deactivate Staff" — sets inactive, unassigns zone, preserves task history. Confirmation dialog.
+"Deactivate Staff" — sets `status` to `Deactivated`, stamps `deactivated_at`, disables the linked login, and preserves the last zone/area plus task history. Deactivated staff are not eligible for manual or automatic allocation.
+
+---
+
+## Reactivate Employee
+
+**Status: IMPLEMENTED** (backend `app/api/v1/workspace.py`).
+
+### Method
+`POST /employees/{employee_uid}/reactivate` → `200` `Employee`.
+
+### Purpose
+"Reactivate" — sets `status` to `Active`, stamps `reactivated_at`, re-enables the linked login, and clears the previous zone/area so reactivation never auto-assigns work.
 
 ---
 
@@ -959,7 +1061,7 @@ Optimistic update with **rollback on error** (the card snaps back if the request
 **Status: IMPLEMENTED** (backend `app/api/v1/workspace.py`).
 
 ### Method
-`DELETE /employees/{employee_uid}` → `204`. Their tasks become unassigned; their login is revoked (frontend does a full refresh).
+`DELETE /employees/{employee_uid}` → `204`. Permanently removes the employee and linked login. Open task/maintenance assignments return to the unassigned queue; completed history keeps the employee-name snapshot.
 
 ---
 
@@ -1204,7 +1306,7 @@ Required.
 
 ### Response — `200`
 ```json
-{ "url": "https://cdn.example.com/uploads/abc123.jpg" }
+{ "url": "https://cdn.example.com/uploads/abc123.jpg", "key": "abc123.jpg" }
 ```
 
 ### Error Responses
@@ -1261,18 +1363,18 @@ Frontend contract: `detail` string → toast/inline; `detail[]` (422) → per-fi
 | `/property/:uid/zones` | Create area/zone | `/areas`, `/zones` | POST | Yes | sa + pm |
 | `/property/:uid/zones` | Edit/delete area/zone | `/areas/{uid}`, `/zones/{uid}` | PATCH/DELETE | Yes | sa + pm |
 | `/property/:uid/zones` (workspace) | Rooms/dorms/beds | `/rooms`, `/dorms` | GET | Yes | sa + pm |
-| `/property/:uid/zones` (workspace) | Room check out / clean | `/rooms/{uid}` | PATCH | Yes | sa + pm |
-| `/property/:uid/zones` (workspace) | Bed check out / clean | `/beds/{uid}/status` | PATCH | Yes | sa + pm |
+| `/property/:uid/zones` (workspace) | Room check in / out | `/rooms/{uid}/check-in`, `/rooms/{uid}/check-out` | POST | Yes | sa + pm |
+| `/property/:uid/zones` (workspace) | Bed check in / out | `/beds/{uid}/check-in`, `/beds/{uid}/check-out` | POST | Yes | sa + pm |
 | `/property/:uid/zones` (workspace) | Dorm checkout / cleaning | `/dorms/{uid}/checkout`, `/dorms/{uid}/mark-cleaning` | POST | Yes | sa + pm |
 | `/property/:uid/zones` (workspace) | Multi-select bulk ops | `/units/bulk-status` | POST | Yes | sa + pm |
 | `/property/:uid/zones` (workspace) | Zone tasks | `/tasks` | GET | Yes | sa + pm |
 | `/property/:uid/employees` | Zone board DnD | `/employees/{uid}/zone` | PATCH | Yes | sa + pm |
 | `/property/:uid/employees` | Staff directory | `/employees` | GET | Yes | sa + pm |
 | `/property/:uid/employees` | Add staff (+credential) | `/employees` | POST | Yes | sa + pm |
-| `/property/:uid/employees` | Edit/deactivate/assign | `/employees/{uid}`, `/employees/{uid}/zone`, `/employees/{uid}/deactivate` | PATCH/POST | Yes | sa + pm |
+| `/property/:uid/employees` | Edit/lifecycle/assign | `/employees/{uid}`, `/employees/{uid}/zone`, `/employees/{uid}/deactivate`, `/employees/{uid}/reactivate` | PATCH/POST | Yes | sa + pm |
 | `/property/:uid/rooms` | Rooms & dorms lists | `/rooms`, `/dorms` | GET | Yes | sa + pm |
 | `/property/:uid/rooms` | Create room / bulk / dorm | `/rooms`, `/rooms/bulk`, `/dorms` | POST | Yes | sa + pm |
-| `/property/:uid/rooms` | Status, zone assign, delete | `/rooms/{uid}`, `/dorms/{uid}`, `/beds/{uid}/status` | PATCH/DELETE | Yes | sa + pm |
+| `/property/:uid/rooms` | Edit, zone assign, delete | `/rooms/{uid}`, `/dorms/{uid}` | PATCH/DELETE | Yes | sa + pm |
 | `/property/:uid/tasks` | Task list + filters | `/tasks` | GET | Yes | sa + pm |
 | `/property/:uid/tasks` | Create/edit/delete task | `/tasks`, `/tasks/{uid}` | POST/PATCH/DELETE | Yes | sa + pm |
 | `/property/:uid/tasks` | Start / complete / redo / reassign | `/tasks/{uid}/start`, `/complete`, `/request-redo`, `/assignee` | POST/PATCH | Yes | sa + pm (+emp own) |
@@ -1367,15 +1469,31 @@ starts `assigned` instead of `pending`.
 ## Submit
 `POST /tasks/{task_uid}/submit` — `{ "note"?, "photo_urls": [] }` — assignee
 submits finished work → `submitted`. Employees may only submit their own tasks.
+Each call creates one `task_completion_submissions` attempt (ordered
+`attempt_number`, `pending`) and links all submitted
+`task_completion_images` rows to that attempt. Rejection followed by a later
+submit creates a new attempt instead of appending images to the old one.
+
+Task and pending-check responses include `completion_submissions` in newest
+attempt order. Each submission carries `attempt_number`, `employee_*`,
+`submitted_at`, `status`, `reviewed_*`, `review_comment`, and `images`.
+`completion_images` remains available as a task-level compatibility array.
+
+`DELETE /tasks/{task_uid}/completion-images/{image_uid}` — staff only. Removes
+that image's storage object and durable row from its own submission, updates
+the submitted history payload, and returns the updated task. The submission
+record and task state are preserved.
 
 ## Approve
 `POST /tasks/{task_uid}/approve` — `{ "note"? }` — staff only → `completed`.
-Repetitive tasks return `{ task, generated_task }` (next instance). The
-assignee cannot self-approve (403).
+The current `pending` submission is marked `approved`; earlier submissions are
+unchanged. Repetitive tasks return `{ task, generated_task }` (next instance).
+The assignee cannot self-approve (403).
 
 ## Reject
 `POST /tasks/{task_uid}/reject` — `{ "reason": "…" }` (required) — staff only →
-`reopened`, reason recorded in history.
+`reopened`, the current `pending` submission becomes `disapproved`, and the
+reason is recorded on the submission and task history.
 
 ## Reopen
 `POST /tasks/{task_uid}/reopen` — `{ "note"? }` — staff only. Completed /
@@ -1402,8 +1520,11 @@ chooses an employee automatically.
 
 Eligibility: employee is `Active`, belongs to the property, is assigned to
 the ticket's zone, is not on leave, and is not the property manager account.
-No eligible employee (or no zone) → ticket stays `unassigned` with
-`allocation_reason` = `no_eligible_employee` | `no_zone`.
+**Maintenance work** (`work_type="maintenance"` — tickets, work batches, and
+maintenance-type template runs) additionally requires the employee's
+`department` to be **Maintenance & Engineering**; task work is not
+department-gated. No eligible employee (or no zone) → ticket stays
+`unassigned` with `allocation_reason` = `no_eligible_employee` | `no_zone`.
 
 Ticket fields added (maintenance + task): `zone_uid`, `allocation_batch_id`,
 `allocation_status` (`auto_assigned` | `manually_assigned` | `unassigned`),

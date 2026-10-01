@@ -4,6 +4,7 @@ import {
   CalendarCheck, UserCheck, Play, CheckCircle2, Timer,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
+import { usePolling } from '../../hooks/usePolling';
 import * as tasksApi from '../../api/tasks';
 import { TodayTaskItem, TodayTasksResponse } from '../../api/types';
 import { Badge } from '../ui/Badge';
@@ -52,8 +53,6 @@ export const TodayTasksView: React.FC<Props> = ({ onOpenTask }) => {
   const [zoneFilter, setZoneFilter] = useState('');
   const [sourceFilter, setSourceFilter] = useState('all');
   const [scope, setScope] = useState<'all' | 'unassigned'>('all');
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
   const load = useCallback(async (quiet = false) => {
     if (!activePropertyUid) return;
     if (!quiet) setLoading(true);
@@ -69,11 +68,12 @@ export const TodayTasksView: React.FC<Props> = ({ onOpenTask }) => {
 
   useEffect(() => {
     void load();
-    // Poll for generation transitions — generated work moves
-    // pending_generation → generated automatically; 30s is plenty
-    pollRef.current = setInterval(() => void load(true), 30000);
-    return () => { if (pollRef.current) clearInterval(pollRef.current); };
   }, [load]);
+  // Poll for generation transitions — generated work moves
+  // pending_generation → generated automatically; 10s keeps the
+  // Today list live without requiring a browser refresh. Pauses in a
+  // hidden tab and never overlaps an in-flight request.
+  usePolling(() => load(true), 10000, true, 'TodayTasksView');
 
   const generate = async (item: TodayTaskItem) => {
     if (!item.template_uid || !item.occurrence_key) return;
@@ -92,6 +92,8 @@ export const TodayTasksView: React.FC<Props> = ({ onOpenTask }) => {
   const filtered = useMemo(() => {
     if (!data) return [];
     return data.items.filter((i) => {
+      // finished work belongs in Task History, not today's schedule
+      if (i.work_status === 'completed' || i.work_status === 'cancelled') return false;
       if (search && !`${i.title} ${i.ticket_number || ''} ${i.assignee || ''} ${i.room_number || ''}`
         .toLowerCase().includes(search.toLowerCase())) return false;
       if (zoneFilter && i.zone_name !== zoneFilter) return false;

@@ -11,9 +11,13 @@ import {
   RecurrenceSchedule,
   RoomStatus,
   Task,
+  TaskCompletionImage,
+  TaskCompletionSubmission,
   TaskPriority,
   TaskStatus,
   TaskType,
+  WashroomResourceType,
+  WashroomStatus,
   WashroomType,
   Zone,
   ZoneType,
@@ -114,6 +118,12 @@ export interface PropertyUpdateRequest {
   manager_name?: string;
   manager_email?: string;
   manager_phone?: string;
+  /** Reassign the manager to an existing employee and/or update their credentials */
+  manager?: {
+    employee_uid?: string;
+    email?: string;
+    password?: string;
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -164,6 +174,8 @@ export interface RoomBulkCreateRequest {
   start: number;
   end: number;
   type: string;
+  /** Optional name prefix — "Special" + range 101-103 → "Special 101"… */
+  prefix?: string;
   area_sqft?: number;
   zone_uid?: string | null;
 }
@@ -183,10 +195,10 @@ export interface RoomUpdateRequest {
   room_number?: string;
   type?: string;
   area_sqft?: number;
-  status?: RoomStatus;
   zone_uid?: string | null;
   cleaning_note?: string;
-  current_guest?: string;
+  // status / current_guest are not patchable — resource state moves through
+  // the command API (check-in, check-out, transition) only.
 }
 
 export interface DormCreateRequest {
@@ -203,11 +215,125 @@ export interface DormCreateRequest {
 
 export type DormUpdateRequest = Partial<
   Omit<import('../types').Dorm, 'dorm_uid' | 'property_uid' | 'beds' | 'created_at'>
->;
+> & {
+  /** Resize bed inventory — grow appends beds, shrink marks occupied extras inactive */
+  bed_count?: number;
+};
 
-export interface BedStatusUpdateRequest {
-  status: BedStatus;
-  guest_name?: string;
+/** One line item of the bulk-dorm form — same fields as DormCreateRequest. */
+export interface DormBulkItem {
+  name: string;
+  dorm_type: DormType;
+  washroom: WashroomType;
+  bed_count: number;
+  zone_uid?: string | null;
+  floor?: string;
+  area_sqft?: number;
+  description?: string;
+}
+
+export interface DormBulkCreateRequest {
+  property_uid: string;
+  dorms: DormBulkItem[];
+}
+
+export interface DormBulkCreateResponse {
+  created: import('../types').Dorm[];
+  /** Row-level validation failures — always empty on success (all-or-nothing) */
+  errors: string[];
+}
+
+// Occupancy commands — the authoritative record behind `occupied`
+export interface CheckInRequest {
+  /** Optional — omitted/null creates an unnamed occupancy. */
+  guest_name?: string | null;
+}
+
+export interface ResourceTransitionRequest {
+  to: string;
+  reason: string;
+}
+
+export interface ResourceTransitionResponse {
+  resource_type: string;
+  resource_id: string;
+  previous_state: string;
+  new_state: string;
+}
+
+// ---------------------------------------------------------------------------
+// Washrooms
+// ---------------------------------------------------------------------------
+
+export interface WashroomCreateRequest {
+  property_uid: string;
+  name: string;
+  washroom_type: WashroomResourceType;
+  /** Fixture counts are resize directives — the backend turns them into
+   *  real washroom_fixtures rows. */
+  stall_count?: number;
+  urinal_count?: number;
+  shower_count?: number;
+  sink_count?: number;
+  mirror_count?: number;
+  bath_tub_count?: number;
+  jacuzzi_count?: number;
+  custom_fixtures?: Record<string, number>;
+  zone_uid?: string | null;
+  area_uid?: string | null;
+  /** Attached to one specific dorm — inherits the dorm's zone/area */
+  dorm_uid?: string | null;
+}
+
+export interface WashroomFixtureUpdateRequest {
+  status: 'operational' | 'maintenance' | 'inactive';
+}
+
+export interface WashroomUpdateRequest {
+  name?: string;
+  washroom_type?: WashroomResourceType;
+  dorm_uid?: string | null;
+  stall_count?: number;
+  urinal_count?: number;
+  shower_count?: number;
+  sink_count?: number;
+  mirror_count?: number;
+  bath_tub_count?: number;
+  jacuzzi_count?: number;
+  custom_fixtures?: Record<string, number>;
+  zone_uid?: string | null;
+  area_uid?: string | null;
+}
+
+export interface WashroomBulkItem {
+  name: string;
+  washroom_type: WashroomResourceType;
+  stall_count?: number;
+  urinal_count?: number;
+  shower_count?: number;
+  sink_count?: number;
+  mirror_count?: number;
+  bath_tub_count?: number;
+  jacuzzi_count?: number;
+  custom_fixtures?: Record<string, number>;
+  zone_uid?: string | null;
+  area_uid?: string | null;
+  dorm_uid?: string | null;
+}
+
+export interface WashroomBulkCreateRequest {
+  property_uid: string;
+  washrooms: WashroomBulkItem[];
+}
+
+export interface WashroomBulkCreateResponse {
+  created: import('../types').Washroom[];
+  errors: string[];
+}
+
+export interface UnitAllocationRequest {
+  zone_uid?: string | null;
+  area_uid?: string | null;
 }
 
 /**
@@ -215,15 +341,17 @@ export interface BedStatusUpdateRequest {
  * Backend may trigger automation rules (e.g. housekeeping task generation).
  */
 export interface BulkUnitStatusRequest {
-  action: 'checkout' | 'cleaning' | 'available' | 'maintenance';
+  action: 'checkout' | 'cleaning' | 'available' | 'cleaned' | 'maintenance';
   property_uid: string;
   room_uids?: string[];
   bed_uids?: string[];
+  washroom_uids?: string[];
 }
 
 export interface BulkUnitStatusResponse {
   rooms: import('../types').Room[];
   dorms: import('../types').Dorm[];
+  washrooms?: import('../types').Washroom[];
   /** Tasks auto-created by automation rules as a side effect */
   generated_tasks?: Task[];
   /** Units kept unavailable because active work still blocks them */
@@ -239,10 +367,14 @@ export interface PendingCheckItem {
   status: string;
   room_uid: string | null;
   room_number: string | null;
+  washroom_uid?: string | null;
+  washroom_name?: string | null;
   employee: string | null;
   submitted_at: string | null;
   note: string | null;
   photo_urls: string[];
+  completion_images?: TaskCompletionImage[];
+  completion_submissions?: TaskCompletionSubmission[];
 }
 
 export interface PendingCheckResponse {
@@ -279,7 +411,6 @@ export interface EmployeeUpdateRequest {
   zone_uid?: string | null;
   salary?: string;
   shift?: string;
-  status?: Employee['status'];
 }
 
 export interface EmployeeZoneAssignRequest {
@@ -300,6 +431,9 @@ export interface TaskCreateRequest {
   employee_uid?: string;
   supervisor_uid?: string | null;
   room_uid?: string | null;
+  washroom_uid?: string | null;
+  /** Fixture-level task target — must belong to washroom_uid */
+  washroom_fixture_uid?: string | null;
   zone_uid?: string | null;
   priority?: TaskPriority;
   due_date?: string;
@@ -327,9 +461,12 @@ export interface TaskUpdateRequest {
   employee_uid?: string;
   supervisor_uid?: string | null;
   room_uid?: string | null;
+  washroom_uid?: string | null;
+  washroom_fixture_uid?: string | null;
   zone_uid?: string | null;
   priority?: TaskPriority;
-  status?: TaskStatus;
+  // status is lifecycle state — it moves only through the lifecycle
+  // endpoints (start/submit/approve/reject/reopen); the backend rejects it
   due_date?: string;
   due_time?: string;
   start_time?: string;
@@ -376,10 +513,13 @@ export interface TaskRejectRequest {
 
 export interface MaintenanceCreateRequest {
   property_uid: string;
-  /** Exactly one of room_uid / dorm_uid / bed_uid must be provided. */
+  /** Exactly one of room_uid / dorm_uid / bed_uid / washroom_uid must be provided. */
   room_uid?: string;
   dorm_uid?: string;
   bed_uid?: string;
+  washroom_uid?: string;
+  /** Fixture-level target — must belong to washroom_uid */
+  washroom_fixture_uid?: string;
   maintenance_type: string;
   issue: string;
   description?: string;
@@ -397,6 +537,9 @@ export interface WorkBatchTicketIn {
   room_uid?: string;
   dorm_uid?: string;
   bed_uid?: string;
+  washroom_uid?: string;
+  /** Fixture-level target — must belong to washroom_uid */
+  washroom_fixture_uid?: string;
   maintenance_type: string;
   issue: string;
   description?: string;
@@ -456,6 +599,7 @@ export interface MaintenanceResolveRequest {
 
 export interface UploadResponse {
   url: string;
+  key?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -464,17 +608,29 @@ export interface UploadResponse {
 // ---------------------------------------------------------------------------
 
 export type TemplateType =
-  | 'task' | 'maintenance' | 'inspection' | 'cleaning' | 'checklist' | 'other';
+  | 'task' | 'maintenance' | 'inspection' | 'cleaning' | 'checklist'
+  | 'operations' | 'housekeeping' | 'other';
 export type TemplateStatus = 'draft' | 'active' | 'paused' | 'archived';
-export type AssignmentMode = 'team' | 'individual' | 'automatic';
-export type LocationScope = 'property' | 'zone' | 'area' | 'rooms' | 'dorms' | 'beds';
+export type AssignmentMode =
+  | 'team' | 'individual' | 'employees' | 'department' | 'automatic';
+export type LocationScope =
+  | 'property'
+  | 'zone'
+  | 'area'
+  | 'rooms'
+  | 'dorms'
+  | 'beds'
+  | 'washrooms'
+  | 'units';
 export type ScheduleKind = 'one_time' | 'recurring';
 export type ScheduleFrequency = 'hourly' | 'daily' | 'weekly' | 'monthly' | 'custom';
 
 export interface TemplateAssignment {
   mode: AssignmentMode;
   team?: string;
+  department?: string;
   employee_uid?: string;
+  employee_uids?: string[];
   supervisor_uid?: string;
   method?: 'zone_round_robin' | 'team_round_robin' | 'supervisor';
 }
@@ -486,8 +642,13 @@ export interface TemplateLocation {
   room_uids?: string[];
   dorm_uids?: string[];
   bed_uids?: string[];
-  /** dynamic expansion inside a zone/area: rooms | dorms | beds | units */
+  washroom_uids?: string[];
+  /** dynamic expansion inside a zone/area: rooms | dorms | beds | washrooms | units */
   target?: string;
+  /** occupancy condition — resolved at generation time; rooms/beds/dorms only */
+  occupancy?: 'all' | 'occupied' | 'unoccupied';
+  /** legacy alias for occupancy:'occupied' */
+  occupied_only?: boolean;
 }
 
 export interface TemplateSchedule {
@@ -621,6 +782,7 @@ export interface TodayTaskItem {
   zone_name?: string;
   target_label?: string;
   room_number?: string;
+  washroom_name?: string;
   generation_state: 'generated' | 'pending_generation' | 'generation_failed' | 'cancelled';
   work_status?: string;
   task_uid?: string;
@@ -651,6 +813,7 @@ export interface TaskHistoryItem {
   title: string;
   task_type: string;
   room_number?: string;
+  washroom_name?: string;
   zone_name?: string;
   assigned_to?: string;
   generated_at?: string;
@@ -674,6 +837,7 @@ export interface TaskHistoryParams {
   date_to?: string;
   zone_uid?: string;
   room_uid?: string;
+  washroom_uid?: string;
   employee_uid?: string;
   status?: string;
   priority?: string;

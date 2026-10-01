@@ -11,6 +11,7 @@ import {
   TaskType,
 } from '../../types';
 import { AUTOMATION_TRIGGER_LABELS, RECURRENCE_LABELS } from '../../lib/taskUtils';
+import { isEmployeeAssignable } from '../../lib/employeeUtils';
 
 interface CreateTaskModalProps {
   isOpen: boolean;
@@ -51,6 +52,7 @@ export const CreateTaskModal: React.FC<CreateTaskModalProps> = ({ isOpen, onClos
     currentPropertyEmployees,
     currentPropertyZones,
     currentPropertyRooms,
+    currentPropertyWashrooms,
     activeProperty,
   } = useApp();
 
@@ -60,6 +62,7 @@ export const CreateTaskModal: React.FC<CreateTaskModalProps> = ({ isOpen, onClos
   const [employeeUid, setEmployeeUid] = useState('');
   const [supervisorUid, setSupervisorUid] = useState('');
   const [roomUid, setRoomUid] = useState('');
+  const [washroomUid, setWashroomUid] = useState('');
   const [zoneUid, setZoneUid] = useState('');
   const [priority, setPriority] = useState<TaskPriority>('medium');
   const [dueDate, setDueDate] = useState('');
@@ -89,6 +92,7 @@ export const CreateTaskModal: React.FC<CreateTaskModalProps> = ({ isOpen, onClos
       setEmployeeUid(editTask.employee_uid || editTask.assigned_to_uid || '');
       setSupervisorUid(editTask.supervisor_uid || '');
       setRoomUid(editTask.room_uid || '');
+      setWashroomUid(editTask.washroom_uid || '');
       setZoneUid(editTask.zone_uid || '');
       setPriority(editTask.priority);
       setDueDate(editTask.due_date || '');
@@ -115,6 +119,7 @@ export const CreateTaskModal: React.FC<CreateTaskModalProps> = ({ isOpen, onClos
     setEmployeeUid('');
     setSupervisorUid('');
     setRoomUid('');
+    setWashroomUid('');
     setZoneUid('');
     setPriority('medium');
     setDueDate('');
@@ -156,6 +161,7 @@ export const CreateTaskModal: React.FC<CreateTaskModalProps> = ({ isOpen, onClos
         employee_uid: assigneeUid,
         supervisor_uid: taskType === 'automated' ? undefined : supervisorUid || null,
         room_uid: taskType === 'automated' ? undefined : roomUid || null,
+        washroom_uid: taskType === 'automated' ? undefined : washroomUid || null,
         zone_uid: zoneUid || null,
         priority,
         due_date: taskType === 'automated' ? undefined : dueDate || undefined,
@@ -283,7 +289,7 @@ export const CreateTaskModal: React.FC<CreateTaskModalProps> = ({ isOpen, onClos
                   className={`${inputCls} cursor-pointer`}
                 >
                   <option value="">Unassigned</option>
-                  {currentPropertyEmployees.map((emp) => (
+                  {currentPropertyEmployees.filter(isEmployeeAssignable).map((emp) => (
                     <option key={emp.employee_uid} value={emp.employee_uid}>
                       {emp.name} — {emp.job_title}
                     </option>
@@ -299,6 +305,7 @@ export const CreateTaskModal: React.FC<CreateTaskModalProps> = ({ isOpen, onClos
                 >
                   <option value="">None</option>
                   {currentPropertyEmployees
+                    .filter(isEmployeeAssignable)
                     .filter((emp) => emp.employee_uid !== employeeUid)
                     .map((emp) => (
                       <option key={emp.employee_uid} value={emp.employee_uid}>
@@ -308,7 +315,7 @@ export const CreateTaskModal: React.FC<CreateTaskModalProps> = ({ isOpen, onClos
                 </select>
               </div>
             </div>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3.5">
               <div>
                 <label className={labelCls}>Zone</label>
                 <select
@@ -328,13 +335,34 @@ export const CreateTaskModal: React.FC<CreateTaskModalProps> = ({ isOpen, onClos
                 <label className={labelCls}>Related Room</label>
                 <select
                   value={roomUid}
-                  onChange={(e) => setRoomUid(e.target.value)}
+                  onChange={(e) => {
+                    setRoomUid(e.target.value);
+                    if (e.target.value) setWashroomUid('');
+                  }}
                   className={`${inputCls} cursor-pointer`}
                 >
                   <option value="">No room</option>
                   {currentPropertyRooms.map((r) => (
                     <option key={r.room_uid} value={r.room_uid}>
-                      Room {r.room_number}
+                      {r.room_number}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className={labelCls}>Related Washroom</label>
+                <select
+                  value={washroomUid}
+                  onChange={(e) => {
+                    setWashroomUid(e.target.value);
+                    if (e.target.value) setRoomUid('');
+                  }}
+                  className={`${inputCls} cursor-pointer`}
+                >
+                  <option value="">No washroom</option>
+                  {currentPropertyWashrooms.map((w) => (
+                    <option key={w.washroom_uid} value={w.washroom_uid}>
+                      {w.name}
                     </option>
                   ))}
                 </select>
@@ -513,7 +541,7 @@ export const CreateTaskModal: React.FC<CreateTaskModalProps> = ({ isOpen, onClos
                 className={`${inputCls} bg-white mt-2 cursor-pointer`}
               >
                 <option value="">Generated tasks: unassigned</option>
-                {currentPropertyEmployees.map((emp) => (
+                {currentPropertyEmployees.filter(isEmployeeAssignable).map((emp) => (
                   <option key={emp.employee_uid} value={emp.employee_uid}>
                     Always assign to {emp.name}
                   </option>

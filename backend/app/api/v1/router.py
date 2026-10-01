@@ -7,7 +7,7 @@ expects them under {API_V1_PREFIX}.
 
 from fastapi import APIRouter
 
-from app.api.v1 import auth, media, templates, work_batches, workspace
+from app.api.v1 import auth, hr, media, templates, work_batches, workspace
 
 api_router = APIRouter()
 api_router.include_router(auth.router)
@@ -15,6 +15,7 @@ api_router.include_router(workspace.router)
 api_router.include_router(media.router)
 api_router.include_router(work_batches.router)
 api_router.include_router(templates.router)
+api_router.include_router(hr.router)
 
 # Future routers (API.md contract):
 # api_router.include_router(companies.router,   prefix="/companies",  tags=["companies"])

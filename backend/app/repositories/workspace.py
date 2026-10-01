@@ -17,8 +17,8 @@ from sqlalchemy.orm import selectinload
 
 from app.models.employee import Employee
 from app.models.property import Property
-from app.models.structure import Area, Dorm, Room, Zone
-from app.models.task import Task
+from app.models.structure import Area, Dorm, Room, Washroom, Zone
+from app.models.task import Task, TaskCompletionSubmission
 from app.models.user import User, UserRole
 
 
@@ -116,6 +116,25 @@ class WorkspaceRepository:
         res = await self.session.execute(q.order_by(Dorm.name))
         return _paged(list(res.unique().scalars()), page, limit)
 
+    async def list_washrooms(
+        self, user: User, *, property_id=None, zone_id=None, status=None,
+        search=None, page=1, limit=20
+    ) -> dict:
+        q = _company_scope(
+            select(Washroom).options(selectinload(Washroom.fixtures)),
+            Washroom, user,
+        )
+        if property_id:
+            q = q.where(Washroom.property_id == property_id)
+        if zone_id:
+            q = q.where(Washroom.zone_id == zone_id)
+        if status:
+            q = q.where(Washroom.status == status)
+        if search:
+            q = q.where(Washroom.name.ilike(f"%{search}%"))
+        res = await self.session.execute(q.order_by(Washroom.name))
+        return _paged(list(res.scalars()), page, limit)
+
     async def list_employees(
         self,
         user: User,
@@ -140,7 +159,7 @@ class WorkspaceRepository:
         if department:
             q = q.where(Employee.department == department)
         if status:
-            q = q.where(Employee.status == status)
+            q = q.where(func.lower(Employee.status) == status.lower())
         if search:
             like = f"%{search}%"
             q = q.where(
@@ -167,9 +186,11 @@ class WorkspaceRepository:
         page=1,
         limit=20,
     ) -> dict:
-        q = _company_scope(
-            select(Task).options(selectinload(Task.history)), Task, user
-        )
+        # List payloads don't need evidence/history — task_out emits empty
+        # collections for unloaded relations, and the Task Detail Drawer
+        # fetches the full record via GET /tasks/{id} on open. Skipping the
+        # eager loads saves ~3 remote round-trips and most of the payload.
+        q = _company_scope(select(Task), Task, user)
         if property_id:
             q = q.where(Task.property_id == property_id)
         if zone_id:

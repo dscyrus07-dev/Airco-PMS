@@ -1,5 +1,7 @@
 import React, { useMemo, useState } from 'react';
-import { CheckSquare, Layers, Wrench } from 'lucide-react';
+import {
+  CheckSquare, Layers, Wrench, Activity, ClipboardCheck, History,
+} from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { Card } from '../ui/Card';
 import { Badge, TaskStatusBadge, TaskTypeBadge } from '../ui/Badge';
@@ -8,10 +10,17 @@ import { MaintStatusPill, PriorityPill, TicketDrawer } from '../maintenance/Main
 import { Task, TaskStatus } from '../../types';
 import { formatTaskDue, getEffectiveTaskStatus } from '../../lib/taskUtils';
 
+// Live = work still actionable by the employee; submitted = awaiting PM
+// approval; completed = terminal record (completed/cancelled).
+const LIVE_TASK_STATUSES: TaskStatus[] = [
+  'pending', 'assigned', 'in_progress', 'reopened', 'overdue', 'scheduled',
+];
+const LIVE_TICKET_STATUSES = ['open', 'assigned', 'in_progress', 'on_hold'];
+
 export const EmployeeTasksView: React.FC = () => {
   const { currentEmployeeTasks, currentEmployeeMaintenance, zones, employeeRecord } = useApp();
 
-  const [statusFilter, setStatusFilter] = useState<'all' | TaskStatus>('all');
+  const [view, setView] = useState<'live' | 'submitted' | 'completed'>('live');
   const [selectedTaskUid, setSelectedTaskUid] = useState<string | null>(null);
   const [selectedTicketUid, setSelectedTicketUid] = useState<string | null>(null);
 
@@ -20,23 +29,24 @@ export const EmployeeTasksView: React.FC = () => {
 
   const filteredTasks = useMemo(() => {
     return currentEmployeeTasks.filter((t) => {
-      if (statusFilter === 'all') return true;
-      return getEffectiveTaskStatus(t) === statusFilter;
+      const st = getEffectiveTaskStatus(t);
+      if (view === 'live') return LIVE_TASK_STATUSES.includes(st);
+      if (view === 'submitted') return st === 'submitted';
+      return st === 'completed' || st === 'cancelled';
     });
-  }, [currentEmployeeTasks, statusFilter]);
+  }, [currentEmployeeTasks, view]);
+
+  const filteredTickets = useMemo(() => {
+    return currentEmployeeMaintenance.filter((t) => {
+      if (view === 'live') return LIVE_TICKET_STATUSES.includes(t.status);
+      if (view === 'submitted') return t.status === 'resolved';
+      return t.status === 'closed' || t.status === 'cancelled';
+    });
+  }, [currentEmployeeMaintenance, view]);
 
   const selectedTask = currentEmployeeTasks.find((t) => t.task_uid === selectedTaskUid) || null;
   const selectedTicket =
     currentEmployeeMaintenance.find((t) => t.ticket_uid === selectedTicketUid) || null;
-
-  const counts = useMemo(() => {
-    const c: Record<string, number> = { all: currentEmployeeTasks.length };
-    currentEmployeeTasks.forEach((t) => {
-      const st = getEffectiveTaskStatus(t);
-      c[st] = (c[st] || 0) + 1;
-    });
-    return c;
-  }, [currentEmployeeTasks]);
 
   return (
     <div className="space-y-5">
@@ -56,42 +66,50 @@ export const EmployeeTasksView: React.FC = () => {
         </p>
       </div>
 
-      {/* Status filter */}
-      <div className="flex items-center gap-1.5 flex-wrap">
-        {(['all', 'pending', 'in_progress', 'completed', 'overdue'] as const).map((st) => (
-          <button
-            key={st}
-            onClick={() => setStatusFilter(st)}
-            className={`px-3 py-1.5 rounded-[8px] text-xs font-medium transition-all cursor-pointer ${
-              statusFilter === st
-                ? 'bg-[#386641] text-white shadow-xs'
-                : 'bg-white text-[#555047] border border-[#DDD7CB] hover:bg-[#F2ECE3]'
-            }`}
-          >
-            {st === 'all'
-              ? `All (${counts.all || 0})`
-              : st === 'in_progress'
-              ? `In Progress (${counts.in_progress || 0})`
-              : `${st.charAt(0).toUpperCase() + st.slice(1)} (${counts[st] || 0})`}
-          </button>
-        ))}
+      {/* Section nav — live work vs pending approval vs terminal record */}
+      <div className="flex items-center gap-1 bg-[#F0EDE6] rounded-[12px] p-1 w-fit">
+        {([
+          { v: 'live' as const, l: 'Current Live', icon: Activity },
+          { v: 'submitted' as const, l: 'Submitted for Approval', icon: ClipboardCheck },
+          { v: 'completed' as const, l: 'Completed', icon: History },
+        ]).map((t) => {
+          const Icon = t.icon;
+          return (
+            <button
+              key={t.v}
+              onClick={() => setView(t.v)}
+              className={`flex items-center gap-2 px-4 py-2 rounded-[9px] text-[13px] font-semibold transition-all cursor-pointer ${
+                view === t.v
+                  ? 'bg-white text-[#24221F] shadow-sm'
+                  : 'text-[#6C675F] hover:text-[#24221F]'
+              }`}
+            >
+              <Icon className="w-4 h-4" />
+              {t.l}
+            </button>
+          );
+        })}
       </div>
 
       {/* Content */}
-      {filteredTasks.length === 0 && currentEmployeeMaintenance.length === 0 ? (
+      {filteredTasks.length === 0 && filteredTickets.length === 0 ? (
         <Card className="p-12 text-center border-dashed border-[#D9D3C7]">
           <div className="w-12 h-12 rounded-full bg-[#EBF3EC] text-[#386641] flex items-center justify-center mx-auto mb-3">
             <CheckSquare className="w-6 h-6" />
           </div>
           <h3 className="font-display font-semibold text-lg text-[#24221F]">
-            {currentEmployeeTasks.length === 0
+            {view === 'live'
               ? 'Nothing assigned to you right now'
-              : 'No tasks match this filter'}
+              : view === 'submitted'
+                ? 'Nothing awaiting approval'
+                : 'No completed work yet'}
           </h3>
           <p className="font-body text-sm text-[#6C675F] max-w-sm mx-auto mt-1">
-            {currentEmployeeTasks.length === 0
+            {view === 'live'
               ? 'New tasks from your property manager will appear here.'
-              : 'Try clearing the status filter.'}
+              : view === 'submitted'
+                ? 'Work you submit for review appears here until it is approved.'
+                : 'Completed and cancelled work is archived here.'}
           </p>
         </Card>
       ) : filteredTasks.length > 0 ? (
@@ -213,13 +231,13 @@ export const EmployeeTasksView: React.FC = () => {
       ) : null}
 
       {/* Maintenance tickets assigned to me */}
-      {currentEmployeeMaintenance.length > 0 && (
+      {filteredTickets.length > 0 && (
         <div>
           <h2 className="font-display font-semibold text-lg text-[#24221F] mb-3">
             Maintenance Tickets
           </h2>
           <div className="grid gap-3">
-            {currentEmployeeMaintenance.map((t) => (
+            {filteredTickets.map((t) => (
               <Card
                 key={t.ticket_uid}
                 hoverEffect
@@ -255,7 +273,7 @@ export const EmployeeTasksView: React.FC = () => {
                   </div>
                   <div className="text-right text-[11px] text-[#8C867C] shrink-0">
                     <p className="font-semibold text-[#555047]">
-                      {t.location_label || `Room ${t.room_number || '—'}`}
+                      {t.location_label || t.room_number || '—'}
                     </p>
                     {t.due_date && <p>Due {t.due_date}</p>}
                   </div>

@@ -14,6 +14,9 @@ class WorkBatchTicketIn(BaseModel):
     room_uid: uuid.UUID | None = None
     dorm_uid: uuid.UUID | None = None
     bed_uid: uuid.UUID | None = None
+    washroom_uid: uuid.UUID | None = None
+    # Fixture-level targeting — must belong to washroom_uid
+    washroom_fixture_uid: uuid.UUID | None = None
     maintenance_type: str | None = Field(default=None, max_length=64)
     issue: str | None = Field(default=None, min_length=3, max_length=255)
     attachment_urls: list[str] = Field(default_factory=list)
@@ -45,9 +48,9 @@ def ticket_ref_out(kind: str, t) -> dict:
             "ticket_number": t.ticket_number,
             "issue": t.issue,
             "location_label": (
-                f"Room {t.room_number}" if t.room_number
-                else f"{t.dorm_name} · {t.bed_number}" if t.bed_number
-                else t.dorm_name
+                t.room_number
+                or (f"{t.dorm_name} · {t.bed_number}" if t.bed_number else t.dorm_name)
+                or t.washroom_name
             ),
             "status": t.status,
             "assigned_to": str(t.assigned_to) if t.assigned_to else None,

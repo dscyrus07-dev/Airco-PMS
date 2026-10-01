@@ -39,6 +39,20 @@ class MaintenanceTicket(Base):
         Uuid, ForeignKey("beds.id", ondelete="SET NULL"), nullable=True, index=True
     )
     bed_number: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    washroom_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("washrooms.id", ondelete="SET NULL"), nullable=True,
+        index=True,
+    )
+    washroom_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Optional fixture-level targeting within the washroom — SET NULL keeps
+    # the ticket history if the fixture is later removed.
+    washroom_fixture_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("washroom_fixtures.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
+    washroom_fixture_label: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
     reported_by: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
     reported_by_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     maintenance_type: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -134,6 +148,10 @@ class MaintenanceTicketAttachment(Base):
     uploaded_by_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     kind: Mapped[str] = mapped_column(String(24), nullable=False, default="issue")
     # issue | resolution
+    # resolution iteration — NULL/1 = first resolution submission; a
+    # disapproved→re-resolved ticket uploads the next attempt's evidence
+    # under a higher number so each submission round stays distinguishable.
+    attempt: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

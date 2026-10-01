@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+.tmp_tok
 
 # Python
 __pycache__/
@@ -17,6 +18,13 @@ dist/
 uploads/
 *.log
 *.dump
+*.sql
+logs/
+migration-backups/
+
+# Installers / build artifacts
+*.exe
+*.msi
 
 # OS/editor
 .DS_Store

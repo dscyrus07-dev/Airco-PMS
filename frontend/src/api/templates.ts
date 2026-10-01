@@ -55,14 +55,6 @@ export async function templateAction(
   });
 }
 
-export async function templateHistory(
-  template_uid: string
-): Promise<ListResponse<TemplateGenerationRow>> {
-  return apiFetch<ListResponse<TemplateGenerationRow>>(
-    `/templates/${template_uid}/history`
-  );
-}
-
 export async function templateGeneratedWork(
   template_uid: string
 ): Promise<WorkTemplateGeneratedWork> {

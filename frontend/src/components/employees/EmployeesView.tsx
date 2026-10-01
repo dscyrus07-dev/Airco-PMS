@@ -1,10 +1,11 @@
 import React, { useState } from 'react';
-import { LayoutGrid, List, Plus } from 'lucide-react';
+import { LayoutGrid, List, Plus, UserX } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { Button } from '../ui/Button';
 import { ZoneBoard } from './ZoneBoard';
 import { EmployeeDirectory } from './EmployeeDirectory';
 import { CreateEmployeeModal } from './CreateEmployeeModal';
+import { isEmployeeDeactivated } from '../../lib/employeeUtils';
 
 // Compact metric pill — quiet statistics, not dashboard cards
 const MetricPill: React.FC<{
@@ -38,11 +39,14 @@ export const EmployeesView: React.FC = () => {
   const { currentPropertyEmployees, currentPropertyUnallocatedEmployees, activeProperty } =
     useApp();
 
-  const [activeTab, setActiveTab] = useState<'board' | 'directory'>('board');
+  const [activeTab, setActiveTab] = useState<'board' | 'directory' | 'deactivated'>('board');
   const [createModalOpen, setCreateModalOpen] = useState(false);
 
-  const assignedCount = currentPropertyEmployees.length -
-    currentPropertyUnallocatedEmployees.length;
+  const activeEmployees = currentPropertyEmployees.filter(
+    (e) => !isEmployeeDeactivated(e)
+  );
+  const deactivatedEmployees = currentPropertyEmployees.filter(isEmployeeDeactivated);
+  const assignedCount = activeEmployees.filter((e) => e.zone_uid || e.area_uid).length;
 
   return (
     <div className="space-y-5">
@@ -59,7 +63,7 @@ export const EmployeesView: React.FC = () => {
 
           {/* Compact staffing summary */}
           <div className="flex items-center gap-2 mt-3">
-            <MetricPill value={currentPropertyEmployees.length} label="Staff" />
+            <MetricPill value={activeEmployees.length} label="Active Staff" />
             <MetricPill value={assignedCount} label="Assigned" />
             <MetricPill
               value={currentPropertyUnallocatedEmployees.length}
@@ -106,7 +110,7 @@ export const EmployeesView: React.FC = () => {
             <List
               className={`w-3.5 h-3.5 ${activeTab === 'directory' ? 'text-[#2F6B45]' : ''}`}
             />
-            <span>Staff Directory</span>
+            <span>Active Staff</span>
             <span
               className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-[5px] ${
                 activeTab === 'directory'
@@ -114,7 +118,29 @@ export const EmployeesView: React.FC = () => {
                   : 'bg-[#E3DED2] text-[#66706A]'
               }`}
             >
-              {currentPropertyEmployees.length}
+              {activeEmployees.length}
+            </span>
+          </button>
+          <button
+            onClick={() => setActiveTab('deactivated')}
+            className={`px-4 py-1.5 rounded-[8px] text-xs font-semibold transition-all duration-150 cursor-pointer inline-flex items-center gap-2 ${
+              activeTab === 'deactivated'
+                ? 'bg-white text-[#17221B] shadow-[0_1px_2px_rgba(20,30,24,0.10)]'
+                : 'text-[#66706A] hover:text-[#17221B]'
+            }`}
+          >
+            <UserX
+              className={`w-3.5 h-3.5 ${activeTab === 'deactivated' ? 'text-[#B33A3A]' : ''}`}
+            />
+            <span>Deactivated Staff</span>
+            <span
+              className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-[5px] ${
+                activeTab === 'deactivated'
+                  ? 'bg-[#FDE8E8] text-[#A82828]'
+                  : 'bg-[#E3DED2] text-[#66706A]'
+              }`}
+            >
+              {deactivatedEmployees.length}
             </span>
           </button>
         </div>
@@ -133,7 +159,7 @@ export const EmployeesView: React.FC = () => {
       {activeTab === 'board' ? (
         <ZoneBoard onOpenCreateModal={() => setCreateModalOpen(true)} />
       ) : (
-        <EmployeeDirectory />
+        <EmployeeDirectory deactivated={activeTab === 'deactivated'} />
       )}
 
       {/* Add Employee Modal */}

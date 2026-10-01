@@ -1,5 +1,6 @@
 import React, { useEffect } from 'react';
 import { BrowserRouter, Routes, Route, Navigate, useParams } from 'react-router-dom';
+import { perfLog } from './dev/perf';
 import { AppProvider, useApp } from './context/AppContext';
 import { Header } from './components/navigation/Header';
 import { ToastContainer } from './components/ui/ToastContainer';
@@ -36,6 +37,15 @@ const TemplatesView = React.lazy(() =>
 );
 const EmployeeTasksView = React.lazy(() =>
   import('./components/employee_views/EmployeeTasksView').then((m) => ({ default: m.EmployeeTasksView }))
+);
+const RaiseMaintenanceTicketView = React.lazy(() =>
+  import('./components/employee_views/RaiseMaintenanceTicketView').then((m) => ({ default: m.RaiseMaintenanceTicketView }))
+);
+const HrEmployeesView = React.lazy(() =>
+  import('./components/hr/HrEmployeesView').then((m) => ({ default: m.HrEmployeesView }))
+);
+const HrTasksView = React.lazy(() =>
+  import('./components/hr/HrTasksView').then((m) => ({ default: m.HrTasksView }))
 );
 const ProfileView = React.lazy(() =>
   import('./components/employee_views/ProfileView').then((m) => ({ default: m.ProfileView }))
@@ -118,6 +128,9 @@ const PropertyScopedView: React.FC<{
   if (currentRole === 'employee') {
     return <Navigate to="/employee/tasks" replace />;
   }
+  if (currentRole === 'human_resource' || currentRole === 'department_manager') {
+    return <Navigate to="/hr/employee-management" replace />;
+  }
 
   // Property Managers are scoped to their single assigned property
   if (
@@ -166,6 +179,8 @@ const RequireRole: React.FC<{ roles: string[]; children: React.ReactNode }> = ({
   const { currentRole, activePropertyUid } = useApp();
   if (!roles.includes(currentRole)) {
     if (currentRole === 'employee') return <Navigate to="/employee/tasks" replace />;
+    if (currentRole === 'human_resource' || currentRole === 'department_manager')
+      return <Navigate to="/hr/employee-management" replace />;
     if (currentRole === 'property_manager')
       return <Navigate to={`/property/${activePropertyUid}/zones`} replace />;
     return <Navigate to="/admin/properties" replace />;
@@ -187,6 +202,9 @@ const RootRedirect: React.FC = () => {
   }
   if (currentRole === 'property_manager') {
     return <Navigate to={`/property/${activePropertyUid}/zones`} replace />;
+  }
+  if (currentRole === 'human_resource' || currentRole === 'department_manager') {
+    return <Navigate to="/hr/employee-management" replace />;
   }
   return <Navigate to="/employee/tasks" replace />;
 };
@@ -239,6 +257,13 @@ const AppContent: React.FC = () => {
 
           {/* Employee workspace routes */}
           <Route path="/employee/tasks" element={<RequireAuth><RequireRole roles={['employee']}><WorkspaceGate><EmployeeTasksView /></WorkspaceGate></RequireRole></RequireAuth>} />
+          <Route path="/employee/raise-maintenance-ticket" element={<RequireAuth><RequireRole roles={['employee']}><WorkspaceGate><RaiseMaintenanceTicketView /></WorkspaceGate></RequireRole></RequireAuth>} />
+          {/* legacy deep links — old Property + Maintenance pages both
+              resolve to the unified raise-ticket workflow */}
+          <Route path="/employee/property" element={<Navigate to="/employee/raise-maintenance-ticket" replace />} />
+          <Route path="/employee/maintenance" element={<Navigate to="/employee/raise-maintenance-ticket" replace />} />
+          <Route path="/hr/employee-management" element={<RequireAuth><RequireRole roles={['human_resource']}><WorkspaceGate><HrEmployeesView /></WorkspaceGate></RequireRole></RequireAuth>} />
+          <Route path="/hr/task-management" element={<RequireAuth><RequireRole roles={['human_resource']}><WorkspaceGate><HrTasksView /></WorkspaceGate></RequireRole></RequireAuth>} />
           <Route path="/employee/profile" element={<RequireAuth><RequireRole roles={['employee']}><WorkspaceGate><ProfileView /></WorkspaceGate></RequireRole></RequireAuth>} />
 
           {/* Role-based fallback redirects */}
@@ -257,7 +282,19 @@ export function App() {
   return (
     <BrowserRouter>
       <AppProvider>
-        <AppContent />
+        {/* dev-only render instrumentation — Profiler counts/measures
+            commits caused by each refresh; production tree unchanged */}
+        <React.Profiler
+          id="app"
+          onRender={(_id, _phase, actualDuration, baseDuration, startTime) => {
+            perfLog(
+              `[RENDER] commit actual=${actualDuration.toFixed(1)}ms ` +
+              `base=${baseDuration.toFixed(1)}ms at=${startTime.toFixed(0)}`
+            );
+          }}
+        >
+          <AppContent />
+        </React.Profiler>
       </AppProvider>
     </BrowserRouter>
   );

@@ -22,6 +22,9 @@ class MaintenanceCreateRequest(BaseModel):
     room_uid: uuid.UUID | None = None
     dorm_uid: uuid.UUID | None = None
     bed_uid: uuid.UUID | None = None
+    washroom_uid: uuid.UUID | None = None
+    # Fixture-level targeting — must belong to washroom_uid
+    washroom_fixture_uid: uuid.UUID | None = None
     maintenance_type: str = Field(..., max_length=64)
     issue: str = Field(..., min_length=3, max_length=255)
     description: str | None = Field(default=None, max_length=4000)
@@ -69,6 +72,7 @@ def attachment_out(a) -> dict:
         "mime_type": a.mime_type,
         "size_bytes": a.size_bytes,
         "kind": a.kind,
+        "attempt": a.attempt,
         "uploaded_by_name": a.uploaded_by_name,
         "created_at": a.created_at.isoformat() if a.created_at else None,
     }
@@ -96,10 +100,16 @@ def ticket_out(t) -> dict:
         "dorm_name": t.dorm_name,
         "bed_uid": str(t.bed_id) if t.bed_id else None,
         "bed_number": t.bed_number,
+        "washroom_uid": str(t.washroom_id) if t.washroom_id else None,
+        "washroom_name": t.washroom_name,
+        "washroom_fixture_uid": (
+            str(t.washroom_fixture_id) if t.washroom_fixture_id else None
+        ),
+        "washroom_fixture_label": t.washroom_fixture_label,
         "location_label": (
-            f"Room {t.room_number}" if t.room_number
-            else f"{t.dorm_name} · {t.bed_number}" if t.bed_number
-            else t.dorm_name
+            t.room_number
+            or (f"{t.dorm_name} · {t.bed_number}" if t.bed_number else t.dorm_name)
+            or t.washroom_name
         ),
         "reported_by_name": t.reported_by_name,
         "maintenance_type": t.maintenance_type,

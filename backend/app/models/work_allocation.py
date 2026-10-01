@@ -1,8 +1,8 @@
 """Work allocation engine — persistent zone round-robin state, batches, audit.
 
-One zone + one allocation batch = one employee. The round-robin pointer
-lives in `zone_allocation_state` (locked with SELECT … FOR UPDATE), so it
-survives restarts and is safe under concurrent requests.
+One allocation step selects one employee from the final zone or area pool.
+Zone state rows serialize zone allocations; area rows serialize fallback.
+Committed allocation history provides the work-type-specific pointer.
 """
 
 import uuid
@@ -73,7 +73,7 @@ class WorkAllocationBatch(Base):
         Uuid, ForeignKey("employees.id", ondelete="SET NULL"), nullable=True, index=True
     )
     employee_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    # maintenance | task | mixed
+    # cleaning | maintenance | task | mixed — drives department eligibility
     work_type: Mapped[str] = mapped_column(String(24), nullable=False)
     # auto_assigned | unassigned
     allocation_status: Mapped[str] = mapped_column(String(32), nullable=False)

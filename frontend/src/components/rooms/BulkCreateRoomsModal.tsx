@@ -18,6 +18,7 @@ export const BulkCreateRoomsModal: React.FC<BulkCreateRoomsModalProps> = ({
 
   const [startNum, setStartNum] = useState<number>(201);
   const [endNum, setEndNum] = useState<number>(208);
+  const [prefix, setPrefix] = useState<string>('');
   const [roomType, setRoomType] = useState<string>(ROOM_TYPES[1]);
   const [areaSqft, setAreaSqft] = useState<number>(250);
   const [zoneUid, setZoneUid] = useState<string>('');
@@ -28,7 +29,9 @@ export const BulkCreateRoomsModal: React.FC<BulkCreateRoomsModalProps> = ({
     return new Set(currentPropertyRooms.map((r) => r.room_number.toLowerCase().trim()));
   }, [currentPropertyRooms]);
 
-  // Live range preview and duplicate check
+  const trimmedPrefix = prefix.trim();
+
+  // Live range preview and duplicate check — names include the prefix
   const { previewRooms, duplicateRooms, validCount } = useMemo(() => {
     const list: string[] = [];
     const dupes: string[] = [];
@@ -40,7 +43,7 @@ export const BulkCreateRoomsModal: React.FC<BulkCreateRoomsModalProps> = ({
     const safeEnd = Math.min(end, start + 49);
 
     for (let i = start; i <= safeEnd; i++) {
-      const s = String(i);
+      const s = trimmedPrefix ? `${trimmedPrefix} ${i}` : String(i);
       list.push(s);
       if (existingSet.has(s.toLowerCase())) {
         dupes.push(s);
@@ -52,7 +55,7 @@ export const BulkCreateRoomsModal: React.FC<BulkCreateRoomsModalProps> = ({
       duplicateRooms: dupes,
       validCount: list.length - dupes.length,
     };
-  }, [startNum, endNum, existingSet]);
+  }, [startNum, endNum, trimmedPrefix, existingSet]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -64,6 +67,7 @@ export const BulkCreateRoomsModal: React.FC<BulkCreateRoomsModalProps> = ({
         start: Math.min(startNum, endNum),
         end: Math.max(startNum, endNum),
         type: roomType,
+        prefix: trimmedPrefix || undefined,
         area_sqft: areaSqft,
         zone_uid: zoneUid ? zoneUid : null,
       });
@@ -113,6 +117,26 @@ export const BulkCreateRoomsModal: React.FC<BulkCreateRoomsModalProps> = ({
               className="w-full px-3.5 py-2 bg-[#FAF8F5] border border-[#DDD7CB] rounded-[10px] text-sm text-[#24221F] focus:outline-none focus:ring-2 focus:ring-[#386641]"
             />
           </div>
+        </div>
+
+        {/* Optional name prefix — e.g. "Special" → "Special 201", "Special 202"… */}
+        <div>
+          <label className="block text-xs font-semibold text-[#45413B] uppercase tracking-wider mb-1 font-body">
+            Prefix <span className="normal-case font-normal text-[#8A8478]">(optional)</span>
+          </label>
+          <input
+            type="text"
+            maxLength={20}
+            value={prefix}
+            onChange={(e) => setPrefix(e.target.value)}
+            placeholder="e.g. Special"
+            className="w-full px-3.5 py-2 bg-[#FAF8F5] border border-[#DDD7CB] rounded-[10px] text-sm text-[#24221F] focus:outline-none focus:ring-2 focus:ring-[#386641]"
+          />
+          {trimmedPrefix && (
+            <p className="text-[11px] text-[#6C675F] font-body mt-1">
+              Rooms will be named "{trimmedPrefix} {Math.min(startNum, endNum)}", "{trimmedPrefix} {Math.min(startNum, endNum) + 1}", …
+            </p>
+          )}
         </div>
 
         <div className="grid grid-cols-2 gap-3.5">
@@ -172,19 +196,19 @@ export const BulkCreateRoomsModal: React.FC<BulkCreateRoomsModalProps> = ({
           </div>
 
           <div className="flex flex-wrap gap-1.5 max-h-28 overflow-y-auto pr-1">
-            {previewRooms.map((num) => {
-              const isDupe = duplicateRooms.includes(num);
+            {previewRooms.map((name) => {
+              const isDupe = duplicateRooms.includes(name);
               return (
                 <span
-                  key={num}
+                  key={name}
                   className={`text-xs px-2.5 py-1 rounded-[6px] font-mono font-medium border ${
                     isDupe
                       ? 'bg-[#FDE8E8] text-[#A82828] border-[#F9C3C3] line-through'
                       : 'bg-[#FFFFFF] text-[#24221F] border-[#DDD7CB]'
                   }`}
-                  title={isDupe ? `Room ${num} already exists in property` : `Ready to create`}
+                  title={isDupe ? `Room ${name} already exists in property` : `Ready to create`}
                 >
-                  {num}
+                  {name}
                 </span>
               );
             })}

@@ -4,14 +4,12 @@ import {
   Filter,
   Mail,
   Phone,
-  Layers,
   Calendar,
   MoreVertical,
-  UserCheck,
   UserX,
   Edit,
-  Shield,
   Trash2,
+  RotateCcw,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { Card } from '../ui/Card';
@@ -21,14 +19,19 @@ import { DEPARTMENTS } from './CreateEmployeeModal';
 import { ConfirmationDialog } from '../ui/ConfirmationDialog';
 import { Employee } from '../../types';
 import { getInitials } from '../../lib/utils';
+import { isEmployeeDeactivated } from '../../lib/employeeUtils';
 
-export const EmployeeDirectory: React.FC = () => {
+export const EmployeeDirectory: React.FC<{ deactivated?: boolean }> = ({
+  deactivated = false,
+}) => {
   const {
     currentPropertyEmployees,
     currentPropertyZones,
     currentPropertyAreas,
     updateEmployee,
     deactivateEmployee,
+    reactivateEmployee,
+    deleteEmployee,
     assignEmployeeToZone,
     assignEmployeeToArea,
     navigate,
@@ -42,6 +45,7 @@ export const EmployeeDirectory: React.FC = () => {
 
   const [activeMenuEmpUid, setActiveMenuEmpUid] = useState<string | null>(null);
   const [empToDeactivate, setEmpToDeactivate] = useState<Employee | null>(null);
+  const [empToDelete, setEmpToDelete] = useState<Employee | null>(null);
 
   // Edit employee modal state
   const [editingEmp, setEditingEmp] = useState<Employee | null>(null);
@@ -50,8 +54,12 @@ export const EmployeeDirectory: React.FC = () => {
   const [editDept, setEditDept] = useState('');
   const [editPhone, setEditPhone] = useState('');
 
+  const directoryEmployees = currentPropertyEmployees.filter(
+    (emp) => isEmployeeDeactivated(emp) === deactivated
+  );
+
   // Filtering
-  const filteredEmployees = currentPropertyEmployees.filter((emp) => {
+  const filteredEmployees = directoryEmployees.filter((emp) => {
     // Search query
     if (searchQuery.trim()) {
       const q = searchQuery.toLowerCase();
@@ -72,7 +80,8 @@ export const EmployeeDirectory: React.FC = () => {
     if (selectedDept !== 'all' && emp.department !== selectedDept) return false;
 
     // Status filter
-    if (selectedStatus !== 'all' && emp.status !== selectedStatus) return false;
+    if (!deactivated && selectedStatus !== 'all' &&
+        emp.status.toLowerCase() !== selectedStatus.toLowerCase()) return false;
 
     return true;
   });
@@ -119,7 +128,7 @@ export const EmployeeDirectory: React.FC = () => {
         </div>
 
         {/* Filter Selectors */}
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+        <div className={`grid grid-cols-1 ${deactivated ? 'sm:grid-cols-2' : 'sm:grid-cols-3'} gap-3 text-xs`}>
           <div className="flex items-center gap-1.5">
             <span className="text-[#736E65] font-medium shrink-0">Zone:</span>
             <select
@@ -153,33 +162,41 @@ export const EmployeeDirectory: React.FC = () => {
             </select>
           </div>
 
-          <div className="flex items-center gap-1.5">
-            <span className="text-[#736E65] font-medium shrink-0">Status:</span>
-            <select
-              value={selectedStatus}
-              onChange={(e) => setSelectedStatus(e.target.value)}
-              className="w-full bg-white border border-[#DDD7CB] rounded-[8px] px-2.5 py-1.5 text-xs text-[#24221F] focus:outline-none"
-            >
-              <option value="all">All Statuses</option>
-              <option value="active">Active Staff</option>
-              <option value="inactive">Inactive / Past</option>
-            </select>
-          </div>
+          {!deactivated && (
+            <div className="flex items-center gap-1.5">
+              <span className="text-[#736E65] font-medium shrink-0">Status:</span>
+              <select
+                value={selectedStatus}
+                onChange={(e) => setSelectedStatus(e.target.value)}
+                className="w-full bg-white border border-[#DDD7CB] rounded-[8px] px-2.5 py-1.5 text-xs text-[#24221F] focus:outline-none"
+              >
+                <option value="all">All Statuses</option>
+                <option value="Active">Active</option>
+                <option value="On Leave">On Leave</option>
+                <option value="Off Duty">Off Duty</option>
+                <option value="Probation">Probation</option>
+              </select>
+            </div>
+          )}
         </div>
       </div>
 
       {/* Employees Grid */}
       {filteredEmployees.length === 0 ? (
         <Card className="p-10 text-center border-dashed">
-          <p className="font-semibold text-sm text-[#24221F]">No employees found</p>
+          <p className="font-semibold text-sm text-[#24221F]">
+            {deactivated ? 'No deactivated staff' : 'No employees found'}
+          </p>
           <p className="text-xs text-[#6C675F] mt-1">
-            Try adjusting your search query or clear active filters.
+            {deactivated
+              ? 'Staff moved here retain their history but cannot receive new work.'
+              : 'Try adjusting your search query or clear active filters.'}
           </p>
         </Card>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {filteredEmployees.map((emp) => {
-            const zone = currentPropertyZones.find((z) => z.zone_uid === emp.zone_uid);
+            const isDeactivated = isEmployeeDeactivated(emp);
             const isMenuOpen = activeMenuEmpUid === emp.employee_uid;
 
             return (
@@ -202,9 +219,9 @@ export const EmployeeDirectory: React.FC = () => {
                           <h4 className="font-semibold text-sm text-[#24221F] leading-tight">
                             {emp.name}
                           </h4>
-                          {(emp.status === 'Off Duty' || (emp.status as string) === 'inactive') && (
+                          {isDeactivated && (
                             <span className="text-[10px] px-1.5 py-0.2 rounded bg-[#FDE8E8] text-[#A82828] font-medium">
-                              Inactive
+                              Deactivated
                             </span>
                           )}
                         </div>
@@ -240,18 +257,39 @@ export const EmployeeDirectory: React.FC = () => {
                             <span>Edit Details</span>
                           </button>
                           <div className="my-1 border-t border-[#F0ECE4]" />
-                          {(emp.status === 'Active' || (emp.status as string) === 'active') && (
+                          {isDeactivated ? (
+                            <button
+                              onClick={() => {
+                                void reactivateEmployee(emp.employee_uid);
+                                setActiveMenuEmpUid(null);
+                              }}
+                              className="w-full px-3 py-1.5 text-xs text-[#2F6B45] hover:bg-[#EBF3EC] flex items-center gap-2 text-left cursor-pointer"
+                            >
+                              <RotateCcw className="w-3.5 h-3.5" />
+                              <span>Reactivate</span>
+                            </button>
+                          ) : (
                             <button
                               onClick={() => {
                                 setEmpToDeactivate(emp);
                                 setActiveMenuEmpUid(null);
                               }}
-                              className="w-full px-3 py-1.5 text-xs text-[#C53B3B] hover:bg-[#FDE8E8] flex items-center gap-2 text-left cursor-pointer"
+                              className="w-full px-3 py-1.5 text-xs text-[#C98232] hover:bg-[#FFF3E4] flex items-center gap-2 text-left cursor-pointer"
                             >
                               <UserX className="w-3.5 h-3.5" />
                               <span>Deactivate Staff</span>
                             </button>
                           )}
+                          <button
+                            onClick={() => {
+                              setEmpToDelete(emp);
+                              setActiveMenuEmpUid(null);
+                            }}
+                            className="w-full px-3 py-1.5 text-xs text-[#C53B3B] hover:bg-[#FDE8E8] flex items-center gap-2 text-left cursor-pointer"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                            <span>Delete Staff</span>
+                          </button>
                         </div>
                       )}
                     </div>
@@ -284,7 +322,7 @@ export const EmployeeDirectory: React.FC = () => {
                   {/* Zone / Area Assignment Dropdown */}
                   <div className="mb-2">
                     <label className="block text-[10px] font-semibold text-[#8C867C] uppercase tracking-wider mb-1 font-body">
-                      Assigned Zone / Area
+                      {isDeactivated ? 'Last Zone / Area' : 'Assigned Zone / Area'}
                     </label>
                     <select
                       value={emp.area_uid ? `area:${emp.area_uid}` : emp.zone_uid || ''}
@@ -296,7 +334,8 @@ export const EmployeeDirectory: React.FC = () => {
                           assignEmployeeToZone(emp.employee_uid, v || null);
                         }
                       }}
-                      className="w-full bg-[#FAF8F5] border border-[#DDD7CB] rounded-[8px] px-2.5 py-1 text-xs text-[#24221F] focus:outline-none"
+                      disabled={isDeactivated}
+                      className="w-full bg-[#FAF8F5] border border-[#DDD7CB] rounded-[8px] px-2.5 py-1 text-xs text-[#24221F] focus:outline-none disabled:opacity-60 disabled:cursor-not-allowed"
                     >
                       <option value="">(Unallocated Pool)</option>
                       {currentPropertyAreas.map((a) => (
@@ -322,7 +361,11 @@ export const EmployeeDirectory: React.FC = () => {
                     </span>
                   </div>
 
-                  {emp.status === 'On Leave' || emp.leave_status ? (
+                  {isDeactivated ? (
+                    <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-[#FDE8E8] text-[#A82828]">
+                      Deactivated{emp.deactivated_at ? ` · ${new Date(emp.deactivated_at).toLocaleString()}` : ''}
+                    </span>
+                  ) : emp.status === 'On Leave' || emp.leave_status ? (
                     <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-[#FEF3E8] text-[#8C3F03]">
                       On Leave
                     </span>
@@ -419,10 +462,31 @@ export const EmployeeDirectory: React.FC = () => {
         <ConfirmationDialog
           isOpen={!!empToDeactivate}
           onClose={() => setEmpToDeactivate(null)}
-          onConfirm={() => deactivateEmployee(empToDeactivate.employee_uid)}
+          onConfirm={() => void deactivateEmployee(empToDeactivate.employee_uid)}
           entityType="Employee"
           entityName={empToDeactivate.name}
-          impactMessage={`Deactivating ${empToDeactivate.name} will unassign them from their zone, preserve their task history, and move them to inactive status.`}
+          title="Deactivate Staff?"
+          warningTitle="Staff access will be paused."
+          impactMessage="This staff member will no longer be available for zone allocation, task assignment, or new work until they are reactivated."
+          promptMessage="Existing assignments and task history remain unchanged."
+          confirmLabel="Deactivate"
+          confirmVariant="primary"
+        />
+      )}
+
+      {/* Permanent Employee Delete Confirmation */}
+      {empToDelete && (
+        <ConfirmationDialog
+          isOpen={!!empToDelete}
+          onClose={() => setEmpToDelete(null)}
+          onConfirm={() => void deleteEmployee(empToDelete.employee_uid)}
+          entityType="Staff"
+          entityName={empToDelete.name}
+          title="Permanently Delete Staff?"
+          impactMessage="This action permanently removes the staff account from the database and cannot be undone."
+          promptMessage={`Type ${empToDelete.name} to permanently delete this staff account.`}
+          confirmLabel="Permanently Delete"
+          confirmationText={empToDelete.name}
         />
       )}
     </div>

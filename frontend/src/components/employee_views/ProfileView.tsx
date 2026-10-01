@@ -4,10 +4,11 @@ import { useApp } from '../../context/AppContext';
 import { Card } from '../ui/Card';
 import { Button } from '../ui/Button';
 import { Badge } from '../ui/Badge';
+import { HrAccountsCard } from '../admin/HrAccountsCard';
 import { getInitials } from '../../lib/utils';
 
 export const ProfileView: React.FC = () => {
-  const { currentUser, employeeRecord, zones, activeProperty, company, updateProfile } = useApp();
+  const { currentUser, employeeRecord, zones, activeProperty, company, companyProperties, updateProfile } = useApp();
 
   const [editing, setEditing] = useState(false);
   const [name, setName] = useState(currentUser?.name || '');
@@ -168,6 +169,11 @@ export const ProfileView: React.FC = () => {
           </form>
         )}
       </Card>
+
+      {/* Super Admin → HR account management (create + activate/deactivate) */}
+      {role === 'super_admin' && (
+        <HrAccountsCard properties={companyProperties} />
+      )}
     </div>
   );
 };

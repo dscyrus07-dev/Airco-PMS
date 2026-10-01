@@ -1,6 +1,7 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { CalendarCheck, ClipboardCheck, History, Plus } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
+import { usePolling } from '../../hooks/usePolling';
 import { Button } from '../ui/Button';
 import { ConfirmationDialog } from '../ui/ConfirmationDialog';
 import { CreateTaskModal } from './CreateTaskModal';
@@ -8,7 +9,6 @@ import { TaskDetailDrawer } from './TaskDetailDrawer';
 import { TodayTasksView } from './TodayTasksView';
 import { TaskHistoryView } from './TaskHistoryView';
 import { PendingCheckView } from './PendingCheckView';
-import * as tasksApi from '../../api/tasks';
 import { Task } from '../../types';
 
 /**
@@ -20,26 +20,26 @@ import { Task } from '../../types';
  *     (the tasks table — nothing appears here before it exists as a task)
  */
 export const TasksView: React.FC = () => {
-  const { currentPropertyTasks, currentUser, canDo, deleteTask, activePropertyUid, navigate } = useApp();
+  const {
+    currentPropertyTasks, currentUser, canDo, deleteTask, activePropertyUid, navigate,
+    pendingCheck, refreshPendingCheck,
+  } = useApp();
 
   const [tab, setTab] = useState<'today' | 'pending' | 'history'>('today');
-  const [pendingCount, setPendingCount] = useState(0);
   const canReview = currentUser?.role !== 'employee';
 
-  // Pending Check badge — backend count, refreshed on mount + 30s poll
-  const refreshPendingCount = useCallback(async () => {
-    if (!activePropertyUid || !canReview) return;
-    try {
-      const res = await tasksApi.pendingCheck(activePropertyUid);
-      setPendingCount(res.count);
-    } catch { /* badge stays at last value */ }
-  }, [activePropertyUid, canReview]);
-
+  // Pending Check badge — shared AppContext snapshot; this view is the
+  // sole 30s poller (PendingCheckView reads the same data, no second fetch)
+  const pendingCount = pendingCheck?.count ?? 0;
   useEffect(() => {
-    void refreshPendingCount();
-    const iv = setInterval(() => void refreshPendingCount(), 30000);
-    return () => clearInterval(iv);
-  }, [refreshPendingCount]);
+    if (canReview) void refreshPendingCheck();
+  }, [canReview, refreshPendingCheck]);
+  usePolling(
+    () => refreshPendingCheck(),
+    30000,
+    canReview,
+    'TasksView.pendingCheck'
+  );
   const [selectedTaskUid, setSelectedTaskUid] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [editingTask, setEditingTask] = useState<Task | null>(null);
@@ -117,7 +117,6 @@ export const TasksView: React.FC = () => {
               ? navigate(`/property/${activePropertyUid}/maintenance?ticket=${uid}`)
               : setSelectedTaskUid(uid)
           }
-          onCountChange={setPendingCount}
         />
       ) : (
         <TaskHistoryView onOpenTask={setSelectedTaskUid} />

@@ -70,6 +70,9 @@ class RoomBulkCreateRequest(BaseModel):
     start: int
     end: int
     type: str = Field(min_length=1, max_length=64)
+    # Optional name prefix — "Special" + range 101-103 creates
+    # "Special 101", "Special 102", "Special 103"
+    prefix: str | None = Field(default=None, max_length=20)
     area_sqft: int | None = None
     zone_uid: uuid.UUID | None = None
     area_uid: uuid.UUID | None = None
@@ -79,11 +82,11 @@ class RoomUpdateRequest(BaseModel):
     room_number: str | None = Field(default=None, min_length=1, max_length=32)
     type: str | None = Field(default=None, max_length=64)
     area_sqft: int | None = None
-    status: str | None = None
     zone_uid: uuid.UUID | None = None
     area_uid: uuid.UUID | None = None
     cleaning_note: str | None = None
-    current_guest: str | None = None
+    # status / current_guest are NOT updatable here — resource state moves
+    # through the command endpoints (check-in/out, transition) only.
 
 
 class RoomBulkDeleteRequest(BaseModel):
@@ -108,6 +111,24 @@ class DormCreateRequest(BaseModel):
     description: str | None = None
 
 
+class DormBulkItem(BaseModel):
+    """One row of the bulk-dorm form — same fields as DormCreateRequest."""
+    name: str = Field(min_length=1, max_length=255)
+    dorm_type: str = Field(min_length=1, max_length=32)
+    washroom: str = Field(min_length=1, max_length=32)
+    bed_count: int = Field(ge=1, le=200)
+    zone_uid: uuid.UUID | None = None
+    area_uid: uuid.UUID | None = None
+    floor: str | None = None
+    area_sqft: int | None = None
+    description: str | None = None
+
+
+class DormBulkCreateRequest(BaseModel):
+    property_uid: uuid.UUID
+    dorms: list[DormBulkItem] = Field(min_length=1, max_length=50)
+
+
 class DormUpdateRequest(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=255)
     dorm_type: str | None = None
@@ -117,13 +138,84 @@ class DormUpdateRequest(BaseModel):
     description: str | None = None
     zone_uid: uuid.UUID | None = None
     area_uid: uuid.UUID | None = None
-    status: str | None = None
+    is_active: bool | None = None  # lifecycle flag — NOT operational status
     bed_count: int | None = Field(default=None, ge=0, le=200)
 
 
-class BedStatusUpdateRequest(BaseModel):
-    status: str  # available | occupied | cleaning | maintenance | inactive
-    guest_name: str | None = None
+class CheckInRequest(BaseModel):
+    # Optional — omitted/empty creates an unnamed occupancy (pure toggle).
+    guest_name: str | None = Field(default=None, max_length=255)
+
+
+class ResourceTransitionRequest(BaseModel):
+    """POST /resources/{type}/{id}/transition — Super Admin administrative
+    transition. Still validated against the legal transition table."""
+    to: str = Field(min_length=1, max_length=32)
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+# ---------------------------------------------------------------------------
+# Washrooms
+# ---------------------------------------------------------------------------
+
+class WashroomFixtureCounts(BaseModel):
+    stall_count: int = Field(default=0, ge=0, le=200)
+    urinal_count: int = Field(default=0, ge=0, le=200)
+    shower_count: int = Field(default=0, ge=0, le=200)
+    sink_count: int = Field(default=0, ge=0, le=200)
+    mirror_count: int = Field(default=0, ge=0, le=200)
+    bath_tub_count: int = Field(default=0, ge=0, le=200)
+    jacuzzi_count: int = Field(default=0, ge=0, le=200)
+
+
+class WashroomCreateRequest(WashroomFixtureCounts):
+    property_uid: uuid.UUID
+    name: str = Field(min_length=1, max_length=255)
+    washroom_type: str = Field(min_length=1, max_length=32)
+    zone_uid: uuid.UUID | None = None
+    area_uid: uuid.UUID | None = None
+    # Set → attached washroom owned by ONE dorm (its own independent
+    # configuration); NULL → zone-level/common facility
+    dorm_uid: uuid.UUID | None = None
+    # Extra named fixture types, e.g. {"Hand Dryer": 2}
+    custom_fixtures: dict[str, int] | None = None
+
+
+class WashroomBulkItem(WashroomFixtureCounts):
+    name: str = Field(min_length=1, max_length=255)
+    washroom_type: str = Field(min_length=1, max_length=32)
+    zone_uid: uuid.UUID | None = None
+    area_uid: uuid.UUID | None = None
+    dorm_uid: uuid.UUID | None = None
+    custom_fixtures: dict[str, int] | None = None
+
+
+class WashroomBulkCreateRequest(BaseModel):
+    property_uid: uuid.UUID
+    washrooms: list[WashroomBulkItem] = Field(min_length=1, max_length=50)
+
+
+class WashroomUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    washroom_type: str | None = Field(default=None, max_length=32)
+    # Count fields are resize directives — the service translates them into
+    # real washroom_fixtures rows (grow appends, shrink removes from the tail).
+    stall_count: int | None = Field(default=None, ge=0, le=200)
+    urinal_count: int | None = Field(default=None, ge=0, le=200)
+    shower_count: int | None = Field(default=None, ge=0, le=200)
+    sink_count: int | None = Field(default=None, ge=0, le=200)
+    mirror_count: int | None = Field(default=None, ge=0, le=200)
+    bath_tub_count: int | None = Field(default=None, ge=0, le=200)
+    jacuzzi_count: int | None = Field(default=None, ge=0, le=200)
+    custom_fixtures: dict[str, int] | None = None
+    zone_uid: uuid.UUID | None = None
+    area_uid: uuid.UUID | None = None
+    dorm_uid: uuid.UUID | None = None
+
+
+class WashroomFixtureUpdateRequest(BaseModel):
+    # canonical fixture states: operational | maintenance | inactive
+    status: str = Field(min_length=1, max_length=32)
 
 
 # ---------------------------------------------------------------------------
@@ -131,10 +223,13 @@ class BedStatusUpdateRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 class BulkUnitStatusRequest(BaseModel):
-    action: str  # checkout | cleaning | available | maintenance
+    action: str  # checkout | cleaning | available | cleaned | maintenance
     property_uid: uuid.UUID
     room_uids: list[uuid.UUID] = []
     bed_uids: list[uuid.UUID] = []
+    washroom_uids: list[uuid.UUID] = []
+    # required for the state-forcing actions (available/cleaned/maintenance)
+    reason: str | None = Field(default=None, max_length=2000)
 
 
 class AllocationRequest(BaseModel):
@@ -207,6 +302,9 @@ class TaskCreateRequest(BaseModel):
     employee_uid: uuid.UUID | None = None
     supervisor_uid: uuid.UUID | None = None
     room_uid: uuid.UUID | None = None
+    washroom_uid: uuid.UUID | None = None
+    # Fixture-level task targeting — must belong to washroom_uid
+    washroom_fixture_uid: uuid.UUID | None = None
     zone_uid: uuid.UUID | None = None
     priority: str | None = "medium"
     due_date: str | None = None
@@ -227,6 +325,8 @@ class TaskUpdateRequest(BaseModel):  # noqa: D401 - partial update payload
     employee_uid: uuid.UUID | None = None
     supervisor_uid: uuid.UUID | None = None
     room_uid: uuid.UUID | None = None
+    washroom_uid: uuid.UUID | None = None
+    washroom_fixture_uid: uuid.UUID | None = None
     zone_uid: uuid.UUID | None = None
     priority: str | None = None
     status: str | None = None

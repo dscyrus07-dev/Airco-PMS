@@ -1,9 +1,12 @@
 import { apiFetch } from './client';
-import { Room } from '../types';
+import { Room, Task } from '../types';
 import {
   BulkUnitStatusRequest,
   BulkUnitStatusResponse,
+  CheckInRequest,
   ListResponse,
+  ResourceTransitionRequest,
+  ResourceTransitionResponse,
   RoomBulkCreateRequest,
   RoomBulkCreateResponse,
   RoomBulkDeleteRequest,
@@ -50,9 +53,41 @@ export async function bulkDeleteRooms(
   });
 }
 
-/** Multi-select bulk actions — checkout / cleaning / mark-available on rooms & beds. */
+/** Multi-select bulk actions — checkout / queue-cleaning / mark-cleaned / release. */
 export async function bulkUpdateUnits(
   req: BulkUnitStatusRequest
 ): Promise<BulkUnitStatusResponse> {
   return apiFetch<BulkUnitStatusResponse>('/units/bulk-status', { method: 'POST', body: req });
+}
+
+// ---------------------------------------------------------------------------
+// Occupancy commands — `occupied` is backed by an occupancies row, not a flag
+// ---------------------------------------------------------------------------
+
+export async function checkInRoom(room_uid: string, req: CheckInRequest): Promise<Room> {
+  return apiFetch<Room>(`/rooms/${room_uid}/check-in`, { method: 'POST', body: req });
+}
+
+/** Room payload + the checkout-cleaning tasks generated in the same
+ *  transaction (empty for the checkout-release path). */
+export type CheckoutResponse<T> = T & { generated_tasks?: Task[] };
+
+export async function checkOutRoom(
+  room_uid: string
+): Promise<CheckoutResponse<Room>> {
+  return apiFetch<CheckoutResponse<Room>>(`/rooms/${room_uid}/check-out`, {
+    method: 'POST',
+  });
+}
+
+/** Super Admin administrative transition — audited ADMIN_OVERRIDE event. */
+export async function transitionResource(
+  resource_type: 'room' | 'dorm' | 'bed' | 'washroom' | 'fixture',
+  resource_id: string,
+  req: ResourceTransitionRequest
+): Promise<ResourceTransitionResponse> {
+  return apiFetch<ResourceTransitionResponse>(
+    `/resources/${resource_type}/${resource_id}/transition`,
+    { method: 'POST', body: req }
+  );
 }

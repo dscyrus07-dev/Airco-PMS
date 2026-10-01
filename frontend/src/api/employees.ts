@@ -58,6 +58,10 @@ export async function deactivateEmployee(employee_uid: string): Promise<Employee
   return apiFetch<Employee>(`/employees/${employee_uid}/deactivate`, { method: 'POST' });
 }
 
+export async function reactivateEmployee(employee_uid: string): Promise<Employee> {
+  return apiFetch<Employee>(`/employees/${employee_uid}/reactivate`, { method: 'POST' });
+}
+
 export async function deleteEmployee(employee_uid: string): Promise<void> {
   return apiFetch<void>(`/employees/${employee_uid}`, { method: 'DELETE' });
 }

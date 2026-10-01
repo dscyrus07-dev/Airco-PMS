@@ -1,6 +1,7 @@
 """EmployeeService — staff records, login credentials, zone allocation."""
 
 import uuid
+from datetime import datetime, timezone
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -8,15 +9,24 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import hash_password, slugify_username
 from app.models.allocation import AllocationEvent
-from app.models.employee import Employee
+from app.models.employee import (
+    EMPLOYEE_STATUS_ACTIVE,
+    EMPLOYEE_STATUS_DEACTIVATED,
+    Employee,
+    employee_is_assignable,
+)
+from app.models.maintenance import MaintenanceTicket, MaintenanceTicketEvent
+from app.models.property import Property
 from app.models.structure import Zone
-from app.models.task import Task
+from app.models.task import Task, TaskHistoryEvent
 from app.models.user import User, UserRole
+from app.models.work_allocation import WorkAllocationBatch
 from app.repositories.user import UserRepository
 from app.schemas.structure import (
     EmployeeCreateRequest,
     EmployeeUpdateRequest,
 )
+from app.services.audit import AuditService
 from app.services.auth import EmailAlreadyExists, UsernameTaken
 from app.services.structure import ConflictErr, NotFoundErr, StructureService, ValidationErr
 
@@ -28,6 +38,7 @@ class EmployeeService:
         self.session = session
         self.users = UserRepository(session)
         self.structure = StructureService(session)
+        self.audit = AuditService(session)
 
     async def _get_employee(self, user: User, employee_id: uuid.UUID) -> Employee:
         res = await self.session.execute(
@@ -124,6 +135,12 @@ class EmployeeService:
                     entity_type="employee", entity_id=emp.id, property_id=prop.id,
                     to_zone_id=zone_id, actor_user_id=user.id, actor_name=user.name,
                 ))
+            self.audit.record(
+                user, entity_type="employee", entity_id=emp.id,
+                entity_name=emp.name, action="employee_created",
+                property_id=prop.id,
+                detail={"department": emp.department, "job_title": emp.job_title},
+            )
             await self.session.commit()
             return emp
         except IntegrityError as exc:
@@ -138,6 +155,11 @@ class EmployeeService:
     ) -> Employee:
         emp = await self._get_employee(user, employee_id)
         data = payload.model_dump(exclude_unset=True)
+        if "status" in data:
+            raise ValidationErr(
+                "Use the deactivate or reactivate endpoint to change staff status.",
+                field="status",
+            )
         if "zone_uid" in data:
             await self.assign_zone(user, employee_id, data.pop("zone_uid"))
             await self.session.refresh(emp)
@@ -148,6 +170,12 @@ class EmployeeService:
                 raise EmailAlreadyExists(field="email")
         for k, v in data.items():
             setattr(emp, k, v)
+        self.audit.record(
+            user, entity_type="employee", entity_id=emp.id,
+            entity_name=emp.name, action="employee_updated",
+            property_id=emp.property_id,
+            detail={"fields": sorted(data)},
+        )
         await self.session.commit()
         return emp
 
@@ -167,6 +195,11 @@ class EmployeeService:
         is eligible for work in every zone inside that area.
         """
         emp = await self._get_employee(user, employee_id)
+        if (zone_uid is not None or area_uid is not None) and not employee_is_assignable(emp):
+            raise ValidationErr(
+                "Inactive or deactivated staff cannot be assigned to a zone or area.",
+                field="employee_uid",
+            )
         if area_uid is not None:
             area_id = await self._area_or_none(area_uid, emp.property_id)
             zone_id = None
@@ -189,35 +222,141 @@ class EmployeeService:
             from_area_id=from_area, to_area_id=area_id,
             actor_user_id=user.id, actor_name=user.name,
         ))
+        self.audit.record(
+            user, entity_type="employee", entity_id=emp.id,
+            entity_name=emp.name, action="employee_assignment_changed",
+            property_id=emp.property_id,
+            detail={
+                "from_zone_id": str(from_zone) if from_zone else None,
+                "to_zone_id": str(zone_id) if zone_id else None,
+                "from_area_id": str(from_area) if from_area else None,
+                "to_area_id": str(area_id) if area_id else None,
+            },
+        )
         await self.session.commit()
         return emp
 
-    async def deactivate(self, user: User, employee_id: uuid.UUID) -> Employee:
-        emp = await self._get_employee(user, employee_id)
-        emp.status = "Inactive" if emp.status not in ("Inactive", "inactive") else "Active"
+    async def _linked_users(self, employee_id: uuid.UUID) -> list[User]:
         res = await self.session.execute(
-            select(User).where(User.employee_id == emp.id)
+            select(User).where(User.employee_id == employee_id)
         )
-        for u in res.scalars():
-            u.is_active = emp.status.lower() == "active"
+        return list(res.scalars())
+
+    async def deactivate(self, user: User, employee_id: uuid.UUID) -> Employee:
+        """Pause the staff account without deleting employment/work history."""
+        emp = await self._get_employee(user, employee_id)
+        if emp.status.lower() != "deactivated":
+            emp.status = EMPLOYEE_STATUS_DEACTIVATED
+            emp.deactivated_at = datetime.now(timezone.utc)
+            emp.reactivated_at = None
+            for linked in await self._linked_users(emp.id):
+                linked.is_active = False
+            self.audit.record(
+                user, entity_type="employee", entity_id=emp.id,
+                entity_name=emp.name, action="employee_deactivated",
+                property_id=emp.property_id,
+            )
+            await self.session.commit()
+        return emp
+
+    async def reactivate(self, user: User, employee_id: uuid.UUID) -> Employee:
+        """Restore eligibility without auto-restoring a zone or task."""
+        emp = await self._get_employee(user, employee_id)
+        if emp.status.lower() == "active" and not emp.leave_status:
+            return emp
+        from_zone, from_area = emp.zone_id, emp.area_id
+        emp.status = EMPLOYEE_STATUS_ACTIVE
+        emp.leave_status = False
+        emp.reactivated_at = datetime.now(timezone.utc)
+        emp.zone_id = None
+        emp.area_id = None
+        for linked in await self._linked_users(emp.id):
+            linked.is_active = True
+            linked.zone_id = None
+        self.audit.record(
+            user, entity_type="employee", entity_id=emp.id,
+            entity_name=emp.name, action="employee_activated",
+            property_id=emp.property_id,
+        )
+        if from_zone or from_area:
+            self.session.add(AllocationEvent(
+                entity_type="employee", entity_id=emp.id, property_id=emp.property_id,
+                from_zone_id=from_zone, from_area_id=from_area,
+                to_zone_id=None, to_area_id=None,
+                actor_user_id=user.id, actor_name=user.name,
+            ))
         await self.session.commit()
         return emp
 
     async def delete_employee(self, user: User, employee_id: uuid.UUID) -> None:
+        """Permanently delete the employee/login while preserving work history."""
         emp = await self._get_employee(user, employee_id)
-        # unassign open tasks — don't destroy task history
+
+        prop = await self.session.get(Property, emp.property_id)
+        if prop and prop.manager_employee_id == emp.id:
+            prop.manager_employee_id = None  # name/email stay as snapshots
+
+        # Open work returns to the unassigned queue. Completed/cancelled rows
+        # keep assigned_to_name/supervisor_name as the immutable display name.
+        open_statuses = {
+            "pending", "assigned", "in_progress", "submitted",
+            "reopened", "overdue", "scheduled",
+        }
         res = await self.session.execute(
-            select(Task).where(
-                Task.employee_id == emp.id, Task.status.in_(["pending", "in_progress", "overdue", "scheduled"])
+            select(Task).where(Task.employee_id == emp.id)
+        )
+        for task in res.scalars():
+            task.employee_id = None
+            if task.status in open_statuses:
+                task.assigned_to_name = None
+                task.status = "pending"
+                task.submitted_at = None
+                task.allocation_status = "unassigned"
+                task.allocation_method = None
+                task.allocation_reason = "employee_deleted"
+                self.session.add(TaskHistoryEvent(
+                    task_id=task.id, type="employee_removed",
+                    actor_name=user.name,
+                    note=f"{emp.name} was deleted; task returned to the unassigned queue.",
+                ))
+
+        res = await self.session.execute(
+            select(Task).where(Task.supervisor_id == emp.id)
+        )
+        for task in res.scalars():
+            task.supervisor_id = None
+
+        res = await self.session.execute(
+            select(MaintenanceTicket).where(MaintenanceTicket.assigned_to == emp.id)
+        )
+        for ticket in res.scalars():
+            ticket.assigned_to = None
+            if ticket.status in {"open", "assigned", "in_progress", "on_hold"}:
+                ticket.assigned_to_name = None
+                ticket.status = "open"
+                ticket.allocation_status = "unassigned"
+                ticket.allocation_method = None
+                ticket.allocation_reason = "employee_deleted"
+                self.session.add(MaintenanceTicketEvent(
+                    ticket_id=ticket.id, action="unassigned",
+                    actor_name=user.name,
+                    comment=f"{emp.name} was deleted; ticket returned to the unassigned queue.",
+                ))
+
+        res = await self.session.execute(
+            select(WorkAllocationBatch).where(
+                WorkAllocationBatch.employee_id == emp.id
             )
         )
-        for t in res.scalars():
-            t.employee_id = None
-            t.assigned_to_name = None
-        res = await self.session.execute(
-            select(User).where(User.employee_id == emp.id)
+        for batch in res.scalars():
+            batch.employee_id = None  # employee_name remains for audit
+
+        for linked in await self._linked_users(emp.id):
+            await self.session.delete(linked)  # refresh tokens cascade
+        self.audit.record(
+            user, entity_type="employee", entity_id=emp.id,
+            entity_name=emp.name, action="employee_deleted",
+            property_id=emp.property_id,
         )
-        for u in res.scalars():
-            u.is_active = False  # revoke access, keep the audit trail
         await self.session.delete(emp)
         await self.session.commit()

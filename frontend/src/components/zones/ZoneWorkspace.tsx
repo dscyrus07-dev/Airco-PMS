@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   ArrowLeft,
   Layers,
@@ -16,62 +16,177 @@ import {
   X,
   AlertCircle,
   Wrench,
+  Bath,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { Card } from '../ui/Card';
 import { Button } from '../ui/Button';
-import { RoomStatusBadge, BedStatusBadge, Badge, TaskStatusBadge } from '../ui/Badge';
-import { getInitials } from '../../lib/utils';
-import { Zone, MaintenanceTicket } from '../../types';
+import {
+  RoomStatusBadge,
+  Badge,
+  unitVisualState,
+  UNIT_VISUAL_TINT,
+  UNIT_VISUAL_BADGE_VARIANT,
+  UNIT_VISUAL_LABEL,
+} from '../ui/Badge';
+import { Dorm, Zone, MaintenanceTicket, Washroom } from '../../types';
 import { getEffectiveTaskStatus } from '../../lib/taskUtils';
 import { ZONE_TYPE_LABELS, zoneSupportsUnits } from '../../lib/zoneUtils';
-import { isActiveTicket } from '../../lib/maintenanceUtils';
+import { isBlockingTicket } from '../../lib/maintenanceUtils';
+import { fixtureCountsFor, fixtureMeta, isCustomKind } from '../../lib/washroomFixtures';
 import { CreateMaintenanceModal, MaintenanceTarget } from '../maintenance/CreateMaintenanceModal';
+import { WashroomDetailModal } from '../rooms/WashroomDetailModal';
+import { WashroomModal, WashroomCreateDefaults } from '../rooms/WashroomModal';
+import { OccupancyToggle } from '../rooms/OccupancyToggle';
+import { ConfirmationDialog } from '../ui/ConfirmationDialog';
 
 interface ZoneWorkspaceProps {
   zone: Zone;
   onBack: () => void;
 }
 
+/**
+ * Cleaning eligibility — occupancy is a separate axis from operational
+ * work: an OCCUPIED room/bed is still cleanable. Only the operational
+ * state gates cleaning (cleaning = duplicate-protection, maintenance =
+ * blocked, inactive = not actionable).
+ */
+const isCleanable = (u: {
+  operational_state?: string | null;
+  status: string;
+  is_occupied?: boolean;
+}): boolean =>
+  (u.operational_state ??
+    (u.is_occupied || u.status === 'occupied' ? 'available' : u.status)) ===
+  'available';
+
+const facilityCount = (count: number, singular: string) =>
+  `${count} ${singular}${count === 1 ? '' : 's'}`;
+
 export const ZoneWorkspace: React.FC<ZoneWorkspaceProps> = ({ zone, onBack }) => {
   const {
     currentPropertyAreas,
     currentPropertyRooms,
     currentPropertyDorms,
-    currentPropertyEmployees,
+    currentPropertyWashrooms,
     currentPropertyTasks,
     navigate,
     activePropertyUid,
     checkoutDorm,
-    markDormCleaning,
     bulkUpdateUnits,
+    checkInRoom,
+    checkOutRoom,
+    checkInBed,
+    checkOutBed,
     currentPropertyMaintenance,
+    currentRole,
+    updateWashroom,
+    subscribeUnitDeselect,
   } = useApp();
+
+  // Employees use the same visual workspace but are strictly read-only on unit
+  // state — they may only raise maintenance tickets (backend enforces coverage).
+  const isEmployee = currentRole === 'employee';
 
   // Multi-Selection State for Rooms and Beds in this Zone
   const [selectedRoomUids, setSelectedRoomUids] = useState<string[]>([]);
   const [selectedBedUids, setSelectedBedUids] = useState<string[]>([]);
+
+  // Release container selection when its task workflow completes — the
+  // event carries exact target uids, so sibling selections survive.
+  useEffect(
+    () =>
+      subscribeUnitDeselect((target) => {
+        if (target.room_uids?.length)
+          setSelectedRoomUids((prev) =>
+            prev.filter((uid) => !target.room_uids!.includes(uid))
+          );
+        if (target.bed_uids?.length)
+          setSelectedBedUids((prev) =>
+            prev.filter((uid) => !target.bed_uids!.includes(uid))
+          );
+      }),
+    [subscribeUnitDeselect]
+  );
   const [isMultiSelectMode, setIsMultiSelectMode] = useState(false);
   const [maintenanceTarget, setMaintenanceTarget] = useState<MaintenanceTarget | null>(null);
   const [maintenanceTargetList, setMaintenanceTargetList] = useState<MaintenanceTarget[] | null>(null);
 
+  // Occupancy commands — check-in is a pure occupancy toggle (unnamed
+  // occupancy allowed); checkout goes through a confirmation. `busyUnits`
+  // locks a unit's controls while its command is in flight so
+  // double-clicks can't fire duplicate requests.
+  const [checkoutTarget, setCheckoutTarget] = useState<{
+    kind: 'room' | 'bed';
+    uid: string;
+    label: string;
+    guest: string | null;
+  } | null>(null);
+  const [busyUnits, setBusyUnits] = useState<Set<string>>(new Set());
+
+  const runUnitAction = async (key: string, fn: () => Promise<void>) => {
+    if (busyUnits.has(key)) return;
+    setBusyUnits((prev) => new Set(prev).add(key));
+    try {
+      await fn();
+    } finally {
+      setBusyUnits((prev) => {
+        const next = new Set(prev);
+        next.delete(key);
+        return next;
+      });
+    }
+  };
+
+  const requestCheckout = (kind: 'room' | 'bed', uid: string, label: string, guest: string | null) => {
+    if (busyUnits.has(`${kind}:${uid}`)) return;
+    setCheckoutTarget({ kind, uid, label, guest });
+  };
+
+  const confirmCheckout = () => {
+    if (!checkoutTarget) return;
+    const { kind, uid } = checkoutTarget;
+    void runUnitAction(`${kind}:${uid}`, () =>
+      kind === 'room' ? checkOutRoom(uid) : checkOutBed(uid)
+    );
+  };
+
+  // Dorm-attached washroom — detail view + create/edit flow. `washroom: null`
+  // means the dorm only declares a facility; the detail modal can then offer
+  // "Configure" to materialize the real Washroom record.
+  const [washroomDetail, setWashroomDetail] = useState<{
+    washroom: Washroom | null;
+    declaredName: string | null;
+    dorm: Dorm | null;
+  } | null>(null);
+  const [washroomModalOpen, setWashroomModalOpen] = useState(false);
+  const [editingWashroom, setEditingWashroom] = useState<Washroom | null>(null);
+  const [washroomDefaults, setWashroomDefaults] =
+    useState<WashroomCreateDefaults | undefined>(undefined);
+
   // entity_uid → active ticket maps for room / dorm / bed maintenance actions
-  const { ticketsByRoom, ticketsByDorm, ticketsByBed } = useMemo(() => {
+  const { ticketsByRoom, ticketsByDorm, ticketsByBed, ticketsByWashroom } = useMemo(() => {
     const rooms = new Map<string, MaintenanceTicket>();
     const dorms = new Map<string, MaintenanceTicket>();
     const beds = new Map<string, MaintenanceTicket>();
+    const washrooms = new Map<string, MaintenanceTicket>();
     for (const t of currentPropertyMaintenance) {
-      if (!isActiveTicket(t.status)) continue;
+      if (!isBlockingTicket(t.status)) continue;
       if (t.room_uid && !rooms.has(t.room_uid)) rooms.set(t.room_uid, t);
       // dorm-wide tickets (no specific bed) map to the dorm; bed tickets map to the bed
       if (t.dorm_uid && !t.bed_uid && !dorms.has(t.dorm_uid)) dorms.set(t.dorm_uid, t);
       if (t.bed_uid && !beds.has(t.bed_uid)) beds.set(t.bed_uid, t);
+      if (t.washroom_uid && !washrooms.has(t.washroom_uid)) {
+        washrooms.set(t.washroom_uid, t);
+      }
     }
-    return { ticketsByRoom: rooms, ticketsByDorm: dorms, ticketsByBed: beds };
+    return {
+      ticketsByRoom: rooms,
+      ticketsByDorm: dorms,
+      ticketsByBed: beds,
+      ticketsByWashroom: washrooms,
+    };
   }, [currentPropertyMaintenance]);
-
-  // Section tab — which part of the zone is visible
-  const [workspaceTab, setWorkspaceTab] = useState<'units' | 'staff' | 'tasks'>('units');
 
   // Resolve Area
   const associatedArea = currentPropertyAreas.find(
@@ -80,7 +195,12 @@ export const ZoneWorkspace: React.FC<ZoneWorkspaceProps> = ({ zone, onBack }) =>
 
   const zoneRooms = currentPropertyRooms.filter((r) => r.zone_uid === zone.zone_uid);
   const zoneDorms = currentPropertyDorms.filter((d) => d.zone_uid === zone.zone_uid);
-  const zoneEmployees = currentPropertyEmployees.filter((e) => e.zone_uid === zone.zone_uid);
+  // Zone-level washrooms only — dorm-owned washrooms (dorm_uid set, zone
+  // inherited from the dorm) already render as tiles inside the dorm cards,
+  // so listing them again here would duplicate them.
+  const zoneWashrooms = currentPropertyWashrooms.filter(
+    (w) => w.zone_uid === zone.zone_uid && !w.dorm_uid
+  );
   const zoneOpenTasks = currentPropertyTasks.filter(
     (t) => t.zone_uid === zone.zone_uid && getEffectiveTaskStatus(t) !== 'completed'
   );
@@ -110,8 +230,12 @@ export const ZoneWorkspace: React.FC<ZoneWorkspaceProps> = ({ zone, onBack }) =>
 
   // Quick multi-selection filters
   const selectAllOccupied = () => {
-    const occupiedRooms = zoneRooms.filter((r) => r.status === 'occupied').map((r) => r.room_uid);
-    const occupiedBeds = allZoneBeds.filter((b) => b.status === 'occupied').map((b) => b.bed_uid);
+    const occupiedRooms = zoneRooms
+      .filter((r) => r.is_occupied ?? r.status === 'occupied')
+      .map((r) => r.room_uid);
+    const occupiedBeds = allZoneBeds
+      .filter((b) => b.is_occupied ?? b.status === 'occupied')
+      .map((b) => b.bed_uid);
     setSelectedRoomUids(occupiedRooms);
     setSelectedBedUids(occupiedBeds);
     setIsMultiSelectMode(true);
@@ -182,6 +306,92 @@ export const ZoneWorkspace: React.FC<ZoneWorkspaceProps> = ({ zone, onBack }) =>
     if (targets.length > 0) setMaintenanceTargetList(targets);
   };
 
+  const washroomSection = (
+    <div>
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="font-display font-semibold text-lg text-[#24221F] flex items-center gap-2">
+          <Bath className="w-4 h-4 text-[#2D5D7B]" />
+          <span>Washrooms ({zoneWashrooms.length})</span>
+        </h3>
+      </div>
+      {zoneWashrooms.length === 0 ? (
+        <Card className="p-6 text-center text-xs text-[#736E65] border-dashed">
+          No washrooms assigned to this zone yet.
+        </Card>
+      ) : (
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3.5">
+          {zoneWashrooms.map((washroom) => (
+            <Card
+              key={washroom.washroom_uid}
+              onClick={() =>
+                setWashroomDetail({
+                  washroom,
+                  declaredName: null,
+                  dorm: null,
+                })
+              }
+              className="p-4 cursor-pointer transition-all hover:border-[#D5CFC3] hover:shadow-xs"
+              title={`${washroom.name} — view facility details`}
+            >
+              <div className="flex items-center justify-between mb-2">
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <div className="w-8 h-8 rounded-[8px] bg-[#EFF6FA] border border-[#D7E7F1] text-[#2D5D7B] flex items-center justify-center">
+                    <Bath className="w-4 h-4" />
+                  </div>
+                  <span className="font-display font-bold text-lg text-[#24221F] truncate">
+                    {washroom.name}
+                  </span>
+                </div>
+                <Badge
+                  variant={
+                    UNIT_VISUAL_BADGE_VARIANT[unitVisualState(washroom)]
+                  }
+                  size="sm"
+                >
+                  {UNIT_VISUAL_LABEL[unitVisualState(washroom)]}
+                </Badge>
+              </div>
+              <p className="text-xs font-medium text-[#4B4741] capitalize">
+                {washroom.washroom_type} washroom
+              </p>
+              <p className="text-[11px] text-[#8C867C] mt-1">
+                {facilityCount(washroom.stall_count, 'stall')} ·{' '}
+                {facilityCount(washroom.urinal_count, 'urinal')} ·{' '}
+                {facilityCount(washroom.shower_count, 'shower')}
+              </p>
+              <div className="mt-3 pt-2.5 border-t border-[#F2ECE3] flex items-center justify-end">
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setMaintenanceTarget({ kind: 'washroom', washroom });
+                  }}
+                  className={`text-[11px] font-medium inline-flex items-center gap-1 cursor-pointer ${
+                    ticketsByWashroom.has(washroom.washroom_uid)
+                      ? 'text-[#B3372C] hover:underline'
+                      : 'text-[#555047] hover:underline'
+                  }`}
+                  title={
+                    ticketsByWashroom.has(washroom.washroom_uid)
+                      ? `Active ticket ${
+                          ticketsByWashroom.get(washroom.washroom_uid)?.ticket_number
+                        }`
+                      : 'Report a maintenance issue for this washroom'
+                  }
+                >
+                  <Wrench className="w-3 h-3" />
+                  {ticketsByWashroom.has(washroom.washroom_uid)
+                    ? 'Maintenance ●'
+                    : 'Maintenance'}
+                </button>
+              </div>
+            </Card>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+
   return (
     <div className="space-y-6">
       {/* Header with Back button */}
@@ -217,61 +427,38 @@ export const ZoneWorkspace: React.FC<ZoneWorkspaceProps> = ({ zone, onBack }) =>
           </div>
         </div>
 
-        {/* Action jump buttons */}
-        <div className="flex items-center gap-2 flex-wrap">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => navigate(`/property/${activePropertyUid}/tasks`)}
-          >
-            <CheckSquare className="w-4 h-4 mr-1.5" />
-            <span>Zone Tasks ({zoneOpenTasks.length})</span>
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => navigate(`/property/${activePropertyUid}/rooms`)}
-          >
-            <Bed className="w-4 h-4 mr-1.5" />
-            <span>Rooms & Dorms</span>
-          </Button>
-          <Button
-            variant="primary"
-            size="sm"
-            onClick={() => navigate(`/property/${activePropertyUid}/employees`)}
-          >
-            <Users className="w-4 h-4 mr-1.5" />
-            <span>Zone Staff Board</span>
-          </Button>
-        </div>
+        {/* Action jump buttons — manager routes; hidden for employees */}
+        {!isEmployee && (
+          <div className="flex items-center gap-2 flex-wrap">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => navigate(`/property/${activePropertyUid}/tasks`)}
+            >
+              <CheckSquare className="w-4 h-4 mr-1.5" />
+              <span>Zone Tasks ({zoneOpenTasks.length})</span>
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => navigate(`/property/${activePropertyUid}/rooms`)}
+            >
+              <Bed className="w-4 h-4 mr-1.5" />
+              <span>Rooms & Dorms</span>
+            </Button>
+            <Button
+              variant="primary"
+              size="sm"
+              onClick={() => navigate(`/property/${activePropertyUid}/employees`)}
+            >
+              <Users className="w-4 h-4 mr-1.5" />
+              <span>Zone Staff Board</span>
+            </Button>
+          </div>
+        )}
       </div>
 
-      {/* Section navigation — only the selected section's data is shown */}
-      <div className="flex items-center gap-1.5 flex-wrap p-1.5 bg-white border border-[#EAE5DC] rounded-[14px] w-fit">
-        {(
-          [
-            { id: 'units' as const, label: 'Private Rooms & Dorms', icon: <Bed className="w-3.5 h-3.5" /> },
-            { id: 'staff' as const, label: `Zone Staff Team (${zoneEmployees.length})`, icon: <Users className="w-3.5 h-3.5" /> },
-            { id: 'tasks' as const, label: `Open Tasks (${zoneOpenTasks.length})`, icon: <CheckSquare className="w-3.5 h-3.5" /> },
-          ]
-        ).map((tab) => (
-          <button
-            key={tab.id}
-            onClick={() => setWorkspaceTab(tab.id)}
-            className={`px-3.5 py-2 rounded-[10px] text-xs font-medium transition-all cursor-pointer inline-flex items-center gap-1.5 ${
-              workspaceTab === tab.id
-                ? 'bg-[#386641] text-white shadow-xs'
-                : 'text-[#555047] hover:bg-[#F2ECE3]'
-            }`}
-          >
-            {tab.icon}
-            <span>{tab.label}</span>
-          </button>
-        ))}
-      </div>
-
-      {/* ── Private Rooms & Dorms section ─────────────────────────────── */}
-      {workspaceTab === 'units' && (
+      {/* ── Rooms, Dorms & Washrooms ──────────────────────────────────── */}
       <div className="space-y-6">
 
       {/* Multi-Select Toolbar & Bulk Operations Dock — only meaningful for stay zones */}
@@ -356,8 +543,11 @@ export const ZoneWorkspace: React.FC<ZoneWorkspaceProps> = ({ zone, onBack }) =>
           </span>
         </div>
 
-        {/* Row 2: bulk actions on the selected units */}
+        {/* Row 2: bulk actions on the selected units — ops actions are
+            manager-only; employees can only raise maintenance tickets */}
         <div className="flex items-center justify-end gap-2 flex-wrap mt-3 pt-3 border-t border-[#F2ECE3]">
+          {!isEmployee && (
+            <>
           {/* Action 1: Bulk Check Out */}
           <Button
             variant="outline"
@@ -389,7 +579,7 @@ export const ZoneWorkspace: React.FC<ZoneWorkspaceProps> = ({ zone, onBack }) =>
             title="Queue all selected units for housekeeping cleaning"
           >
             <Sparkles className="w-3.5 h-3.5" />
-            <span>Queue for Cleaning ({totalSelectedCount})</span>
+            <span>Clean ({totalSelectedCount})</span>
           </Button>
 
           {/* Action 3: Mark Cleaned / Available */}
@@ -399,11 +589,13 @@ export const ZoneWorkspace: React.FC<ZoneWorkspaceProps> = ({ zone, onBack }) =>
               size="sm"
               onClick={handleBulkAvailable}
               className="text-xs gap-1.5 bg-white border-[#386641] text-[#244E2C]"
-              title="Mark all selected cleaned units as Available"
+              title="Release selected units to Available — closes occupancy and blocking cleaning/maintenance work"
             >
               <CheckCircle2 className="w-3.5 h-3.5 text-[#386641]" />
-              <span>Mark Cleaned / Ready</span>
+              <span>Available</span>
             </Button>
+          )}
+            </>
           )}
 
           {/* Action 4: Send selected rooms/beds to maintenance */}
@@ -426,7 +618,7 @@ export const ZoneWorkspace: React.FC<ZoneWorkspaceProps> = ({ zone, onBack }) =>
       </Card>
       )}
 
-          {!supportsUnits ? (
+          {!supportsUnits && zoneWashrooms.length === 0 ? (
             <Card className="p-8 text-center border-dashed border-[#D9D3C7]">
               <div className="w-12 h-12 rounded-full bg-[#F2EFF9] text-[#554388] flex items-center justify-center mx-auto mb-3">
                 <Layers className="w-6 h-6" />
@@ -435,7 +627,7 @@ export const ZoneWorkspace: React.FC<ZoneWorkspaceProps> = ({ zone, onBack }) =>
                 {ZONE_TYPE_LABELS[zone.zone_type || 'stay']} zone — no guest units
               </h3>
               <p className="font-body text-sm text-[#6C675F] max-w-md mx-auto mt-1">
-                This zone type doesn't contain rooms, dorms or beds. Manage its staff on the
+                This zone type doesn't contain rooms, dorms, beds, or washrooms. Manage its staff on the
                 Zone Staff Board and its work through the Tasks module.
               </p>
               {zone.description && (
@@ -444,6 +636,8 @@ export const ZoneWorkspace: React.FC<ZoneWorkspaceProps> = ({ zone, onBack }) =>
             </Card>
           ) : (
             <>
+          {supportsUnits && (
+          <>
           {/* Private Rooms in Zone */}
           <div>
             <div className="flex items-center justify-between mb-3">
@@ -453,7 +647,9 @@ export const ZoneWorkspace: React.FC<ZoneWorkspaceProps> = ({ zone, onBack }) =>
               </h3>
               {zoneRooms.length > 0 && (
                 <span className="text-[11px] text-[#736E65]">
-                  Click checkbox to multi-select for cleaning or checkout
+                  {isEmployee
+                    ? 'Click checkbox to select rooms for a maintenance ticket'
+                    : 'Click checkbox to multi-select for cleaning or checkout'}
                 </span>
               )}
             </div>
@@ -476,9 +672,11 @@ export const ZoneWorkspace: React.FC<ZoneWorkspaceProps> = ({ zone, onBack }) =>
                         }
                       }}
                       className={`p-4 transition-all relative ${
+                        UNIT_VISUAL_TINT[unitVisualState(room)]
+                      } ${
                         isSelected
-                          ? 'border-[#386641] bg-[#F2F8F3] ring-2 ring-[#386641]/20 shadow-xs'
-                          : 'hover:border-[#D5CFC3] bg-white'
+                          ? 'border-[#386641] ring-2 ring-[#386641]/20 shadow-xs'
+                          : 'hover:border-[#D5CFC3]'
                       } ${isMultiSelectMode ? 'cursor-pointer select-none' : ''}`}
                     >
                       {/* Top Row with Selection Checkbox & Room Number */}
@@ -501,7 +699,7 @@ export const ZoneWorkspace: React.FC<ZoneWorkspaceProps> = ({ zone, onBack }) =>
                           </button>
 
                           <span className="font-display font-bold text-lg text-[#24221F]">
-                            Room {room.room_number}
+                            {room.room_number}
                           </span>
                         </div>
                         <RoomStatusBadge status={room.status} />
@@ -519,75 +717,119 @@ export const ZoneWorkspace: React.FC<ZoneWorkspaceProps> = ({ zone, onBack }) =>
                         )}
                       </div>
 
-                      {/* Direct card-level quick actions — Check Out / Clean Room */}
-                      <div className="mt-3 pt-2.5 border-t border-[#F2ECE3] flex items-center justify-end gap-2">
-                        <button
-                          type="button"
-                          disabled={room.status !== 'occupied'}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            bulkUpdateUnits({ action: 'checkout', roomUids: [room.room_uid] });
-                          }}
-                          className={`text-[11px] font-medium cursor-pointer ${
-                            room.status === 'occupied'
-                              ? 'text-[#9A4C07] hover:underline'
-                              : 'text-[#C4BDB1] cursor-not-allowed'
-                          }`}
-                          title={
-                            room.status === 'occupied'
-                              ? 'Check out the current guest'
-                              : 'Only occupied rooms can be checked out'
-                          }
-                        >
-                          Check Out
-                        </button>
-                        <button
-                          type="button"
-                          disabled={room.status === 'occupied'}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            bulkUpdateUnits({
-                              action: room.status === 'cleaning' ? 'available' : 'cleaning',
-                              roomUids: [room.room_uid],
-                            });
-                          }}
-                          className={`text-[11px] font-medium cursor-pointer ${
-                            room.status === 'occupied'
-                              ? 'text-[#C4BDB1] cursor-not-allowed'
-                              : room.status === 'cleaning'
-                              ? 'text-[#1E4324] hover:underline'
-                              : 'text-[#555047] hover:underline'
-                          }`}
-                          title={
-                            room.status === 'occupied'
-                              ? 'Check out the guest before cleaning'
-                              : room.status === 'cleaning'
-                              ? 'Mark room as cleaned and available'
-                              : 'Queue this room for cleaning'
-                          }
-                        >
-                          Clean Room
-                        </button>
-                        <button
-                          type="button"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setMaintenanceTarget({ kind: 'room', room });
-                          }}
-                          className={`text-[11px] font-medium inline-flex items-center gap-1 cursor-pointer ${
-                            ticketsByRoom.has(room.room_uid)
-                              ? 'text-[#B3372C] hover:underline'
-                              : 'text-[#555047] hover:underline'
-                          }`}
-                          title={
-                            ticketsByRoom.has(room.room_uid)
-                              ? `Active ticket ${ticketsByRoom.get(room.room_uid)?.ticket_number} — click to view`
-                              : 'Report a maintenance issue for this room'
-                          }
-                        >
-                          <Wrench className="w-3 h-3" />
-                          {ticketsByRoom.has(room.room_uid) ? 'Maintenance ●' : 'Maintenance'}
-                        </button>
+                      {/* Occupancy toggle + workflow actions — commands only,
+                          ResourceStateService stays the authority */}
+                      <div
+                        className="mt-3 pt-2.5 border-t border-[#F2ECE3] flex items-center justify-between gap-2 flex-wrap"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        {!isEmployee ? (
+                          <OccupancyToggle
+                            status={room.status}
+                            isOccupied={room.is_occupied}
+                            busy={busyUnits.has(`room:${room.room_uid}`)}
+                            onCheckIn={() =>
+                              void runUnitAction(`room:${room.room_uid}`, () =>
+                                checkInRoom(room.room_uid)
+                              )
+                            }
+                            onCheckOut={() =>
+                              requestCheckout(
+                                'room',
+                                room.room_uid,
+                                `Room ${room.room_number}`,
+                                room.current_guest ?? null
+                              )
+                            }
+                          />
+                        ) : (
+                          <span />
+                        )}
+                        <div className="flex items-center gap-1.5">
+                          {!isEmployee && (
+                            <>
+                          <button
+                            type="button"
+                            disabled={
+                              !isCleanable(room) ||
+                              busyUnits.has(`room:${room.room_uid}`)
+                            }
+                            onClick={() =>
+                              void runUnitAction(`room:${room.room_uid}`, () =>
+                                bulkUpdateUnits({
+                                  action: 'cleaning',
+                                  roomUids: [room.room_uid],
+                                })
+                              )
+                            }
+                            className={`px-2 py-1 rounded-[7px] text-[11px] font-semibold border transition-colors focus:outline-none focus:ring-1 focus:ring-[#386641] ${
+                              isCleanable(room) &&
+                              !busyUnits.has(`room:${room.room_uid}`)
+                                ? 'text-[#386641] border-[#CDE0CF] bg-[#F4F8F4] hover:bg-[#EBF3EC] cursor-pointer'
+                                : 'text-[#C4BDB1] border-[#EDE8DD] bg-[#FAF8F5] cursor-not-allowed'
+                            }`}
+                            title={
+                              room.status === 'cleaning'
+                                ? 'Cleaning already in progress'
+                                : (room.is_occupied ?? room.status === 'occupied')
+                                  ? 'Queue this room for cleaning — guest stays checked in'
+                                  : room.status === 'available'
+                                    ? 'Queue this room for cleaning'
+                                    : `Room is ${room.status} — cleaning not available`
+                            }
+                          >
+                            Cleaning
+                          </button>
+                          <button
+                            type="button"
+                            disabled={
+                              !(room.is_occupied ?? room.status === 'occupied') ||
+                              busyUnits.has(`room:${room.room_uid}`)
+                            }
+                            onClick={() =>
+                              requestCheckout(
+                                'room',
+                                room.room_uid,
+                                `Room ${room.room_number}`,
+                                room.current_guest ?? null
+                              )
+                            }
+                            className={`px-2 py-1 rounded-[7px] text-[11px] font-semibold border transition-colors focus:outline-none focus:ring-1 focus:ring-[#9A4C07] ${
+                              (room.is_occupied ?? room.status === 'occupied') &&
+                              !busyUnits.has(`room:${room.room_uid}`)
+                                ? 'text-[#9A4C07] border-[#F0D5B8] bg-[#FDF6EE] hover:bg-[#FBEEDA] cursor-pointer'
+                                : 'text-[#C4BDB1] border-[#EDE8DD] bg-[#FAF8F5] cursor-not-allowed'
+                            }`}
+                            title={
+                              room.is_occupied ?? room.status === 'occupied'
+                                ? 'Check out the guest — room moves to cleaning'
+                                : 'No active occupancy'
+                            }
+                          >
+                            Checkout
+                          </button>
+                            </>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setMaintenanceTarget({ kind: 'room', room })
+                            }
+                            className={`px-2 py-1 rounded-[7px] text-[11px] font-semibold border transition-colors inline-flex items-center gap-1 cursor-pointer focus:outline-none focus:ring-1 focus:ring-[#A32A2A] ${
+                              ticketsByRoom.has(room.room_uid)
+                                ? 'text-[#A32A2A] border-[#F0C7C7] bg-[#FDF1F1] hover:bg-[#FBE4E4]'
+                                : 'text-[#555047] border-[#E3DCD0] bg-white hover:bg-[#FAF8F5]'
+                            }`}
+                            title={
+                              ticketsByRoom.has(room.room_uid)
+                                ? `Active ticket ${ticketsByRoom.get(room.room_uid)?.ticket_number} — click to view`
+                                : 'Report a maintenance issue'
+                            }
+                          >
+                            <Wrench className="w-3 h-3" />
+                            {ticketsByRoom.has(room.room_uid) ? 'Maint ●' : 'Maint'}
+                          </button>
+                        </div>
                       </div>
                     </Card>
                   );
@@ -605,7 +847,9 @@ export const ZoneWorkspace: React.FC<ZoneWorkspaceProps> = ({ zone, onBack }) =>
               </h3>
               {allZoneBeds.length > 0 && (
                 <span className="text-[11px] text-[#736E65]">
-                  Click bed checkboxes to multi-select for cleaning or checkout
+                  {isEmployee
+                    ? 'Click bed checkboxes to select beds for a maintenance ticket'
+                    : 'Click bed checkboxes to multi-select for cleaning or checkout'}
                 </span>
               )}
             </div>
@@ -620,6 +864,13 @@ export const ZoneWorkspace: React.FC<ZoneWorkspaceProps> = ({ zone, onBack }) =>
                   // Only active beds participate in dorm-level selection —
                   // 'inactive' bunks are kept for history, not actionable.
                   const selectableBeds = dorm.beds.filter((b) => b.status !== 'inactive');
+                  // Washrooms OWNED by this dorm (dorm_uid) — the dorm's
+                  // `washroom` field is only a declared label until a real
+                  // record is configured for it.
+                  const dormWashrooms = currentPropertyWashrooms.filter(
+                    (w) => w.dorm_uid === dorm.dorm_uid
+                  );
+                  const washroomAvailable = dorm.washroom !== 'No Washroom';
                   const dormBedUids = selectableBeds.map((b) => b.bed_uid);
                   const selectedBedsInDorm = dormBedUids.filter((id) =>
                     selectedBedUids.includes(id)
@@ -666,6 +917,24 @@ export const ZoneWorkspace: React.FC<ZoneWorkspaceProps> = ({ zone, onBack }) =>
                           <p className="text-xs text-[#6C675F] font-body mt-0.5">
                             {dorm.beds.length} Total Bunk Spots
                           </p>
+                          {(() => {
+                            const occ = dorm.beds.filter(
+                              (b) => b.is_occupied ?? b.status === 'occupied'
+                            ).length;
+                            const av = dorm.beds.filter((b) => b.status === 'available').length;
+                            const cl = dorm.beds.filter((b) => b.status === 'cleaning').length;
+                            const mt = dorm.beds.filter((b) => b.status === 'maintenance').length;
+                            return (
+                              <p className="text-[11px] font-body mt-0.5 flex items-center gap-2 flex-wrap">
+                                <span className="font-semibold text-[#254668]">
+                                  {occ}/{dorm.beds.length} occupied
+                                </span>
+                                <span className="text-[#2E6038]">Available {av}</span>
+                                <span className="text-[#9A4C07]">Cleaning {cl}</span>
+                                <span className="text-[#A32A2A]">Maintenance {mt}</span>
+                              </p>
+                            );
+                          })()}
                         </div>
 
                         {/* Dorm Quick Select & Direct Actions */}
@@ -700,22 +969,87 @@ export const ZoneWorkspace: React.FC<ZoneWorkspaceProps> = ({ zone, onBack }) =>
                             Select Entire Dorm
                           </label>
 
+                          {!isEmployee && (
+                            <>
+                          {(() => {
+                            // Actions scope to the clicked beds when a
+                            // selection exists; otherwise the whole dorm.
+                            const selectedInDorm = selectableBeds.filter((b) =>
+                              selectedBedUids.includes(b.bed_uid)
+                            );
+                            const actionBeds = someBedsInDormSelected
+                              ? selectedInDorm
+                              : selectableBeds;
+                            const scopeNote = someBedsInDormSelected
+                              ? `${selectedInDorm.length} selected bed${selectedInDorm.length === 1 ? '' : 's'}`
+                              : 'all beds';
+                            const occupiedScope = actionBeds.filter(
+                              (b) => b.is_occupied ?? b.status === 'occupied'
+                            );
+                            // Occupancy is a separate axis — occupied beds
+                            // are cleanable; only operationally-busy beds
+                            // (cleaning/maintenance/inactive) are excluded.
+                            const cleanableScope = actionBeds.filter(
+                              (b) => isCleanable(b)
+                            );
+                            return (
+                              <>
                           <Button
                             variant="outline"
                             size="sm"
-                            onClick={() => checkoutDorm(dorm.dorm_uid)}
-                            title="Checkout all occupied beds in this dorm"
+                            disabled={occupiedScope.length === 0}
+                            onClick={() =>
+                              bulkUpdateUnits({
+                                action: 'checkout',
+                                bedUids: occupiedScope.map((b) => b.bed_uid),
+                              })
+                            }
+                            title={
+                              occupiedScope.length === 0
+                                ? `No occupied beds in ${scopeNote}`
+                                : `Check out ${occupiedScope.length} occupied bed${occupiedScope.length === 1 ? '' : 's'} (${scopeNote})`
+                            }
                           >
-                            Checkout Dorm
+                            Check Out
+                          </Button>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            disabled={cleanableScope.length === 0}
+                            onClick={() =>
+                              bulkUpdateUnits({
+                                action: 'cleaning',
+                                bedUids: cleanableScope.map((b) => b.bed_uid),
+                              })
+                            }
+                            title={
+                              cleanableScope.length === 0
+                                ? 'No cleanable beds — all are already cleaning, under maintenance, or inactive'
+                                : `Queue ${cleanableScope.length} bed${cleanableScope.length === 1 ? '' : 's'} for cleaning (${scopeNote})`
+                            }
+                          >
+                            <Sparkles className="w-3.5 h-3.5 mr-1" />
+                            Send to Clean
                           </Button>
                           <Button
                             variant="sage"
                             size="sm"
-                            onClick={() => markDormCleaning(dorm.dorm_uid)}
-                            title="Mark all cleaned beds as available"
+                            disabled={actionBeds.length === 0}
+                            onClick={() =>
+                              bulkUpdateUnits({
+                                action: 'available',
+                                bedUids: actionBeds.map((b) => b.bed_uid),
+                              })
+                            }
+                            title={`Release ${scopeNote} to Available — closes occupancy and blocking cleaning/maintenance work`}
                           >
-                            Mark Cleaned
+                            Available
                           </Button>
+                              </>
+                            );
+                          })()}
+                            </>
+                          )}
                           <Button
                             variant="outline"
                             size="sm"
@@ -782,20 +1116,92 @@ export const ZoneWorkspace: React.FC<ZoneWorkspaceProps> = ({ zone, onBack }) =>
                         </div>
 
                         <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+                          {/* Attached washroom facility tile — leads the bed
+                              grid, same as the Rooms & Dorms view. A declared
+                              facility (no Washroom row yet) still renders so
+                              the facility is visible and configurable. */}
+                          {washroomAvailable &&
+                            (dormWashrooms.length > 0 ? (
+                              dormWashrooms.map((w) => {
+                                const counts = fixtureCountsFor(w);
+                                const totalFixtures = (
+                                  Object.values(counts) as number[]
+                                ).reduce((a, b) => a + b, 0);
+                                const breakdown = Object.keys(counts)
+                                  .filter((k) => counts[k] > 0)
+                                  .map(
+                                    (k) =>
+                                      `${counts[k]} ${fixtureMeta(k, isCustomKind(k)).plural}`
+                                  )
+                                  .join(' · ');
+                                return (
+                                  <button
+                                    key={w.washroom_uid}
+                                    type="button"
+                                    onClick={() =>
+                                      setWashroomDetail({
+                                        washroom: w,
+                                        declaredName: null,
+                                        dorm,
+                                      })
+                                    }
+                                    className={`p-2.5 rounded-[12px] border text-left transition-all cursor-pointer hover:shadow-xs ${
+                                      UNIT_VISUAL_TINT[unitVisualState(w)]
+                                    }`}
+                                    title={`${w.name} — view facility details`}
+                                  >
+                                    <div className="flex items-center justify-between text-xs font-semibold">
+                                      <span className="flex items-center gap-1 min-w-0">
+                                        <Bath className="w-3 h-3 shrink-0" />
+                                        <span className="truncate">{w.name}</span>
+                                      </span>
+                                      <span className="w-2 h-2 rounded-full bg-current shrink-0" />
+                                    </div>
+                                    <span className="text-[10px] font-medium capitalize block mt-1">
+                                      {w.status.replace('_', ' ')}
+                                    </span>
+                                    <span className="text-[9px] opacity-70 block leading-tight mt-0.5">
+                                      {totalFixtures} fixture{totalFixtures === 1 ? '' : 's'}
+                                      {breakdown ? ` · ${breakdown}` : ''}
+                                    </span>
+                                  </button>
+                                );
+                              })
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setWashroomDetail({
+                                    washroom: null,
+                                    declaredName: dorm.washroom,
+                                    dorm,
+                                  })
+                                }
+                                className="p-2.5 rounded-[12px] border text-left bg-[#EFF6FA] border-[#CFDCEB] text-[#2D5D7B] transition-all cursor-pointer hover:shadow-xs"
+                                title={`${dorm.washroom} — declared facility`}
+                              >
+                                <div className="flex items-center justify-between text-xs font-semibold">
+                                  <span className="flex items-center gap-1 min-w-0">
+                                    <Bath className="w-3 h-3 shrink-0" />
+                                    <span className="truncate">{dorm.washroom}</span>
+                                  </span>
+                                  <span className="w-2 h-2 rounded-full bg-current shrink-0" />
+                                </div>
+                                <span className="text-[9px] opacity-70 block leading-tight mt-1">
+                                  Declared facility — no washroom record
+                                </span>
+                                <span className="text-[9px] font-semibold opacity-80 block mt-0.5">
+                                  View details →
+                                </span>
+                              </button>
+                            ))}
                           {dorm.beds.map((bed) => {
                             const isBedSelectable = bed.status !== 'inactive';
                             const isBedSelected = selectedBedUids.includes(bed.bed_uid);
-
-                            let tileBg = 'bg-[#EBF3EC] border-[#CFE4D1] text-[#244E2C]';
-                            if (bed.status === 'occupied') {
-                              tileBg = 'bg-[#EEF2F6] border-[#CFDCEB] text-[#1E3A56]';
-                            } else if (bed.status === 'cleaning') {
-                              tileBg = 'bg-[#FEF3E8] border-[#FCD9BD] text-[#8C3F03]';
-                            } else if (bed.status === 'maintenance') {
-                              tileBg = 'bg-[#FDF1F1] border-[#F0C8C8] text-[#7C2323]';
-                            } else if (bed.status === 'inactive') {
-                              tileBg = 'bg-[#F3EFE9] border-[#E2DDD5] text-[#8C867C]';
-                            }
+                            // canonical resolver — the server's visual_state
+                            // drives the tint when present
+                            const tileBg =
+                              UNIT_VISUAL_TINT[unitVisualState(bed)];
 
                             return (
                               <div
@@ -845,7 +1251,9 @@ export const ZoneWorkspace: React.FC<ZoneWorkspaceProps> = ({ zone, onBack }) =>
                                 </div>
 
                                 <span className="text-[10px] font-medium capitalize block mt-1">
-                                  {bed.status}
+                                  {bed.is_occupied && bed.status !== 'occupied'
+                                    ? `occupied · ${bed.status}`
+                                    : bed.status}
                                 </span>
                                 {bed.guest_name ? (
                                   <span className="text-[9px] truncate block opacity-85 mt-0.5 font-medium">
@@ -857,59 +1265,34 @@ export const ZoneWorkspace: React.FC<ZoneWorkspaceProps> = ({ zone, onBack }) =>
                                   </span>
                                 )}
 
-                                {/* Explicit status actions — status never changes by clicking the tile itself */}
-                                <div className="mt-1.5 pt-1.5 border-t border-current/10 flex items-center justify-end gap-1.5">
-                                  <button
-                                    type="button"
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      setMaintenanceTarget({ kind: 'bed', dorm, bed });
-                                    }}
-                                    className={`text-[9px] font-semibold inline-flex items-center gap-0.5 hover:underline cursor-pointer ${
-                                      ticketsByBed.has(bed.bed_uid) || bed.status === 'maintenance'
-                                        ? 'text-[#A32A2A]'
-                                        : ''
-                                    }`}
-                                    title={
-                                      ticketsByBed.has(bed.bed_uid)
-                                        ? `Active ticket ${ticketsByBed.get(bed.bed_uid)?.ticket_number}`
-                                        : 'Send this bed to maintenance'
-                                    }
-                                  >
-                                    <Wrench className="w-2.5 h-2.5" />
-                                    {ticketsByBed.has(bed.bed_uid) || bed.status === 'maintenance' ? 'Maint ●' : 'Maint'}
-                                  </button>
-                                  {bed.status === 'occupied' ? (
-                                    <button
-                                      type="button"
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        bulkUpdateUnits({ action: 'checkout', bedUids: [bed.bed_uid] });
-                                      }}
-                                      className="text-[9px] font-semibold hover:underline cursor-pointer"
-                                      title="Check out this bed"
-                                    >
-                                      Check out
-                                    </button>
-                                  ) : (
-                                    <button
-                                      type="button"
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        bulkUpdateUnits({
-                                          action: bed.status === 'cleaning' ? 'available' : 'cleaning',
-                                          bedUids: [bed.bed_uid],
-                                        });
-                                      }}
-                                      className="text-[9px] font-semibold hover:underline cursor-pointer"
-                                      title={
-                                        bed.status === 'cleaning'
-                                          ? 'Mark bed cleaned and available'
-                                          : 'Queue this bed for cleaning'
+                                {/* Occupancy toggle + workflow actions — status
+                                    never changes by clicking the tile itself */}
+                                <div
+                                  className="mt-1.5 pt-1.5 border-t border-current/10 flex items-center justify-between gap-1"
+                                  onClick={(e) => e.stopPropagation()}
+                                >
+                                  {!isEmployee ? (
+                                    <OccupancyToggle
+                                      status={bed.status}
+                                      isOccupied={bed.is_occupied}
+                                      compact
+                                      busy={busyUnits.has(`bed:${bed.bed_uid}`)}
+                                      onCheckIn={() =>
+                                        void runUnitAction(`bed:${bed.bed_uid}`, () =>
+                                          checkInBed(bed.bed_uid)
+                                        )
                                       }
-                                    >
-                                      Clean
-                                    </button>
+                                      onCheckOut={() =>
+                                        requestCheckout(
+                                          'bed',
+                                          bed.bed_uid,
+                                          `${dorm.name} — ${bed.bed_number}`,
+                                          bed.guest_name ?? null
+                                        )
+                                      }
+                                    />
+                                  ) : (
+                                    <span />
                                   )}
                                 </div>
                               </div>
@@ -923,110 +1306,12 @@ export const ZoneWorkspace: React.FC<ZoneWorkspaceProps> = ({ zone, onBack }) =>
               </div>
             )}
           </div>
+          </>
+          )}
+          {washroomSection}
             </>
           )}
         </div>
-      )}
-
-      {/* ── Zone Staff Team section ──────────────────────────────────── */}
-      {workspaceTab === 'staff' && (
-        <div>
-          <div className="flex items-center justify-between mb-3">
-            <h3 className="font-display font-semibold text-lg text-[#24221F] flex items-center gap-2">
-              <Users className="w-4 h-4 text-[#386641]" />
-              <span>Zone Staff Team ({zoneEmployees.length})</span>
-            </h3>
-          </div>
-
-          <Card className="p-4 divide-y divide-[#F2ECE3]">
-            {zoneEmployees.length === 0 ? (
-              <div className="text-center py-6">
-                <p className="text-xs text-[#736E65] font-body mb-2">
-                  No staff allocated to this zone yet.
-                </p>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => navigate(`/property/${activePropertyUid}/employees`)}
-                  className="text-xs"
-                >
-                  Allocate Staff on Board
-                </Button>
-              </div>
-            ) : (
-              zoneEmployees.map((emp) => (
-                <div
-                  key={emp.employee_uid}
-                  className="py-3 first:pt-0 last:pb-0 flex items-center justify-between gap-3"
-                >
-                  <div className="flex items-center gap-2.5">
-                    <div
-                      className="w-8 h-8 rounded-full text-white flex items-center justify-center font-bold text-xs shrink-0"
-                      style={{ backgroundColor: emp.avatar_color || '#386641' }}
-                    >
-                      {getInitials(emp.name)}
-                    </div>
-                    <div>
-                      <h5 className="font-semibold text-xs text-[#24221F]">{emp.name}</h5>
-                      <p className="text-[11px] text-[#6C675F]">{emp.job_title}</p>
-                      <span className="text-[10px] font-mono text-[#8C867C]">{emp.employee_uid}</span>
-                    </div>
-                  </div>
-
-                  <span className="text-[10px] px-2 py-0.5 rounded-full bg-[#F4F0E8] text-[#555047] font-medium">
-                    {emp.department}
-                  </span>
-                </div>
-              ))
-            )}
-          </Card>
-        </div>
-      )}
-
-      {/* ── Open Tasks section ───────────────────────────────────────── */}
-      {workspaceTab === 'tasks' && (
-          <div>
-            <div className="flex items-center justify-between mb-3">
-              <h3 className="font-display font-semibold text-lg text-[#24221F] flex items-center gap-2">
-                <CheckSquare className="w-4 h-4 text-[#C8681A]" />
-                <span>Open Tasks ({zoneOpenTasks.length})</span>
-              </h3>
-              {zoneOpenTasks.length > 0 && (
-                <button
-                  onClick={() => navigate(`/property/${activePropertyUid}/tasks`)}
-                  className="text-[11px] font-medium text-[#386641] hover:underline cursor-pointer"
-                >
-                  View all
-                </button>
-              )}
-            </div>
-
-            <Card className="p-4 divide-y divide-[#F2ECE3]">
-              {zoneOpenTasks.length === 0 ? (
-                <p className="text-xs text-[#736E65] font-body text-center py-4">
-                  No open tasks in this zone.
-                </p>
-              ) : (
-                zoneOpenTasks.slice(0, 6).map((task) => (
-                  <div key={task.task_uid} className="py-2.5 first:pt-0 last:pb-0">
-                    <div className="flex items-start justify-between gap-2">
-                      <div className="min-w-0">
-                        <p className="text-xs font-medium text-[#24221F] leading-snug truncate">
-                          {task.title}
-                        </p>
-                        <p className="text-[10px] text-[#8C867C] font-mono mt-0.5">
-                          {task.task_uid}
-                          {task.assigned_to_name ? ` · ${task.assigned_to_name}` : ''}
-                        </p>
-                      </div>
-                      <TaskStatusBadge status={getEffectiveTaskStatus(task)} />
-                    </div>
-                  </div>
-                ))
-              )}
-            </Card>
-          </div>
-      )}
 
       {/* Maintenance ticket flow — same modal as the Rooms view */}
       {(maintenanceTarget || maintenanceTargetList) && (
@@ -1039,7 +1324,9 @@ export const ZoneWorkspace: React.FC<ZoneWorkspaceProps> = ({ zone, onBack }) =>
                 ? ticketsByRoom.get(maintenanceTarget.room.room_uid) || null
                 : maintenanceTarget.kind === 'dorm'
                   ? ticketsByDorm.get(maintenanceTarget.dorm.dorm_uid) || null
-                  : ticketsByBed.get(maintenanceTarget.bed.bed_uid) || null
+                  : maintenanceTarget.kind === 'washroom'
+                    ? ticketsByWashroom.get(maintenanceTarget.washroom.washroom_uid) || null
+                    : ticketsByBed.get(maintenanceTarget.bed.bed_uid) || null
           }
           onClose={() => {
             setMaintenanceTarget(null);
@@ -1047,7 +1334,84 @@ export const ZoneWorkspace: React.FC<ZoneWorkspaceProps> = ({ zone, onBack }) =>
           }}
           onViewTicket={() => {
             clearSelection();
-            navigate(`/property/${activePropertyUid}/maintenance`);
+            navigate(isEmployee
+              ? '/employee/tasks'
+              : `/property/${activePropertyUid}/maintenance`);
+          }}
+        />
+      )}
+
+      {/* Washroom facility detail — real record shows fixtures/activity; a
+          declared-only facility offers Configure (managers) to create it */}
+      {washroomDetail && (
+        <WashroomDetailModal
+          key={
+            washroomDetail.washroom?.washroom_uid ??
+            `${washroomDetail.dorm?.dorm_uid}:declared`
+          }
+          washroom={washroomDetail.washroom}
+          declaredName={washroomDetail.declaredName}
+          dorm={washroomDetail.dorm}
+          zone={zone}
+          onClose={() => setWashroomDetail(null)}
+          onEdit={
+            isEmployee
+              ? undefined
+              : (w) => {
+                  setEditingWashroom(w);
+                  setWashroomDefaults(undefined);
+                  setWashroomModalOpen(true);
+                }
+          }
+          onConfigure={
+            isEmployee
+              ? undefined
+              : () => {
+                  // Declared facility → create a DORM-OWNED washroom record
+                  setEditingWashroom(null);
+                  setWashroomDefaults({
+                    name: `${washroomDetail.dorm?.name} - Washroom`,
+                    dorm_uid: washroomDetail.dorm?.dorm_uid,
+                  });
+                  setWashroomDetail(null);
+                  setWashroomModalOpen(true);
+                }
+          }
+        />
+      )}
+
+      {/* Checkout — closes the occupancy; backend queues cleaning */}
+      <ConfirmationDialog
+        isOpen={!!checkoutTarget}
+        onClose={() => setCheckoutTarget(null)}
+        onConfirm={confirmCheckout}
+        entityType={checkoutTarget?.kind === 'bed' ? 'Bed' : 'Room'}
+        entityName={checkoutTarget?.label ?? ''}
+        title={`Check out ${checkoutTarget?.label ?? ''}?`}
+        warningTitle="This will close the active occupancy."
+        impactMessage={
+          checkoutTarget?.guest
+            ? `${checkoutTarget.guest} will be checked out and the ${checkoutTarget.kind} will move to Cleaning — a housekeeping task is generated automatically.`
+            : `The ${checkoutTarget?.kind ?? 'unit'} will move to Cleaning and a housekeeping task is generated automatically.`
+        }
+        promptMessage={`Are you sure you want to check out ${checkoutTarget?.label ?? 'this unit'}?`}
+        confirmLabel="Check Out"
+        confirmVariant="primary"
+        isLoading={
+          !!checkoutTarget &&
+          busyUnits.has(`${checkoutTarget.kind}:${checkoutTarget.uid}`)
+        }
+      />
+
+      {washroomModalOpen && (
+        <WashroomModal
+          isOpen={washroomModalOpen}
+          washroom={editingWashroom}
+          defaults={washroomDefaults}
+          onClose={() => {
+            setWashroomModalOpen(false);
+            setEditingWashroom(null);
+            setWashroomDefaults(undefined);
           }}
         />
       )}

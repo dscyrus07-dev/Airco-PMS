@@ -1,6 +1,7 @@
 """Property write DTOs — matches frontend PropertyCreateRequest."""
 
 import re
+import uuid
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -47,6 +48,32 @@ class PropertyCreateRequest(BaseModel):
     manager: ManagerCreate
 
 
+class ManagerUpdate(BaseModel):
+    """Reassign the property manager and/or update their login credentials.
+
+    employee_uid — promote an existing employee of this property to manager;
+    email — new login email for the manager's account;
+    password — new login password for the manager's account (blank keeps the
+    current one).
+    """
+
+    employee_uid: uuid.UUID | None = None
+    email: str | None = None
+    password: str | None = Field(default=None, min_length=8, max_length=128)
+
+    @field_validator("email")
+    @classmethod
+    def _email(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        v = v.strip().lower()
+        if not v:
+            return None
+        if not EMAIL_RE.match(v):
+            raise ValueError("Enter a valid email address.")
+        return v
+
+
 class PropertyUpdateRequest(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=255)
     location: str | None = Field(default=None, max_length=255)
@@ -56,3 +83,4 @@ class PropertyUpdateRequest(BaseModel):
     manager_name: str | None = None
     manager_email: str | None = None
     manager_phone: str | None = None
+    manager: ManagerUpdate | None = None

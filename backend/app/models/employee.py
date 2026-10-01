@@ -7,6 +7,18 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.models import Base
 
 
+EMPLOYEE_STATUS_ACTIVE = "Active"
+EMPLOYEE_STATUS_DEACTIVATED = "Deactivated"
+
+
+def employee_is_assignable(employee: "Employee") -> bool:
+    """Whether the employee may receive NEW work or allocation."""
+    return (
+        (employee.status or "").lower() == "active"
+        and not employee.leave_status
+    )
+
+
 class Employee(Base):
     __tablename__ = "employees"
 
@@ -39,6 +51,12 @@ class Employee(Base):
     avatar_color: Mapped[str | None] = mapped_column(String(16), nullable=True)
     leave_balance_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
     leave_status: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    deactivated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    reactivated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         # client-side µs precision — the round-robin ORDER BY depends on

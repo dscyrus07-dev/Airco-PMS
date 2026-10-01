@@ -10,11 +10,12 @@ import {
 } from '../../api/types';
 import { Modal } from '../ui/Modal';
 import { Button } from '../ui/Button';
+import { isEmployeeAssignable } from '../../lib/employeeUtils';
 
 const STEPS = [
   { key: 'basics', label: 'Basics', icon: ClipboardList, q: 'What needs to be done?' },
   { key: 'assign', label: 'Assignment', icon: Users, q: 'Who should do it?' },
-  { key: 'location', label: 'Location', icon: MapPin, q: 'Where should it happen?' },
+  { key: 'location', label: 'Condition', icon: MapPin, q: 'Which resources should this apply to?' },
   { key: 'schedule', label: 'Schedule', icon: CalendarClock, q: 'When should it happen?' },
   { key: 'instructions', label: 'Instructions', icon: ListChecks, q: 'How should it be done?' },
   { key: 'verify', label: 'Verify', icon: ShieldCheck, q: 'How is completion verified?' },
@@ -22,10 +23,13 @@ const STEPS = [
 ];
 
 const TEMPLATE_TYPES = [
-  { v: 'task', l: 'Task' }, { v: 'maintenance', l: 'Maintenance' },
-  { v: 'inspection', l: 'Inspection' }, { v: 'cleaning', l: 'Cleaning' },
-  { v: 'checklist', l: 'Checklist' }, { v: 'other', l: 'Other' },
+  { v: 'housekeeping', l: 'Housekeeping' }, { v: 'maintenance', l: 'Maintenance' },
+  { v: 'operations', l: 'Operations' }, { v: 'inspection', l: 'Inspection' },
+  { v: 'other', l: 'Other' },
 ];
+const LEGACY_TYPE_LABELS: Record<string, string> = {
+  task: 'Task', cleaning: 'Cleaning', checklist: 'Checklist',
+};
 const CATEGORIES = ['housekeeping', 'maintenance', 'operations', 'safety', 'inspection', 'guest_services', 'inventory', 'security', 'other'];
 const TEAMS = ['Housekeeping', 'Maintenance', 'Front Desk', 'Security', 'Operations'];
 const PRIORITIES = ['low', 'medium', 'high', 'urgent'];
@@ -74,7 +78,7 @@ export const TemplateWizard: React.FC<Props> = ({ editTemplate, onClose, onSaved
   const {
     activePropertyUid, activeProperty, currentPropertyEmployees,
     currentPropertyZones, currentPropertyAreas, currentPropertyRooms,
-    currentPropertyDorms, addToast,
+    currentPropertyDorms, currentPropertyWashrooms, addToast,
   } = useApp();
 
   const [step, setStep] = useState(0);
@@ -129,6 +133,118 @@ export const TemplateWizard: React.FC<Props> = ({ editTemplate, onClose, onSaved
     setSub('location', { room_uids: next });
   };
 
+  // ---- Condition (resource × occupancy × scope) -------------------------
+  // Derived FROM loc — the stored location config is the condition model:
+  //   resource → target, scope → scope (specific = the uid-picker scopes),
+  //   occupancy → occupancy. Resolved server-side at generation time.
+  type CondResource = 'rooms' | 'beds' | 'dorms' | 'washrooms' | 'rooms_beds';
+  type CondScope = 'property' | 'area' | 'zone' | 'specific';
+  const SPECIFIC_KINDS = ['rooms', 'dorms', 'beds', 'washrooms', 'units'];
+  const isSpecific = SPECIFIC_KINDS.includes(loc.scope as string);
+  const condResource: CondResource = isSpecific
+    ? loc.scope === 'dorms' && loc.target === 'beds'
+      ? 'beds'
+      : loc.scope === 'units'
+        ? 'rooms_beds'
+        : (loc.scope as CondResource)
+    : loc.target === 'units' || !loc.target
+      ? 'rooms'
+      : (loc.target as CondResource);
+  const condScope: CondScope = isSpecific ? 'specific' : (loc.scope as CondScope);
+  const condOccupancy: 'all' | 'occupied' | 'unoccupied' =
+    loc.occupancy === 'occupied' || loc.occupied_only
+      ? 'occupied'
+      : loc.occupancy === 'unoccupied'
+        ? 'unoccupied'
+        : 'all';
+
+  const setCondition = (patch: {
+    resource?: CondResource;
+    scope?: CondScope;
+    occupancy?: 'all' | 'occupied' | 'unoccupied';
+  }) => {
+    const resource = patch.resource ?? condResource;
+    const scope = patch.scope ?? condScope;
+    const occupancy = patch.occupancy ?? condOccupancy;
+    const next: NonNullable<WorkTemplateCreateRequest['location']> = { ...loc };
+    if (scope === 'specific') {
+      // dorm beds narrow to a specific dorm; 'all units' picks rooms + beds
+      next.scope =
+        resource === 'beds' ? 'dorms'
+          : resource === 'rooms_beds' ? 'units'
+            : resource;
+      next.target = resource === 'beds' ? 'beds' : undefined;
+    } else {
+      next.scope = scope;
+      next.target = resource;
+    }
+    next.occupancy =
+      resource === 'washrooms' || occupancy === 'all' ? undefined : occupancy;
+    next.occupied_only = undefined;
+    set({ location: next });
+  };
+
+  const zoneChoices = useMemo(
+    () =>
+      currentPropertyZones.filter(
+        (z) => !loc.area_uid || z.area_uid === loc.area_uid
+      ),
+    [currentPropertyZones, loc.area_uid]
+  );
+  const areaName = (uid?: string | null) =>
+    currentPropertyAreas.find((a) => a.area_uid === uid)?.name;
+
+  // Area/Zone selects ARE the scope — picking a zone makes scope 'zone',
+  // area alone → 'area', neither → 'property'. A zone can never stay
+  // selected under an area it doesn't belong to.
+  const applyScopePick = (patch: { area_uid?: string; zone_uid?: string }) => {
+    const area_uid = patch.area_uid !== undefined ? patch.area_uid : loc.area_uid;
+    let zone_uid = patch.zone_uid !== undefined ? patch.zone_uid : loc.zone_uid;
+    if (area_uid && zone_uid) {
+      const z = currentPropertyZones.find((x) => x.zone_uid === zone_uid);
+      if (z && z.area_uid && z.area_uid !== area_uid) zone_uid = undefined;
+    }
+    set({
+      location: {
+        ...loc,
+        scope: zone_uid ? 'zone' : area_uid ? 'area' : 'property',
+        target: condResource,
+        area_uid: area_uid || undefined,
+        zone_uid: zone_uid || undefined,
+        occupancy:
+          condResource === 'washrooms' || condOccupancy === 'all'
+            ? undefined
+            : condOccupancy,
+        occupied_only: undefined,
+      },
+    });
+  };
+
+  const conditionSummary = (): string => {
+    const occ =
+      condOccupancy === 'occupied'
+        ? 'currently occupied'
+        : condOccupancy === 'unoccupied'
+          ? 'currently unoccupied'
+          : 'all';
+    const res = {
+      rooms: 'rooms',
+      beds: 'dorm beds',
+      dorms: 'dorms',
+      washrooms: 'washrooms',
+      rooms_beds: 'units (rooms + dorm beds)',
+    }[condResource];
+    const where =
+      condScope === 'zone'
+        ? `in ${currentPropertyZones.find((z) => z.zone_uid === loc.zone_uid)?.name || 'the selected zone'}`
+        : condScope === 'area'
+          ? `in ${areaName(loc.area_uid) || 'the selected area'}`
+          : condScope === 'specific'
+            ? 'on the selected units only'
+            : 'in this property';
+    return `Applies to ${occ} ${res} ${where} — resolved against live occupancy when the task is generated.`;
+  };
+
   // ---- per-step validation ----
   const stepError = (): string | null => {
     switch (STEPS[step].key) {
@@ -137,14 +253,23 @@ export const TemplateWizard: React.FC<Props> = ({ editTemplate, onClose, onSaved
         return null;
       case 'assign':
         if (assign.mode === 'individual' && !assign.employee_uid) return 'Pick an employee.';
+        if (assign.mode === 'employees' && !(assign.employee_uids || []).length)
+          return 'Pick at least one employee.';
         if (assign.mode === 'team' && !assign.team) return 'Pick a team.';
+        if (assign.mode === 'department' && !assign.department) return 'Pick a department.';
         return null;
       case 'location':
+        if (form.template_type === 'operations') return null;
         if (loc.scope === 'zone' && !loc.zone_uid) return 'Pick a zone.';
         if (loc.scope === 'area' && !loc.area_uid) return 'Pick an area.';
         if (loc.scope === 'rooms' && !selectedRooms.length) return 'Select at least one room.';
+        if (loc.scope === 'dorms' && loc.target === 'beds' && !(loc.dorm_uids || []).length)
+          return 'Select at least one dorm.';
         if (loc.scope === 'dorms' && !(loc.dorm_uids || []).length) return 'Select at least one dorm.';
         if (loc.scope === 'beds' && !(loc.bed_uids || []).length) return 'Select at least one bed.';
+        if (loc.scope === 'units' && !(loc.room_uids || []).length && !(loc.bed_uids || []).length)
+          return 'Select at least one unit.';
+        if (loc.scope === 'washrooms' && !(loc.washroom_uids || []).length) return 'Select at least one washroom.';
         return null;
       case 'schedule':
         if (sched.kind === 'one_time' && !sched.date) return 'Pick a date.';
@@ -171,6 +296,11 @@ export const TemplateWizard: React.FC<Props> = ({ editTemplate, onClose, onSaved
     setSubmitting(true);
     try {
       const payload = { ...form, status, name: form.name.trim() };
+      // Operations has no physical target — force a property-level
+      // condition so the task is never tied to a fake room/zone.
+      if (payload.template_type === 'operations') {
+        payload.location = { scope: 'property' };
+      }
       const t = editTemplate
         ? await templatesApi.updateTemplate(editTemplate.template_uid, payload)
         : await templatesApi.createTemplate(payload);
@@ -318,9 +448,11 @@ export const TemplateWizard: React.FC<Props> = ({ editTemplate, onClose, onSaved
             value={assign.mode}
             onChange={(mode) => setSub('assignment', { mode })}
             options={[
-              { v: 'team' as const, l: 'Team', hint: 'A whole team picks it up' },
+              { v: 'automatic' as const, l: 'Automatic', hint: 'System decides by location' },
               { v: 'individual' as const, l: 'Individual', hint: 'One named employee' },
-              { v: 'automatic' as const, l: 'Automatic', hint: 'System decides by zone' },
+              { v: 'employees' as const, l: 'Employees', hint: 'Fair rotation across named people' },
+              { v: 'team' as const, l: 'Team', hint: 'A whole team picks it up' },
+              { v: 'department' as const, l: 'Department', hint: 'Fair rotation inside a department' },
             ]}
           />
 
@@ -340,7 +472,7 @@ export const TemplateWizard: React.FC<Props> = ({ editTemplate, onClose, onSaved
                   onChange={(e) => setSub('assignment', { supervisor_uid: e.target.value || undefined })}
                   className={`${inputCls} cursor-pointer`}>
                   <option value="">None</option>
-                  {currentPropertyEmployees.map((e) => (
+                  {currentPropertyEmployees.filter(isEmployeeAssignable).map((e) => (
                     <option key={e.employee_uid} value={e.employee_uid}>{e.name}</option>
                   ))}
                 </select>
@@ -355,12 +487,60 @@ export const TemplateWizard: React.FC<Props> = ({ editTemplate, onClose, onSaved
                 onChange={(e) => setSub('assignment', { employee_uid: e.target.value || undefined })}
                 className={`${inputCls} cursor-pointer`}>
                 <option value="">Choose…</option>
-                {currentPropertyEmployees.map((e) => (
+                {currentPropertyEmployees.filter(isEmployeeAssignable).map((e) => (
                   <option key={e.employee_uid} value={e.employee_uid}>
                     {e.name} — {e.job_title || e.department || 'Staff'}
                   </option>
                 ))}
               </select>
+            </div>
+          )}
+
+          {assign.mode === 'employees' && (
+            <div>
+              <label className={labelCls}>Select Employees *</label>
+              <div className="grid grid-cols-2 gap-1.5 max-h-44 overflow-y-auto">
+                {currentPropertyEmployees.filter(isEmployeeAssignable).map((e) => {
+                  const picked = (assign.employee_uids || []).includes(e.employee_uid);
+                  return (
+                    <button key={e.employee_uid} type="button"
+                      onClick={() => {
+                        const cur = new Set(assign.employee_uids || []);
+                        if (picked) cur.delete(e.employee_uid); else cur.add(e.employee_uid);
+                        setSub('assignment', { employee_uids: [...cur] });
+                      }}
+                      className={`px-2.5 py-2 rounded-[9px] border text-left cursor-pointer transition-all text-[12px] font-medium ${
+                        picked
+                          ? 'bg-[#EBF3EC] border-[#386641] text-[#244E2C]'
+                          : 'bg-white border-[#E2DCD0] text-[#58534C] hover:border-[#C8C1B4]'
+                      }`}>
+                      {e.name}
+                      <span className="block text-[10.5px] font-normal text-[#8C867C]">
+                        {e.job_title || e.department || 'Staff'}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="text-[11px] text-[#8C867C] mt-1.5">
+                The allocator rotates fairly across the selected people — nobody is first in line.
+              </p>
+            </div>
+          )}
+
+          {assign.mode === 'department' && (
+            <div>
+              <label className={labelCls}>Select Department *</label>
+              <select value={assign.department || ''}
+                onChange={(e) => setSub('assignment', { department: e.target.value || undefined })}
+                className={`${inputCls} cursor-pointer`}>
+                <option value="">Choose…</option>
+                {TEAMS.map((d) => <option key={d} value={d}>{d}</option>)}
+              </select>
+              <p className="text-[11px] text-[#8C867C] mt-1.5">
+                All active employees in this department form the pool; work is
+                distributed fairly by workload.
+              </p>
             </div>
           )}
 
@@ -384,71 +564,112 @@ export const TemplateWizard: React.FC<Props> = ({ editTemplate, onClose, onSaved
         </div>
       )}
 
-      {/* ======================== STEP 3 — LOCATION ======================== */}
-      {step === 2 && (
+      {/* ======================== STEP 3 — CONDITION ======================== */}
+      {step === 2 && form.template_type === 'operations' && (
+        <div className="rounded-[12px] border border-[#E2DCD0] bg-[#FBFAF7] px-4 py-3.5">
+          <div className="text-[12.5px] font-semibold text-[#3C3832]">No physical target</div>
+          <p className="text-[12px] text-[#8C867C] mt-1 leading-relaxed">
+            Operations tasks apply to the property as a whole — no rooms, zones,
+            or occupancy conditions. Who receives the work is decided by the
+            assignment mode on the previous step (people, team, or department),
+            and the allocator distributes it fairly.
+          </p>
+        </div>
+      )}
+      {step === 2 && form.template_type !== 'operations' && (
         <div className="space-y-4">
-          <div>
-            <label className={labelCls}>Where?</label>
-            <div className="grid grid-cols-3 gap-2">
-              {([
-                { v: 'property', l: 'Entire Property' }, { v: 'zone', l: 'Zone' },
-                { v: 'area', l: 'Area' }, { v: 'rooms', l: 'Specific Rooms' },
-                { v: 'dorms', l: 'Dorms' }, { v: 'beds', l: 'Beds' },
-              ] as const).map((o) => (
-                <button key={o.v} type="button"
-                  onClick={() => setSub('location', { scope: o.v })}
-                  className={`px-3 py-2.5 rounded-[10px] border text-[13px] font-medium cursor-pointer transition-all ${
-                    loc.scope === o.v
-                      ? 'bg-[#EBF3EC] border-[#386641] text-[#244E2C]'
-                      : 'bg-white border-[#E2DCD0] text-[#58534C] hover:border-[#C8C1B4]'
-                  }`}>
-                  {o.l}
-                </button>
-              ))}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label className={labelCls}>Resource</label>
+              <select
+                value={condResource}
+                onChange={(e) =>
+                  setCondition({ resource: e.target.value as typeof condResource })
+                }
+                className={`${inputCls} cursor-pointer`}
+              >
+                <option value="rooms">Rooms</option>
+                <option value="beds">Dorm beds</option>
+                <option value="dorms">Dorms</option>
+                <option value="washrooms">Washrooms</option>
+                <option value="rooms_beds">All units</option>
+              </select>
+            </div>
+            <div>
+              <label className={labelCls}>Occupancy</label>
+              <select
+                value={condOccupancy}
+                disabled={condResource === 'washrooms'}
+                onChange={(e) =>
+                  setCondition({
+                    occupancy: e.target.value as 'all' | 'occupied' | 'unoccupied',
+                  })
+                }
+                className={`${inputCls} cursor-pointer disabled:opacity-50`}
+              >
+                <option value="all">All</option>
+                <option value="occupied">Occupied</option>
+                <option value="unoccupied">Unoccupied</option>
+              </select>
             </div>
           </div>
 
-          {loc.scope === 'zone' && (
-            <div className="grid grid-cols-2 gap-3.5">
+          {condScope !== 'specific' && (
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div>
-                <label className={labelCls}>Select Zone *</label>
-                <select value={loc.zone_uid || ''}
-                  onChange={(e) => setSub('location', { zone_uid: e.target.value || undefined })}
-                  className={`${inputCls} cursor-pointer`}>
-                  <option value="">Choose…</option>
-                  {currentPropertyZones.map((z) => <option key={z.zone_uid} value={z.zone_uid}>{z.name}</option>)}
+                <label className={labelCls}>Area</label>
+                <select
+                  value={loc.area_uid || ''}
+                  onChange={(e) =>
+                    applyScopePick({ area_uid: e.target.value || undefined })
+                  }
+                  className={`${inputCls} cursor-pointer`}
+                >
+                  <option value="">All areas</option>
+                  {currentPropertyAreas.map((a) => (
+                    <option key={a.area_uid} value={a.area_uid}>{a.name}</option>
+                  ))}
                 </select>
               </div>
               <div>
-                <label className={labelCls}>Cover</label>
-                <select value={loc.target || 'rooms'}
-                  onChange={(e) => setSub('location', { target: e.target.value })}
-                  className={`${inputCls} cursor-pointer`}>
-                  <option value="rooms">All rooms in zone</option>
-                  <option value="dorms">All dorms in zone</option>
-                  <option value="beds">All beds in zone</option>
-                  <option value="units">All units in zone</option>
+                <label className={labelCls}>Zone</label>
+                <select
+                  value={loc.zone_uid || ''}
+                  onChange={(e) =>
+                    applyScopePick({ zone_uid: e.target.value || undefined })
+                  }
+                  className={`${inputCls} cursor-pointer`}
+                >
+                  <option value="">All zones</option>
+                  {zoneChoices.map((z) => (
+                    <option key={z.zone_uid} value={z.zone_uid}>
+                      {z.name}{z.area_uid ? ` — ${areaName(z.area_uid) || ''}` : ''}
+                    </option>
+                  ))}
                 </select>
-                <p className="text-[10.5px] text-[#8C867C] mt-1">
-                  Dynamic — new rooms added to this zone join automatically.
-                </p>
               </div>
             </div>
           )}
 
-          {loc.scope === 'area' && (
-            <div>
-              <label className={labelCls}>Select Area *</label>
-              <select value={loc.area_uid || ''}
-                onChange={(e) => setSub('location', { area_uid: e.target.value || undefined })}
-                className={`${inputCls} cursor-pointer`}>
-                <option value="">Choose…</option>
-                {currentPropertyAreas.map((a) => <option key={a.area_uid} value={a.area_uid}>{a.name}</option>)}
-              </select>
-            </div>
-          )}
+          <label className="flex items-center gap-2 text-[13px] text-[#555047] cursor-pointer w-fit">
+            <input
+              type="checkbox"
+              checked={condScope === 'specific'}
+              onChange={(e) =>
+                setCondition({
+                  scope: e.target.checked ? 'specific' : 'property',
+                })
+              }
+              className="rounded border-[#C8C1B4] text-[#386641] cursor-pointer"
+            />
+            {condResource === 'beds'
+              ? 'Pick specific dorms instead'
+              : condResource === 'rooms_beds'
+                ? 'Pick specific rooms & beds instead'
+                : `Pick specific ${condResource} instead`}
+          </label>
 
-          {loc.scope === 'rooms' && (
+          {(loc.scope === 'rooms' || loc.scope === 'units') && (
             <div>
               <div className="flex items-center gap-2 mb-2">
                 <input value={roomSearch} onChange={(e) => setRoomSearch(e.target.value)}
@@ -499,7 +720,28 @@ export const TemplateWizard: React.FC<Props> = ({ editTemplate, onClose, onSaved
             </div>
           )}
 
-          {loc.scope === 'beds' && (
+          {loc.scope === 'washrooms' && (
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5 max-h-44 overflow-y-auto">
+              {currentPropertyWashrooms.map((w) => {
+                const sel = (loc.washroom_uids || []).includes(w.washroom_uid);
+                return (
+                  <button key={w.washroom_uid} type="button"
+                    onClick={() => setSub('location', {
+                      washroom_uids: sel
+                        ? (loc.washroom_uids || []).filter((x) => x !== w.washroom_uid)
+                        : [...(loc.washroom_uids || []), w.washroom_uid],
+                    })}
+                    className={`px-3 py-2.5 rounded-[8px] border text-xs font-medium text-left cursor-pointer ${
+                      sel ? 'bg-[#EBF3EC] border-[#386641] text-[#244E2C]' : 'bg-white border-[#E2DCD0] text-[#58534C]'
+                    }`}>
+                    {w.name}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
+          {(loc.scope === 'beds' || loc.scope === 'units') && (
             <div className="space-y-2 max-h-52 overflow-y-auto">
               {currentPropertyDorms.map((d) => (
                 <div key={d.dorm_uid}>
@@ -525,6 +767,20 @@ export const TemplateWizard: React.FC<Props> = ({ editTemplate, onClose, onSaved
               ))}
             </div>
           )}
+
+          {/* Human-readable condition summary — the rule, not a snapshot */}
+          <div className="rounded-[10px] bg-[#F7F4EF] border border-[#EAE5DC] px-3.5 py-3">
+            <p className="text-[11px] font-semibold uppercase tracking-wider text-[#8C867C] mb-1">
+              Condition
+            </p>
+            <p className="text-[13px] text-[#555047] leading-snug">
+              {conditionSummary()}
+            </p>
+            <p className="text-[11px] text-[#8C867C] mt-1">
+              Targets are re-evaluated every run — today&rsquo;s occupied rooms
+              can differ from tomorrow&rsquo;s.
+            </p>
+          </div>
         </div>
       )}
 

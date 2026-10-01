@@ -44,6 +44,16 @@ export const MAINTENANCE_ACTIVE_STATUSES: MaintenanceStatus[] = [
 export const isActiveTicket = (status: MaintenanceStatus): boolean =>
   MAINTENANCE_ACTIVE_STATUSES.includes(status);
 
+/** Mirrors the backend's BLOCKING_MAINTENANCE — a ticket still blocks its
+ * resource until it is closed/cancelled (resolved = awaiting review). */
+export const MAINTENANCE_BLOCKING_STATUSES: MaintenanceStatus[] = [
+  ...MAINTENANCE_ACTIVE_STATUSES,
+  'resolved',
+];
+
+export const isBlockingTicket = (status: MaintenanceStatus): boolean =>
+  MAINTENANCE_BLOCKING_STATUSES.includes(status);
+
 /** Common issues per maintenance type — `other` always falls back to free text. */
 export const MAINTENANCE_ISSUE_OPTIONS: Record<string, string[]> = {
   electrical: [

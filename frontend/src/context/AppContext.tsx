@@ -4,9 +4,12 @@ import React, {
   useState,
   useEffect,
   useMemo,
+  useRef,
   ReactNode,
   useCallback,
 } from 'react';
+import { usePolling } from '../hooks/usePolling';
+import { corrForRequest, marker } from '../dev/perf';
 import { useLocation, useNavigate } from 'react-router-dom';
 import {
   Area,
@@ -23,10 +26,12 @@ import {
   Task,
   TaskStatus,
   UserRole,
+  Washroom,
   Zone,
 } from '../types';
 import { generateId } from '../lib/utils';
 import { can } from '../lib/permissions';
+import { isEmployeeDeactivated } from '../lib/employeeUtils';
 import { ApiError, setUnauthorizedHandler } from '../api/client';
 import * as authApi from '../api/auth';
 import * as companiesApi from '../api/companies';
@@ -35,6 +40,7 @@ import * as areasApi from '../api/areas';
 import * as zonesApi from '../api/zones';
 import * as roomsApi from '../api/rooms';
 import * as dormsApi from '../api/dorms';
+import * as washroomsApi from '../api/washrooms';
 import * as employeesApi from '../api/employees';
 import * as tasksApi from '../api/tasks';
 import * as maintenanceApi from '../api/maintenance';
@@ -48,6 +54,7 @@ import {
   TaskCreateRequest,
   TaskUpdateRequest,
   DormCreateRequest,
+  DormBulkCreateRequest,
   ZoneCreateRequest,
   AreaCreateRequest,
   AreaUpdateRequest,
@@ -56,6 +63,9 @@ import {
   DormUpdateRequest,
   EmployeeUpdateRequest,
   PropertyUpdateRequest,
+  WashroomBulkCreateRequest,
+  WashroomCreateRequest,
+  WashroomUpdateRequest,
 } from '../api/types';
 
 export interface ToastMessage {
@@ -112,15 +122,32 @@ interface AppContextType {
   zones: Zone[];
   rooms: Room[];
   dorms: Dorm[];
+  washrooms: Washroom[];
   employees: Employee[];
   tasks: Task[];
   maintenanceTickets: MaintenanceTicket[];
+  /** Shared pending-check snapshot — single owner for TasksView badge and
+      PendingCheckView; refreshed at the TasksView 30s cadence */
+  pendingCheck: import('../api/types').PendingCheckResponse | null;
+  refreshPendingCheck: () => Promise<void>;
+  /** Subscribe to container-deselection events — fired when a task
+      completes or a maintenance ticket closes, carrying the target
+      resource uid(s). Views prune their local selection sets. */
+  subscribeUnitDeselect: (
+    fn: (t: {
+      room_uids?: string[];
+      bed_uids?: string[];
+      dorm_uids?: string[];
+      washroom_uids?: string[];
+    }) => void
+  ) => () => void;
 
   // Computed collections scoped to active property
   currentPropertyAreas: Area[];
   currentPropertyZones: Zone[];
   currentPropertyRooms: Room[];
   currentPropertyDorms: Dorm[];
+  currentPropertyWashrooms: Washroom[];
   currentPropertyEmployees: Employee[];
   currentPropertyUnallocatedEmployees: Employee[];
   currentPropertyTasks: Task[];
@@ -155,18 +182,48 @@ interface AppContextType {
 
   // Dorm & Bed Operations
   createDorm: (data: Omit<DormCreateRequest, 'property_uid'>) => Promise<Dorm>;
+  bulkCreateDorms: (
+    data: Omit<DormBulkCreateRequest, 'property_uid'>
+  ) => Promise<{ createdCount: number; errors: string[] }>;
   updateDorm: (dorm_uid: string, updates: DormUpdateRequest) => Promise<void>;
   moveDormToZone: (dorm_uid: string, zone_uid: string | null) => Promise<void>;
   deleteDorm: (dorm_uid: string) => Promise<void>;
-  updateBedStatus: (bed_uid: string, status: BedStatus, guest_name?: string) => Promise<void>;
+  checkInBed: (bed_uid: string, guest_name?: string) => Promise<void>;
+  checkOutBed: (bed_uid: string) => Promise<void>;
   checkoutDorm: (dorm_uid: string) => Promise<void>;
-  markDormCleaning: (dorm_uid: string) => Promise<void>;
+  markDormCleaned: (dorm_uid: string) => Promise<void>;
+
+  // Washroom Operations
+  createWashroom: (
+    data: Omit<WashroomCreateRequest, 'property_uid'>
+  ) => Promise<Washroom>;
+  bulkCreateWashrooms: (
+    data: Omit<WashroomBulkCreateRequest, 'property_uid'>
+  ) => Promise<{ createdCount: number; errors: string[] }>;
+  updateWashroom: (
+    washroom_uid: string,
+    updates: WashroomUpdateRequest
+  ) => Promise<void>;
+  /** Re-fetch a single washroom (with fixtures) and merge into state */
+  refreshWashroom: (washroom_uid: string) => Promise<Washroom | null>;
+  /** Per-fixture status mutation — returns the refreshed washroom record */
+  updateWashroomFixture: (
+    washroom_uid: string,
+    fixture_uid: string,
+    status: import('../api/types').WashroomFixtureUpdateRequest['status']
+  ) => Promise<void>;
+  moveWashroomToZone: (
+    washroom_uid: string,
+    zone_uid: string | null
+  ) => Promise<void>;
+  deleteWashroom: (washroom_uid: string) => Promise<void>;
 
   // Multi-Unit Selection & Bulk Actions (Cleaning & Checkout)
   bulkUpdateUnits: (options: {
-    action: 'checkout' | 'cleaning' | 'available' | 'maintenance';
+    action: 'checkout' | 'cleaning' | 'available' | 'cleaned' | 'maintenance';
     roomUids?: string[];
     bedUids?: string[];
+    washroomUids?: string[];
   }) => Promise<void>;
   bulkCheckoutRooms: (roomUids: string[]) => Promise<void>;
   bulkCleanRooms: (roomUids: string[], targetStatus?: RoomStatus) => Promise<void>;
@@ -183,9 +240,18 @@ interface AppContextType {
   assignEmployeeToArea: (employee_uid: string, area_uid: string | null) => Promise<void>;
   deleteEmployee: (employee_uid: string) => Promise<void>;
   deactivateEmployee: (employee_uid: string) => Promise<void>;
+  reactivateEmployee: (employee_uid: string) => Promise<void>;
 
-  // Room and Dorm Helper Aliases
-  updateRoomStatus: (room_uid: string, status: RoomStatus) => Promise<void>;
+  // Occupancy & transition commands — resource state is server-authoritative;
+  // the API response replaces local state (no optimistic mutation)
+  checkInRoom: (room_uid: string, guest_name?: string) => Promise<void>;
+  checkOutRoom: (room_uid: string) => Promise<void>;
+  transitionResource: (
+    resource_type: 'room' | 'dorm' | 'bed' | 'washroom' | 'fixture',
+    resource_id: string,
+    to: string,
+    reason: string
+  ) => Promise<void>;
   assignRoomToZone: (room_uid: string, zone_uid: string | null) => Promise<void>;
   assignDormToZone: (dorm_uid: string, zone_uid: string | null) => Promise<void>;
 
@@ -197,10 +263,17 @@ interface AppContextType {
   completeTask: (task_uid: string, photos: File[], note?: string) => Promise<void>;
   requestTaskRedo: (task_uid: string, note?: string) => Promise<void>;
   reassignTask: (task_uid: string, employee_uid: string | null) => Promise<void>;
-  updateTaskStatus: (task_uid: string, status: TaskStatus) => Promise<void>;
-  submitTask: (task_uid: string, note: string | undefined, photo_urls: string[]) => Promise<void>;
+  submitTask: (
+    task_uid: string,
+    note: string | undefined,
+    photo_urls: string[]
+  ) => Promise<Task | null>;
   approveTask: (task_uid: string, note?: string) => Promise<void>;
   rejectTask: (task_uid: string, reason: string) => Promise<void>;
+  deleteTaskCompletionImage: (
+    task_uid: string,
+    image_uid: string
+  ) => Promise<Task | null>;
   reopenTask: (task_uid: string, note?: string) => Promise<void>;
 
   // Maintenance ticket operations
@@ -221,6 +294,7 @@ interface AppContextType {
     ticket_uid: string,
     updates: import('../api/types').MaintenanceUpdateRequest
   ) => Promise<void>;
+  deleteMaintenanceTicket: (ticket_uid: string) => Promise<void>;
 
   // UI Toast notifications
   toasts: ToastMessage[];
@@ -252,6 +326,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [zones, setZones] = useState<Zone[]>([]);
   const [rooms, setRooms] = useState<Room[]>([]);
   const [dorms, setDorms] = useState<Dorm[]>([]);
+  const [washrooms, setWashrooms] = useState<Washroom[]>([]);
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [maintenanceTickets, setMaintenanceTickets] = useState<MaintenanceTicket[]>([]);
@@ -291,22 +366,26 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     setIsLoadingData(true);
     setDataError(null);
     try {
-      const [propertiesRes, areasRes, zonesRes, roomsRes, dormsRes, employeesRes, tasksRes, maintenanceRes] =
-        await Promise.all([
-          propertiesApi.listProperties(),
-          areasApi.listAreas(),
-          zonesApi.listZones(),
-          roomsApi.listRooms(),
-          dormsApi.listDorms(),
-          employeesApi.listEmployees(),
-          tasksApi.listTasks({ limit: 500 }),
-          maintenanceApi.listMaintenance(),
-        ]);
+      const [
+        propertiesRes, areasRes, zonesRes, roomsRes, dormsRes,
+        washroomsRes, employeesRes, tasksRes, maintenanceRes,
+      ] = await Promise.all([
+        propertiesApi.listProperties(),
+        areasApi.listAreas(),
+        zonesApi.listZones(),
+        roomsApi.listRooms(),
+        dormsApi.listDorms(),
+        washroomsApi.listWashrooms(),
+        employeesApi.listEmployees(),
+        tasksApi.listTasks({ limit: 500 }),
+        maintenanceApi.listMaintenance(),
+      ]);
       setProperties(propertiesRes.items);
       setAreas(areasRes.items);
       setZones(zonesRes.items);
       setRooms(roomsRes.items);
       setDorms(dormsRes.items);
+      setWashrooms(washroomsRes.items);
       setEmployees(employeesRes.items);
       setTasks(tasksRes.items);
       setMaintenanceTickets(maintenanceRes.items);
@@ -324,10 +403,216 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   // Approving/rejecting/reopening work re-derives unit statuses server-side
   // (bed released to available, room back to cleaning, ...) — the local
   // rooms/dorms lists must be re-pulled or the UI shows stale states.
-  const refreshUnits = useCallback(() => {
-    void roomsApi.listRooms().then((r) => setRooms(r.items)).catch(() => {});
-    void dormsApi.listDorms().then((d) => setDorms(d.items)).catch(() => {});
+  type UnitRefreshScope = {
+    rooms?: boolean;
+    dorms?: boolean;
+    washrooms?: boolean;
+    tasks?: boolean;
+    maintenance?: boolean;
+  };
+  const FULL_UNIT_SCOPE: UnitRefreshScope = {
+    rooms: true,
+    dorms: true,
+    washrooms: true,
+    tasks: true,
+    maintenance: true,
+  };
+  // --- Container-selection release -------------------------------------
+  // Successful task completion / ticket close emits the target uid(s);
+  // views holding selection sets subscribe and clear exactly those ids.
+  // Fires ONLY on success — failures and mid-lifecycle states (submitted)
+  // leave the selection untouched.
+  type UnitDeselectTarget = {
+    room_uids?: string[];
+    bed_uids?: string[];
+    dorm_uids?: string[];
+    washroom_uids?: string[];
+  };
+  const unitDeselectListeners = useRef(
+    new Set<(t: UnitDeselectTarget) => void>()
+  );
+  const subscribeUnitDeselect = useCallback(
+    (fn: (t: UnitDeselectTarget) => void): (() => void) => {
+      unitDeselectListeners.current.add(fn);
+      return () => {
+        unitDeselectListeners.current.delete(fn);
+      };
+    },
+    []
+  );
+  const emitUnitDeselect = (t: {
+    room_uid?: string | null;
+    dorm_uid?: string | null;
+    bed_uid?: string | null;
+    bed_uids?: string[] | null;
+    washroom_uid?: string | null;
+  }) => {
+    const beds = [...(t.bed_uids ?? []), ...(t.bed_uid ? [t.bed_uid] : [])];
+    const target: UnitDeselectTarget = {
+      room_uids: t.room_uid ? [t.room_uid] : undefined,
+      bed_uids: beds.length ? beds : undefined,
+      dorm_uids: t.dorm_uid ? [t.dorm_uid] : undefined,
+      washroom_uids: t.washroom_uid ? [t.washroom_uid] : undefined,
+    };
+    if (
+      target.room_uids || target.dorm_uids ||
+      (target.bed_uids && target.bed_uids.length) || target.washroom_uids
+    ) {
+      unitDeselectListeners.current.forEach((fn) => fn(target));
+    }
+  };
+
+  // A resource-targeted task/ticket can only change the collection that
+  // holds the target — beds live inside their dorm payload.
+  const scopeForTarget = (t: {
+    room_uid?: string | null;
+    dorm_uid?: string | null;
+    washroom_uid?: string | null;
+    bed_uid?: string | null;
+    bed_uids?: string[] | null;
+  }): UnitRefreshScope => ({
+    rooms: !!t.room_uid,
+    dorms: !!t.dorm_uid || !!t.bed_uid || (t.bed_uids?.length ?? 0) > 0,
+    washrooms: !!t.washroom_uid,
+  });
+
+  const refreshUnitsInFlight = useRef<Promise<void> | null>(null);
+  const refreshUnitsPendingScope = useRef<UnitRefreshScope | null>(null);
+  const fetchUnitScope = useCallback(async (scope: UnitRefreshScope): Promise<void> => {
+    await Promise.allSettled([
+      scope.rooms && roomsApi.listRooms().then((r) => setRooms(r.items)),
+      scope.dorms && dormsApi.listDorms().then((d) => setDorms(d.items)),
+      scope.washrooms &&
+        washroomsApi.listWashrooms().then((w) => setWashrooms(w.items)),
+      // Server-side derive can close blocking tasks/tickets — the
+      // queued-work tint reads these lists, so they must not stay
+      // stale or released beds keep the cleaning/maintenance tint.
+      // limit must match loadWorkspace — the default page size would
+      // silently truncate the tint/task views.
+      scope.tasks && tasksApi.listTasks({ limit: 500 }).then((t) => setTasks(t.items)),
+      scope.maintenance &&
+        maintenanceApi.listMaintenance().then((m) => setMaintenanceTickets(m.items)),
+    ]);
   }, []);
+  const refreshUnitsScoped = useCallback(
+    (scope: UnitRefreshScope): Promise<void> => {
+      // In-flight dedup — a refresh request that arrives mid-cycle unions
+      // its scope into one follow-up pass instead of firing a second
+      // parallel burst of GETs. The follow-up re-reads AFTER the in-flight
+      // snapshot, so no request is lost and no stale state survives.
+      const corr = corrForRequest('GET'); // inherits mutation corr when open
+      const mark = marker('REFRESH', corr);
+      if (refreshUnitsInFlight.current) {
+        mark('requested-while-inflight → pending rerun');
+        refreshUnitsPendingScope.current = {
+          ...(refreshUnitsPendingScope.current || {}),
+          ...scope,
+        };
+        return refreshUnitsInFlight.current;
+      }
+      const run = async (): Promise<void> => {
+        mark('refresh_start');
+        let next: UnitRefreshScope | null = scope;
+        do {
+          refreshUnitsPendingScope.current = null;
+          await fetchUnitScope(next);
+          mark('state_updated');
+          next = refreshUnitsPendingScope.current;
+        } while (next);
+        // T9 approximation — next animation frame after the state updates
+        // is the earliest the committed render can paint.
+        await new Promise<void>((resolve) =>
+          requestAnimationFrame(() => resolve())
+        );
+        mark('paint_after_state_update');
+      };
+      const p = run().finally(() => {
+        refreshUnitsInFlight.current = null;
+      });
+      refreshUnitsInFlight.current = p;
+      return p;
+    },
+    [fetchUnitScope]
+  );
+  // Full-collection refresh — polling + workspace loads only.
+  const refreshUnits = useCallback(
+    (): Promise<void> => refreshUnitsScoped(FULL_UNIT_SCOPE),
+    [refreshUnitsScoped]
+  );
+
+  // Completion watcher — releases container selections for task/ticket
+  // completions that arrive through refresh/polling too (approval can
+  // happen in another session). Transitions are diffed by uid, so a
+  // resource with older completed history is never deselected.
+  const taskStatusRef = useRef(new Map<string, string>());
+  const ticketStatusRef = useRef(new Map<string, string>());
+  useEffect(() => {
+    const prev = taskStatusRef.current;
+    const next = new Map<string, string>();
+    for (const t of tasks) {
+      next.set(t.task_uid, t.status);
+      if (
+        t.status === 'completed' &&
+        prev.get(t.task_uid) &&
+        prev.get(t.task_uid) !== 'completed'
+      ) {
+        emitUnitDeselect(t);
+      }
+    }
+    taskStatusRef.current = next;
+  }, [tasks]);
+  useEffect(() => {
+    const prev = ticketStatusRef.current;
+    const next = new Map<string, string>();
+    for (const t of maintenanceTickets) {
+      next.set(t.ticket_uid, t.status);
+      if (
+        t.status === 'closed' &&
+        prev.get(t.ticket_uid) &&
+        prev.get(t.ticket_uid) !== 'closed'
+      ) {
+        emitUnitDeselect(t);
+      }
+    }
+    ticketStatusRef.current = next;
+  }, [maintenanceTickets]);
+
+  // -------------------------------------------------------------------
+  // Cross-session synchronization — lightweight unit-state polling.
+  // Canonical resource state changes server-side whenever ANY session
+  // checks in/out, starts work, or approves/closes tickets; without a
+  // refresh this client would render stale projections until its next
+  // own mutation. Poll the three unit lists on a conservative interval
+  // and pause while the tab is hidden — SSE/WebSockets can replace this.
+  // -------------------------------------------------------------------
+  const UNIT_POLL_INTERVAL_MS = 20_000;
+  usePolling(refreshUnits, UNIT_POLL_INTERVAL_MS, !!currentUser, 'AppContext.units');
+
+  // -------------------------------------------------------------------
+  // Pending-check — ONE shared owner. TasksView (badge) polls it every
+  // 30s; PendingCheckView consumes the same snapshot + calls this same
+  // deduplicated refresh on mount/after actions — never a second request
+  // while one is in flight.
+  const [pendingCheck, setPendingCheck] = useState<import('../api/types').PendingCheckResponse | null>(null);
+  const pendingCheckInFlight = useRef<Promise<void> | null>(null);
+  const refreshPendingCheck = useCallback(async (): Promise<void> => {
+    if (!activePropertyUid || !currentUser || currentUser.role === 'employee') return;
+    if (pendingCheckInFlight.current) {
+      await pendingCheckInFlight.current;
+      return;
+    }
+    const p = tasksApi
+      .pendingCheck(activePropertyUid)
+      .then((res) => setPendingCheck(res))
+      .catch(() => {
+        /* keep last snapshot */
+      })
+      .finally(() => {
+        pendingCheckInFlight.current = null;
+      });
+    pendingCheckInFlight.current = p;
+    await p;
+  }, [activePropertyUid, currentUser]);
 
   // -------------------------------------------------------------------
   // Session bootstrap: token present → GET /auth/me → load workspace
@@ -401,13 +686,20 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     [dorms, activePropertyUid]
   );
 
+  const currentPropertyWashrooms = useMemo(
+    () => washrooms.filter((w) => w.property_uid === activePropertyUid),
+    [washrooms, activePropertyUid]
+  );
+
   const currentPropertyEmployees = useMemo(
     () => employees.filter((e) => e.property_uid === activePropertyUid),
     [employees, activePropertyUid]
   );
 
   const currentPropertyUnallocatedEmployees = useMemo(
-    () => currentPropertyEmployees.filter((e) => !e.zone_uid && !e.area_uid),
+    () => currentPropertyEmployees.filter(
+      (e) => !isEmployeeDeactivated(e) && !e.zone_uid && !e.area_uid
+    ),
     [currentPropertyEmployees]
   );
 
@@ -470,6 +762,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         routerNavigate('/admin/properties');
       } else if (user.role === 'property_manager') {
         routerNavigate(`/property/${user.property_uid}/zones`);
+      } else if (user.role === 'human_resource' || user.role === 'department_manager') {
+        routerNavigate('/hr/employee-management');
       } else {
         routerNavigate('/employee/tasks');
       }
@@ -486,6 +780,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     setZones([]);
     setRooms([]);
     setDorms([]);
+    setWashrooms([]);
     setEmployees([]);
     setTasks([]);
     setMaintenanceTickets([]);
@@ -668,9 +963,10 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       try {
         await areasApi.deleteArea(area_uid);
         setAreas((prev) => prev.filter((a) => a.area_uid !== area_uid));
-        // Zones referencing the area are cleared server-side — refresh zones
-        void zonesApi.listZones().then((r) => setZones(r.items)).catch(() => {});
-        addToast({ type: 'warning', title: 'Area Deleted', description: 'Area removed.' });
+        // The area and its zones are removed server-side; unassigned rooms,
+        // dorms, washrooms, employees and tasks may also have changed.
+        await loadWorkspace();
+        addToast({ type: 'warning', title: 'Area Deleted', description: 'Area and its zones removed.' });
       } catch (err) {
         addToast({
           type: 'error',
@@ -679,7 +975,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         });
       }
     },
-    [addToast]
+    [addToast, loadWorkspace]
   );
 
   // -------------------------------------------------------------------
@@ -793,25 +1089,91 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     [addToast]
   );
 
-  const updateRoomStatus = useCallback(
-    async (room_uid: string, status: RoomStatus) => {
-      const previous = rooms.find((r) => r.room_uid === room_uid)?.status;
-      setRooms((prev) =>
-        prev.map((r) => (r.room_uid === room_uid ? { ...r, status } : r))
-      );
+  // -------------------------------------------------------------------
+  // Occupancy commands — the authoritative API response replaces state;
+  // no optimistic resource-status mutation (spec: frontend is a view, not
+  // a second state engine).
+  // -------------------------------------------------------------------
+  const checkInRoom = useCallback(
+    async (room_uid: string, guest_name?: string) => {
       try {
-        await updateRoom(room_uid, { status });
-        // Status transitions may trigger task automation server-side
-        void tasksApi.listTasks({ limit: 500 }).then((r) => setTasks(r.items)).catch(() => {});
-      } catch {
-        if (previous) {
-          setRooms((prev) =>
-            prev.map((r) => (r.room_uid === room_uid ? { ...r, status: previous } : r))
-          );
-        }
+        const room = await roomsApi.checkInRoom(room_uid, {
+          guest_name: guest_name ?? null,
+        });
+        setRooms((prev) => prev.map((r) => (r.room_uid === room_uid ? room : r)));
+      } catch (err) {
+        addToast({
+          type: 'error',
+          title: 'Check-in Failed',
+          description: apiErrorMessage(err, 'Could not check in the room.'),
+        });
       }
     },
-    [updateRoom, rooms]
+    [addToast]
+  );
+
+  const checkOutRoom = useCallback(
+    async (room_uid: string) => {
+      try {
+        const { generated_tasks, ...room } =
+          await roomsApi.checkOutRoom(room_uid);
+        setRooms((prev) =>
+          prev.map((r) => (r.room_uid === room_uid ? room : r))
+        );
+        // the checkout-cleaning tasks came back in the same transaction —
+        // merge them now instead of waiting for a reload
+        if (generated_tasks?.length) {
+          setTasks((prev) => {
+            const known = new Set(prev.map((t) => t.task_uid));
+            return [
+              ...prev,
+              ...generated_tasks.filter((t) => !known.has(t.task_uid)),
+            ];
+          });
+        } else {
+          void tasksApi
+            .listTasks({ limit: 500 })
+            .then((r) => setTasks(r.items))
+            .catch(() => {});
+        }
+        addToast({
+          type: 'success',
+          title: 'Checked Out',
+          description: 'Guest checked out — room flagged for cleaning.',
+        });
+      } catch (err) {
+        addToast({
+          type: 'error',
+          title: 'Checkout Failed',
+          description: apiErrorMessage(err, 'Could not check out the room.'),
+        });
+      }
+    },
+    [addToast]
+  );
+
+  /** Super-Admin administrative transition — the API returns the committed
+   *  state; local state is refreshed from the server response. */
+  const transitionResource = useCallback(
+    async (
+      resource_type: 'room' | 'dorm' | 'bed' | 'washroom' | 'fixture',
+      resource_id: string,
+      to: string,
+      reason: string
+    ) => {
+      try {
+        await roomsApi.transitionResource(resource_type, resource_id, { to, reason });
+        // authoritative refresh — fetch the resource lists back from the API
+        await loadWorkspace();
+      } catch (err) {
+        addToast({
+          type: 'error',
+          title: 'Transition Failed',
+          description: apiErrorMessage(err, 'Could not transition the resource.'),
+        });
+      }
+    },
+    [addToast, loadWorkspace]
   );
 
   // Fire-and-forget zone assignment — errors already toasted by updateRoom
@@ -867,6 +1229,26 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         description: `${created.name} added with ${created.beds.length} beds.`,
       });
       return created;
+    },
+    [activePropertyUid, addToast, createError]
+  );
+
+  const bulkCreateDorms = useCallback(
+    async (
+      data: Omit<DormBulkCreateRequest, 'property_uid'>
+    ): Promise<{ createdCount: number; errors: string[] }> => {
+      const res = await dormsApi
+        .bulkCreateDorms({ ...data, property_uid: activePropertyUid })
+        .catch((err: unknown) =>
+          createError(err, 'Bulk Create Failed', 'Could not create the dorms.')
+        );
+      setDorms((prev) => [...prev, ...res.created]);
+      addToast({
+        type: 'success',
+        title: 'Dorms Created',
+        description: `${res.created.length} dorm${res.created.length === 1 ? '' : 's'} created successfully.`,
+      });
+      return { createdCount: res.created.length, errors: res.errors };
     },
     [activePropertyUid, addToast, createError]
   );
@@ -928,44 +1310,82 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     [addToast]
   );
 
-  const updateBedStatus = useCallback(
-    async (bed_uid: string, status: BedStatus, guest_name?: string) => {
-      // Optimistic — flip the bed in its dorm card immediately, rollback on error
-      const prevDorms = dorms;
-      setDorms((prev) =>
-        prev.map((d) => ({
-          ...d,
-          beds: d.beds.map((b) =>
-            b.bed_uid === bed_uid
-              ? { ...b, status, guest_name: guest_name ?? b.guest_name }
-              : b
-          ),
-        }))
-      );
+  // Bed occupancy commands — the containing dorm comes back in the
+  // authoritative response; no optimistic status mutation.
+  const checkInBed = useCallback(
+    async (bed_uid: string, guest_name?: string) => {
       try {
-        // API returns the containing dorm — nested beds stay consistent
-        const dorm = await dormsApi.updateBedStatus(bed_uid, { status, guest_name });
+        const dorm = await dormsApi.checkInBed(bed_uid, {
+          guest_name: guest_name ?? null,
+        });
         setDorms((prev) => prev.map((d) => (d.dorm_uid === dorm.dorm_uid ? dorm : d)));
-        // Bed transitions may trigger automation rules → refresh tasks
-        void tasksApi.listTasks({ limit: 500 }).then((r) => setTasks(r.items)).catch(() => {});
       } catch (err) {
-        setDorms(prevDorms);
         addToast({
           type: 'error',
-          title: 'Bed Update Failed',
-          description: apiErrorMessage(err, 'Could not update the bed status.'),
+          title: 'Check-in Failed',
+          description: apiErrorMessage(err, 'Could not check in the bed.'),
         });
       }
     },
-    [addToast, dorms]
+    [addToast]
+  );
+
+  const checkOutBed = useCallback(
+    async (bed_uid: string) => {
+      try {
+        const { generated_tasks, ...dorm } =
+          await dormsApi.checkOutBed(bed_uid);
+        setDorms((prev) =>
+          prev.map((d) => (d.dorm_uid === dorm.dorm_uid ? dorm : d))
+        );
+        // checkout-generated tasks return in-band — merge, else refetch
+        if (generated_tasks?.length) {
+          setTasks((prev) => {
+            const known = new Set(prev.map((t) => t.task_uid));
+            return [
+              ...prev,
+              ...generated_tasks.filter((t) => !known.has(t.task_uid)),
+            ];
+          });
+        } else {
+          void tasksApi
+            .listTasks({ limit: 500 })
+            .then((r) => setTasks(r.items))
+            .catch(() => {});
+        }
+      } catch (err) {
+        addToast({
+          type: 'error',
+          title: 'Checkout Failed',
+          description: apiErrorMessage(err, 'Could not check out the bed.'),
+        });
+      }
+    },
+    [addToast]
   );
 
   const checkoutDorm = useCallback(
     async (dorm_uid: string) => {
       try {
-        const dorm = await dormsApi.checkoutDorm(dorm_uid);
-        setDorms((prev) => prev.map((d) => (d.dorm_uid === dorm_uid ? dorm : d)));
-        void tasksApi.listTasks({ limit: 500 }).then((r) => setTasks(r.items)).catch(() => {});
+        const { generated_tasks, ...dorm } =
+          await dormsApi.checkoutDorm(dorm_uid);
+        setDorms((prev) =>
+          prev.map((d) => (d.dorm_uid === dorm_uid ? dorm : d))
+        );
+        if (generated_tasks?.length) {
+          setTasks((prev) => {
+            const known = new Set(prev.map((t) => t.task_uid));
+            return [
+              ...prev,
+              ...generated_tasks.filter((t) => !known.has(t.task_uid)),
+            ];
+          });
+        } else {
+          void tasksApi
+            .listTasks({ limit: 500 })
+            .then((r) => setTasks(r.items))
+            .catch(() => {});
+        }
         addToast({
           type: 'success',
           title: 'Dorm Checked Out',
@@ -982,22 +1402,22 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     [addToast]
   );
 
-  const markDormCleaning = useCallback(
+  const markDormCleaned = useCallback(
     async (dorm_uid: string) => {
       try {
-        const dorm = await dormsApi.markDormCleaning(dorm_uid);
+        const dorm = await dormsApi.markDormCleaned(dorm_uid);
         setDorms((prev) => prev.map((d) => (d.dorm_uid === dorm_uid ? dorm : d)));
         void tasksApi.listTasks({ limit: 500 }).then((r) => setTasks(r.items)).catch(() => {});
         addToast({
-          type: 'info',
-          title: 'Cleaning Requested',
-          description: 'Dorm queued for housekeeping.',
+          type: 'success',
+          title: 'Marked Cleaned',
+          description: 'Cleaning beds are now available.',
         });
       } catch (err) {
         addToast({
           type: 'error',
           title: 'Request Failed',
-          description: apiErrorMessage(err, 'Could not request cleaning.'),
+          description: apiErrorMessage(err, 'Could not mark the dorm cleaned.'),
         });
       }
     },
@@ -1005,17 +1425,189 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   );
 
   // -------------------------------------------------------------------
-  // Bulk unit operations — checkout / cleaning / available
+  // Washroom operations
+  // -------------------------------------------------------------------
+  const createWashroom = useCallback(
+    async (
+      data: Omit<WashroomCreateRequest, 'property_uid'>
+    ): Promise<Washroom> => {
+      const created = await washroomsApi
+        .createWashroom({ ...data, property_uid: activePropertyUid })
+        .catch((err: unknown) =>
+          createError(err, 'Create Failed', 'Could not create the washroom.')
+        );
+      setWashrooms((prev) => [...prev, created]);
+      addToast({
+        type: 'success',
+        title: 'Washroom Created',
+        description: `${created.name} added.`,
+      });
+      return created;
+    },
+    [activePropertyUid, addToast, createError]
+  );
+
+  const bulkCreateWashrooms = useCallback(
+    async (
+      data: Omit<WashroomBulkCreateRequest, 'property_uid'>
+    ): Promise<{ createdCount: number; errors: string[] }> => {
+      const res = await washroomsApi
+        .bulkCreateWashrooms({ ...data, property_uid: activePropertyUid })
+        .catch((err: unknown) =>
+          createError(err, 'Bulk Create Failed', 'Could not create the washrooms.')
+        );
+      setWashrooms((prev) => [...prev, ...res.created]);
+      addToast({
+        type: 'success',
+        title: 'Washrooms Created',
+        description: `${res.created.length} washroom${res.created.length === 1 ? '' : 's'} created successfully.`,
+      });
+      return { createdCount: res.created.length, errors: res.errors };
+    },
+    [activePropertyUid, addToast, createError]
+  );
+
+  const updateWashroom = useCallback(
+    async (washroom_uid: string, updates: WashroomUpdateRequest) => {
+      try {
+        const updated = await washroomsApi.updateWashroom(washroom_uid, updates);
+        setWashrooms((prev) =>
+          prev.map((w) => (w.washroom_uid === washroom_uid ? updated : w))
+        );
+      } catch (err) {
+        addToast({
+          type: 'error',
+          title: 'Update Failed',
+          description: apiErrorMessage(err, 'Could not update the washroom.'),
+        });
+        throw err;
+      }
+    },
+    [addToast]
+  );
+
+  const refreshWashroom = useCallback(
+    async (washroom_uid: string): Promise<Washroom | null> => {
+      try {
+        const fresh = await washroomsApi.getWashroom(washroom_uid);
+        setWashrooms((prev) =>
+          prev.map((w) => (w.washroom_uid === washroom_uid ? fresh : w))
+        );
+        return fresh;
+      } catch {
+        return null;
+      }
+    },
+    []
+  );
+
+  const updateWashroomFixture = useCallback(
+    async (
+      washroom_uid: string,
+      fixture_uid: string,
+      status: 'operational' | 'maintenance' | 'inactive'
+    ) => {
+      try {
+        const updated = await washroomsApi.updateWashroomFixture(
+          washroom_uid, fixture_uid, { status }
+        );
+        setWashrooms((prev) =>
+          prev.map((w) => (w.washroom_uid === washroom_uid ? updated : w))
+        );
+        // Restoring a fixture to service closes its blocking maintenance
+        // tickets server-side — refresh so the ledger stays in sync.
+        if (status === 'operational') {
+          void maintenanceApi.listMaintenance().then((r) =>
+            setMaintenanceTickets(r.items)
+          ).catch(() => {});
+        }
+      } catch (err) {
+        addToast({
+          type: 'error',
+          title: 'Update Failed',
+          description: apiErrorMessage(err, 'Could not update the fixture.'),
+        });
+        throw err;
+      }
+    },
+    [addToast]
+  );
+
+  const moveWashroomToZone = useCallback(
+    async (washroom_uid: string, zone_uid: string | null) => {
+      const previous =
+        washrooms.find((w) => w.washroom_uid === washroom_uid)?.zone_uid ?? null;
+      setWashrooms((prev) =>
+        prev.map((w) =>
+          w.washroom_uid === washroom_uid ? { ...w, zone_uid } : w
+        )
+      );
+      try {
+        const updated = await washroomsApi.allocateWashroom(washroom_uid, {
+          zone_uid,
+        });
+        setWashrooms((prev) =>
+          prev.map((w) => (w.washroom_uid === washroom_uid ? updated : w))
+        );
+      } catch (err) {
+        setWashrooms((prev) =>
+          prev.map((w) =>
+            w.washroom_uid === washroom_uid
+              ? { ...w, zone_uid: previous }
+              : w
+          )
+        );
+        addToast({
+          type: 'error',
+          title: 'Allocation Failed',
+          description: apiErrorMessage(err, 'Could not assign the washroom.'),
+        });
+      }
+    },
+    [addToast, washrooms]
+  );
+
+  const deleteWashroom = useCallback(
+    async (washroom_uid: string) => {
+      try {
+        await washroomsApi.deleteWashroom(washroom_uid);
+        setWashrooms((prev) => prev.filter((w) => w.washroom_uid !== washroom_uid));
+        // Task/ticket history keeps the preserved washroom label server-side;
+        // refresh so stale live links disappear from selectors immediately.
+        void tasksApi.listTasks({ limit: 500 }).then((r) => setTasks(r.items)).catch(() => {});
+        void maintenanceApi.listMaintenance().then((r) =>
+          setMaintenanceTickets(r.items)
+        ).catch(() => {});
+        addToast({
+          type: 'warning',
+          title: 'Washroom Deleted',
+          description: 'Washroom removed; task and maintenance history were preserved.',
+        });
+      } catch (err) {
+        addToast({
+          type: 'error',
+          title: 'Delete Failed',
+          description: apiErrorMessage(err, 'Could not delete the washroom.'),
+        });
+      }
+    },
+    [addToast]
+  );
+
+  // -------------------------------------------------------------------
+  // Bulk unit operations — checkout / queue-cleaning / mark-cleaned / release
   // -------------------------------------------------------------------
   const bulkUpdateUnits = useCallback(
     async (options: {
-      action: 'checkout' | 'cleaning' | 'available' | 'maintenance';
+      action: 'checkout' | 'cleaning' | 'available' | 'cleaned' | 'maintenance';
       roomUids?: string[];
       bedUids?: string[];
+      washroomUids?: string[];
     }) => {
       const roomUids = options.roomUids || [];
       const bedUids = options.bedUids || [];
-      if (roomUids.length === 0 && bedUids.length === 0) return;
+      const washroomUids = options.washroomUids || [];
+      if (roomUids.length === 0 && bedUids.length === 0 && washroomUids.length === 0) return;
 
       try {
         const res = await roomsApi.bulkUpdateUnits({
@@ -1023,6 +1615,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
           property_uid: activePropertyUid,
           room_uids: roomUids,
           bed_uids: bedUids,
+          washroom_uids: washroomUids,
         });
         setRooms((prev) => {
           const byId = new Map(res.rooms.map((r) => [r.room_uid, r]));
@@ -1032,13 +1625,35 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
           const byId = new Map(res.dorms.map((d) => [d.dorm_uid, d]));
           return prev.map((d) => byId.get(d.dorm_uid) || d);
         });
+        if (res.washrooms?.length) {
+          const byId = new Map(res.washrooms.map((w) => [w.washroom_uid, w]));
+          setWashrooms((prev) =>
+            prev.map((w) => byId.get(w.washroom_uid) || w)
+          );
+        }
+        // release actions admin-close tasks/tickets server-side — the
+        // local copies are stale until refetched (task-derived UI like the
+        // queued-cleaning tint reads currentPropertyTasks)
+        void tasksApi
+          .listTasks({ limit: 500 })
+          .then((r) => setTasks(r.items))
+          .catch(() => {});
+        void maintenanceApi
+          .listMaintenance()
+          .then((r) => setMaintenanceTickets(r.items))
+          .catch(() => {});
         if (res.generated_tasks?.length) {
           setTasks((prev) => [...prev, ...(res.generated_tasks || [])]);
         }
 
-        const unitText = `${roomUids.length > 0 ? `${roomUids.length} room${roomUids.length > 1 ? 's' : ''}` : ''}${
-          roomUids.length > 0 && bedUids.length > 0 ? ' & ' : ''
-        }${bedUids.length > 0 ? `${bedUids.length} bed${bedUids.length > 1 ? 's' : ''}` : ''}`;
+        const parts = [
+          roomUids.length > 0 ? `${roomUids.length} room${roomUids.length > 1 ? 's' : ''}` : '',
+          bedUids.length > 0 ? `${bedUids.length} bed${bedUids.length > 1 ? 's' : ''}` : '',
+          washroomUids.length > 0
+            ? `${washroomUids.length} washroom${washroomUids.length > 1 ? 's' : ''}`
+            : '',
+        ].filter(Boolean);
+        const unitText = parts.join(' & ');
 
         if (options.action === 'checkout') {
           addToast({
@@ -1261,14 +1876,37 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         );
         addToast({
           type: 'warning',
-          title: 'Employee Deactivated',
-          description: 'Moved to inactive status and unassigned from zone.',
+          title: 'Staff Deactivated',
+          description: 'Removed from future zone and work allocation.',
         });
       } catch (err) {
         addToast({
           type: 'error',
           title: 'Deactivation Failed',
           description: apiErrorMessage(err, 'Could not deactivate the employee.'),
+        });
+      }
+    },
+    [addToast]
+  );
+
+  const reactivateEmployee = useCallback(
+    async (employee_uid: string) => {
+      try {
+        const updated = await employeesApi.reactivateEmployee(employee_uid);
+        setEmployees((prev) =>
+          prev.map((e) => (e.employee_uid === employee_uid ? updated : e))
+        );
+        addToast({
+          type: 'success',
+          title: 'Staff Reactivated',
+          description: 'Employee is eligible for new assignments.',
+        });
+      } catch (err) {
+        addToast({
+          type: 'error',
+          title: 'Reactivation Failed',
+          description: apiErrorMessage(err, 'Could not reactivate the employee.'),
         });
       }
     },
@@ -1352,6 +1990,11 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       try {
         const updated = await tasksApi.startTask(task_uid);
         setTasks((prev) => prev.map((t) => (t.task_uid === task_uid ? updated : t)));
+        // flag-on-start: the unit flipped to cleaning/maintenance in the
+        // same transaction — pull fresh unit state immediately
+        if (updated.room_uid || updated.dorm_uid || updated.washroom_uid) {
+          refreshUnitsScoped(scopeForTarget(updated));
+        }
         addToast({ type: 'info', title: 'Task Started', description: 'Status → In Progress.' });
       } catch (err) {
         addToast({
@@ -1379,7 +2022,10 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
           if (res.generated_task) next.unshift(res.generated_task);
           return next;
         });
-        if (res.task.room_uid || res.task.dorm_uid) refreshUnits();
+        if (res.task.room_uid || res.task.dorm_uid || res.task.washroom_uid)
+          refreshUnitsScoped(scopeForTarget(res.task));
+        // completion submitted successfully — release target selection
+        emitUnitDeselect(res.task);
         addToast({
           type: 'success',
           title: 'Task Completed',
@@ -1395,7 +2041,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         });
       }
     },
-    [addToast, refreshUnits]
+    [addToast, refreshUnitsScoped]
   );
 
   const requestTaskRedo = useCallback(
@@ -1403,7 +2049,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       try {
         const updated = await tasksApi.requestTaskRedo(task_uid, note);
         setTasks((prev) => prev.map((t) => (t.task_uid === task_uid ? updated : t)));
-        if (updated.room_uid || updated.dorm_uid) refreshUnits();
+        if (updated.room_uid || updated.dorm_uid || updated.washroom_uid)
+          refreshUnitsScoped(scopeForTarget(updated));
         addToast({
           type: 'warning',
           title: 'Redo Requested',
@@ -1417,7 +2064,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         });
       }
     },
-    [addToast, refreshUnits]
+    [addToast, refreshUnitsScoped]
   );
 
   const reassignTask = useCallback(
@@ -1437,17 +2084,6 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     [addToast]
   );
 
-  const updateTaskStatus = useCallback(
-    async (task_uid: string, status: TaskStatus) => {
-      try {
-        await updateTask(task_uid, { status });
-      } catch {
-        /* toast already emitted */
-      }
-    },
-    [updateTask]
-  );
-
   // -------------------------------------------------------------------
   // Task ticket review workflow — submit / approve / reject / reopen
   // -------------------------------------------------------------------
@@ -1457,12 +2093,14 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         const updated = await tasksApi.submitTask(task_uid, { note, photo_urls });
         setTasks((prev) => prev.map((t) => (t.task_uid === task_uid ? updated : t)));
         addToast({ type: 'success', title: 'Task Submitted', description: 'Sent for supervisor review.' });
+        return updated;
       } catch (err) {
         addToast({
           type: 'error',
           title: 'Submit Failed',
           description: apiErrorMessage(err, 'Could not submit the task.'),
         });
+        return null;
       }
     },
     [addToast]
@@ -1477,7 +2115,10 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
           if (res.generated_task) next.unshift(res.generated_task);
           return next;
         });
-        if (res.task.room_uid || res.task.dorm_uid) refreshUnits();
+        if (res.task.room_uid || res.task.dorm_uid || res.task.washroom_uid)
+          refreshUnitsScoped(scopeForTarget(res.task));
+        // the workflow completed — release the target's UI selection
+        emitUnitDeselect(res.task);
         addToast({ type: 'success', title: 'Task Approved', description: 'Marked completed.' });
       } catch (err) {
         addToast({
@@ -1487,7 +2128,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         });
       }
     },
-    [addToast, refreshUnits]
+    [addToast, refreshUnitsScoped]
   );
 
   const rejectTask = useCallback(
@@ -1495,7 +2136,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       try {
         const updated = await tasksApi.rejectTask(task_uid, reason);
         setTasks((prev) => prev.map((t) => (t.task_uid === task_uid ? updated : t)));
-        if (updated.room_uid || updated.dorm_uid) refreshUnits();
+        if (updated.room_uid || updated.dorm_uid || updated.washroom_uid)
+          refreshUnitsScoped(scopeForTarget(updated));
         addToast({ type: 'warning', title: 'Task Rejected', description: 'Reopened for the assignee.' });
       } catch (err) {
         addToast({
@@ -1505,7 +2147,26 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         });
       }
     },
-    [addToast, refreshUnits]
+    [addToast, refreshUnitsScoped]
+  );
+
+  const deleteTaskCompletionImage = useCallback(
+    async (task_uid: string, image_uid: string) => {
+      try {
+        const updated = await tasksApi.deleteTaskCompletionImage(task_uid, image_uid);
+        setTasks((prev) => prev.map((t) => (t.task_uid === task_uid ? updated : t)));
+        addToast({ type: 'success', title: 'Image Deleted', description: 'Completion evidence removed.' });
+        return updated;
+      } catch (err) {
+        addToast({
+          type: 'error',
+          title: 'Delete Failed',
+          description: apiErrorMessage(err, 'Could not delete the image.'),
+        });
+        return null;
+      }
+    },
+    [addToast]
   );
 
   const reopenTask = useCallback(
@@ -1513,7 +2174,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       try {
         const updated = await tasksApi.reopenTask(task_uid, note);
         setTasks((prev) => prev.map((t) => (t.task_uid === task_uid ? updated : t)));
-        if (updated.room_uid || updated.dorm_uid) refreshUnits();
+        if (updated.room_uid || updated.dorm_uid || updated.washroom_uid)
+          refreshUnitsScoped(scopeForTarget(updated));
         addToast({ type: 'info', title: 'Task Reopened' });
       } catch (err) {
         addToast({
@@ -1523,7 +2185,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         });
       }
     },
-    [addToast, refreshUnits]
+    [addToast, refreshUnitsScoped]
   );
 
   // -------------------------------------------------------------------
@@ -1546,16 +2208,14 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         property_uid: activePropertyUid,
       });
       _upsertTicket(ticket);
-      if (ticket.room_uid) {
-        setRooms((prev) =>
-          prev.map((r) =>
-            r.room_uid === ticket.room_uid ? { ...r, status: 'maintenance' as RoomStatus } : r
-          )
-        );
+      // The backend flags the target resource in the same transaction —
+      // refetch the units rather than simulating the state change locally.
+      if (ticket.room_uid || ticket.bed_uid || ticket.dorm_uid || ticket.washroom_uid) {
+        refreshUnitsScoped(scopeForTarget(ticket));
       }
       return ticket;
     },
-    [activePropertyUid, _upsertTicket]
+    [activePropertyUid, _upsertTicket, refreshUnitsScoped]
   );
 
   const createMaintenanceBatch = useCallback(
@@ -1564,56 +2224,43 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         property_uid: activePropertyUid,
         tickets: tickets.map((t) => ({ ...t, kind: 'maintenance' as const })),
       });
-      // Apply all created tickets + unit status flips to local state
+      // Apply all created tickets to local state — resource statuses are
+      // refetched authoritatively (the backend flags them in-transaction).
       const allTickets = res.batches.flatMap((b) => b.tickets);
       for (const t of allTickets) _upsertTicket(t);
-      const roomIds = new Set(allTickets.map((t) => t.room_uid).filter(Boolean));
-      const bedIds = new Set(allTickets.map((t) => t.bed_uid).filter(Boolean));
-      // Bed-level tickets also carry dorm_uid as location context — only a
-      // ticket WITHOUT bed_uid flags the whole dorm.
-      const dormIds = new Set(
-        allTickets.filter((t) => !t.bed_uid).map((t) => t.dorm_uid).filter(Boolean)
-      );
-      if (roomIds.size) {
-        setRooms((prev) =>
-          prev.map((r) =>
-            roomIds.has(r.room_uid) ? { ...r, status: 'maintenance' as RoomStatus } : r
-          )
-        );
-      }
-      if (bedIds.size || dormIds.size) {
-        setDorms((prev) =>
-          prev.map((d) => {
-            const dormFlagged = dormIds.has(d.dorm_uid);
-            return {
-              ...d,
-              status: dormFlagged ? 'maintenance' : d.status,
-              beds: d.beds.map((b) =>
-                bedIds.has(b.bed_uid) || (dormFlagged && b.status !== 'occupied')
-                  ? { ...b, status: 'maintenance' as BedStatus }
-                  : b
-              ),
-            };
-          })
-        );
+      const scope: UnitRefreshScope = {};
+      for (const t of allTickets) Object.assign(scope, scopeForTarget(t));
+      if (scope.rooms || scope.dorms || scope.washrooms) {
+        refreshUnitsScoped(scope);
       }
       return res.batches;
     },
-    [activePropertyUid, _upsertTicket]
+    [activePropertyUid, _upsertTicket, refreshUnitsScoped]
   );
 
   const _ticketAction = useCallback(
     async (
       fn: () => Promise<MaintenanceTicket>,
       successToast: { type: 'success' | 'info' | 'warning'; title: string; description?: string },
-      errorTitle: string
+      errorTitle: string,
+      // disapproval re-blocks a drifted fixture/unit server-side — the
+      // caller opts into a unit refresh for actions that change blockers
+      refreshUnitsOnDone = false
     ) => {
       try {
         const ticket = await fn();
         _upsertTicket(ticket);
         // resolved keeps the unit blocked until the PM closes it; only
         // close/cancel release server-side — refetch rather than guess
-        if (['closed', 'cancelled'].includes(ticket.status)) refreshUnits();
+        if (
+          refreshUnitsOnDone ||
+          ['closed', 'cancelled'].includes(ticket.status)
+        ) {
+          refreshUnitsScoped(scopeForTarget(ticket));
+        }
+        // ticket closed = maintenance workflow completed — release the
+        // target container's selection (not on hold/assign/reopen)
+        if (ticket.status === 'closed') emitUnitDeselect(ticket);
         addToast(successToast);
       } catch (err) {
         addToast({
@@ -1623,7 +2270,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         });
       }
     },
-    [_upsertTicket, addToast, refreshUnits]
+    [_upsertTicket, addToast, refreshUnitsScoped]
   );
 
   const assignMaintenanceTicket = useCallback(
@@ -1685,7 +2332,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       _ticketAction(
         () => maintenanceApi.disapproveMaintenanceTicket(ticket_uid, reason),
         { type: 'info', title: 'Returned for correction' },
-        'Disapprove Failed'
+        'Disapprove Failed',
+        true // disapproval re-blocks the unit — refresh projections
       ),
     [_ticketAction]
   );
@@ -1700,7 +2348,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         _upsertTicket(ticket);
         // cancellation releases the unit server-side only when nothing else
         // blocks it — refetch instead of assuming 'available'
-        if (ticket.status === 'cancelled') refreshUnits();
+        if (ticket.status === 'cancelled')
+          refreshUnitsScoped(scopeForTarget(ticket));
         addToast({ type: 'success', title: 'Ticket Updated' });
       } catch (err) {
         addToast({
@@ -1710,7 +2359,38 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         });
       }
     },
-    [_upsertTicket, addToast, refreshUnits]
+    [_upsertTicket, addToast, refreshUnitsScoped]
+  );
+
+  const deleteMaintenanceTicket = useCallback(
+    async (ticket_uid: string) => {
+      try {
+        await maintenanceApi.deleteMaintenanceTicket(ticket_uid);
+        // capture the target before removal — deletion releases the
+        // resource server-side, so only that collection needs a refetch
+        const released = maintenanceTickets.find(
+          (t) => t.ticket_uid === ticket_uid
+        );
+        setMaintenanceTickets((prev) =>
+          prev.filter((ticket) => ticket.ticket_uid !== ticket_uid)
+        );
+        if (released) refreshUnitsScoped(scopeForTarget(released));
+        else refreshUnits();
+        addToast({
+          type: 'warning',
+          title: 'Ticket Deleted',
+          description: 'The maintenance ticket was permanently removed.',
+        });
+      } catch (err) {
+        addToast({
+          type: 'error',
+          title: 'Delete Failed',
+          description: apiErrorMessage(err, 'Could not delete the ticket.'),
+        });
+        throw err;
+      }
+    },
+    [addToast, refreshUnits, refreshUnitsScoped, maintenanceTickets]
   );
 
   // -------------------------------------------------------------------
@@ -1754,8 +2434,12 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     zones,
     rooms,
     dorms,
+    washrooms,
     employees,
     tasks,
+    pendingCheck,
+    refreshPendingCheck,
+    subscribeUnitDeselect,
     employeeRecord: employees.find(
       (e) => e.employee_uid === currentUser?.employee_uid || e.email === currentUser?.email
     ),
@@ -1763,6 +2447,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     currentPropertyZones,
     currentPropertyRooms,
     currentPropertyDorms,
+    currentPropertyWashrooms,
     currentPropertyEmployees,
     currentPropertyUnallocatedEmployees,
     currentPropertyTasks,
@@ -1784,16 +2469,27 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     updateRoom,
     moveRoomToZone,
     deleteRoom,
-    updateRoomStatus,
+    checkInRoom,
+    checkOutRoom,
+    transitionResource,
     assignRoomToZone,
     createDorm,
+    bulkCreateDorms,
     updateDorm,
     moveDormToZone,
     deleteDorm,
     assignDormToZone,
-    updateBedStatus,
+    checkInBed,
+    checkOutBed,
     checkoutDorm,
-    markDormCleaning,
+    markDormCleaned,
+    createWashroom,
+    bulkCreateWashrooms,
+    updateWashroom,
+    refreshWashroom,
+    updateWashroomFixture,
+    moveWashroomToZone,
+    deleteWashroom,
     bulkUpdateUnits,
     bulkDeleteRooms,
     bulkCheckoutRooms,
@@ -1807,6 +2503,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     assignEmployeeToArea,
     deleteEmployee,
     deactivateEmployee,
+    reactivateEmployee,
     createTask,
     updateTask,
     deleteTask,
@@ -1814,10 +2511,10 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     completeTask,
     requestTaskRedo,
     reassignTask,
-    updateTaskStatus,
     submitTask,
     approveTask,
     rejectTask,
+    deleteTaskCompletionImage,
     reopenTask,
     createMaintenanceTicket,
     createMaintenanceBatch,
@@ -1828,6 +2525,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     closeMaintenanceTicket,
     disapproveMaintenanceTicket,
     updateMaintenanceTicket,
+    deleteMaintenanceTicket,
     toasts,
     addToast,
     dismissToast,

@@ -3,15 +3,15 @@ import {
   ClipboardCheck, RefreshCw, User, MapPin, Camera, CheckCircle2, Undo2,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
-import * as tasksApi from '../../api/tasks';
-import { PendingCheckItem, PendingCheckResponse } from '../../api/types';
+import { PendingCheckItem } from '../../api/types';
+import { TaskCompletionImage, TaskCompletionSubmission } from '../../types';
 import { Badge } from '../ui/Badge';
 import { Button } from '../ui/Button';
 import { mediaUrl } from '../../api/client';
+import { CompletionEvidenceLightbox, EvidenceImage } from './CompletionEvidenceLightbox';
 
 interface Props {
   onOpenTask: (uid: string, kind: 'task' | 'maintenance') => void;
-  onCountChange?: (count: number) => void;
 }
 
 function fmtSubmitted(iso?: string | null): string {
@@ -30,37 +30,44 @@ function fmtSubmitted(iso?: string | null): string {
  * completes the work (and releases the resource when nothing else blocks);
  * disapprove returns it to the employee with a required reason.
  */
-export const PendingCheckView: React.FC<Props> = ({ onOpenTask, onCountChange }) => {
+export const PendingCheckView: React.FC<Props> = ({ onOpenTask }) => {
   const {
     activePropertyUid, addToast,
-    approveTask, rejectTask, closeMaintenanceTicket, disapproveMaintenanceTicket,
+    approveTask, rejectTask, deleteTaskCompletionImage,
+    closeMaintenanceTicket, disapproveMaintenanceTicket,
+    pendingCheck, refreshPendingCheck,
   } = useApp();
-  const [data, setData] = useState<PendingCheckResponse | null>(null);
-  const [loading, setLoading] = useState(true);
+  // Shared snapshot owned by AppContext — the TasksView badge is the 30s
+  // poller; this view consumes the same data and only requests a refresh
+  // (deduplicated) on mount and after approve/disapprove actions.
+  const data = pendingCheck;
+  const [loading, setLoading] = useState(pendingCheck === null);
   const [acting, setActing] = useState<string | null>(null);
   const [disapproveItem, setDisapproveItem] = useState<PendingCheckItem | null>(null);
+  const [viewer, setViewer] = useState<{
+    uid: string;
+    title: string;
+    images: EvidenceImage[];
+    index: number;
+  } | null>(null);
   const [reason, setReason] = useState('');
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  const load = useCallback(async (quiet = false) => {
-    if (!activePropertyUid) return;
-    if (!quiet) setLoading(true);
-    try {
-      const res = await tasksApi.pendingCheck(activePropertyUid);
-      setData(res);
-      onCountChange?.(res.count);
-    } catch {
-      if (!quiet) addToast({ type: 'error', title: 'Could not load pending checks' });
-    } finally {
+  const loadingRef = useRef(loading);
+  useEffect(() => {
+    if (data !== null && loadingRef.current) {
+      loadingRef.current = false;
       setLoading(false);
     }
-  }, [activePropertyUid, addToast, onCountChange]);
+  }, [data]);
 
   useEffect(() => {
-    void load();
-    pollRef.current = setInterval(() => void load(true), 30000);
-    return () => { if (pollRef.current) clearInterval(pollRef.current); };
-  }, [load]);
+    if (!activePropertyUid) return;
+    void refreshPendingCheck().finally(() => {
+      if (loadingRef.current) {
+        loadingRef.current = false;
+        setLoading(false);
+      }
+    });
+  }, [activePropertyUid, refreshPendingCheck]);
 
   const approve = async (item: PendingCheckItem) => {
     setActing(item.uid);
@@ -69,7 +76,7 @@ export const PendingCheckView: React.FC<Props> = ({ onOpenTask, onCountChange })
       // (approval releases the room/dorm/bed server-side)
       if (item.kind === 'task') await approveTask(item.uid);
       else await closeMaintenanceTicket(item.uid);
-      await load(true);
+      await refreshPendingCheck();
     } finally {
       setActing(null);
     }
@@ -85,13 +92,56 @@ export const PendingCheckView: React.FC<Props> = ({ onOpenTask, onCountChange })
         await disapproveMaintenanceTicket(disapproveItem.uid, reason.trim());
       setDisapproveItem(null);
       setReason('');
-      await load(true);
+      await refreshPendingCheck();
     } finally {
       setActing(null);
     }
   };
 
   const items = data?.items || [];
+  const attemptStatusBadge = (status?: string) => {
+    if (status === 'approved') return 'sage';
+    if (status === 'disapproved') return 'red';
+    return 'orange';
+  };
+  const attemptStatusLabel = (status?: string) => {
+    if (status === 'approved') return 'Approved';
+    if (status === 'disapproved') return 'Disapproved';
+    return 'Pending Review';
+  };
+  const attemptsFor = (item: PendingCheckItem): TaskCompletionSubmission[] => {
+    if (item.completion_submissions?.length) {
+      return [...item.completion_submissions].sort(
+        (a, b) => b.attempt_number - a.attempt_number
+      );
+    }
+    if (item.kind !== 'task' || item.photo_urls.length === 0) return [];
+    return [{
+      submission_uid: `${item.uid}-legacy`,
+      task_uid: item.uid,
+      attempt_number: 1,
+      employee_name: item.employee,
+      submitted_at: item.submitted_at,
+      status: 'pending',
+      images: item.photo_urls.map((url): TaskCompletionImage => ({
+        image_uid: null,
+        url,
+      })),
+    }];
+  };
+
+  const deleteEvidence = async (taskUid: string, image: EvidenceImage) => {
+    if (!image.image_uid) return false;
+    const updated = await deleteTaskCompletionImage(taskUid, image.image_uid);
+    if (updated) {
+      setViewer((current) => current && ({
+        ...current,
+        images: current.images.filter((i) => i.image_uid !== image.image_uid),
+      }));
+    }
+    await refreshPendingCheck();
+    return Boolean(updated);
+  };
 
   return (
     <div className="space-y-4">
@@ -100,7 +150,7 @@ export const PendingCheckView: React.FC<Props> = ({ onOpenTask, onCountChange })
           Employee-submitted work awaiting your review. Approval completes the
           work and releases the room when nothing else blocks it.
         </p>
-        <Button variant="ghost" size="sm" onClick={() => void load()} className="gap-1.5">
+        <Button variant="ghost" size="sm" onClick={() => void refreshPendingCheck()} className="gap-1.5">
           <RefreshCw className="w-3.5 h-3.5" /> Refresh
         </Button>
       </div>
@@ -146,7 +196,7 @@ export const PendingCheckView: React.FC<Props> = ({ onOpenTask, onCountChange })
                     <span>Submitted {fmtSubmitted(item.submitted_at)}</span>
                     {item.photo_urls.length > 0 && (
                       <span className="inline-flex items-center gap-1">
-                        <Camera className="w-3.5 h-3.5" /> {item.photo_urls.length} photo{item.photo_urls.length > 1 ? 's' : ''}
+                        <Camera className="w-3.5 h-3.5" /> {item.photo_urls.length} current photo{item.photo_urls.length > 1 ? 's' : ''}
                       </span>
                     )}
                   </div>
@@ -155,16 +205,91 @@ export const PendingCheckView: React.FC<Props> = ({ onOpenTask, onCountChange })
                       “{item.note}”
                     </p>
                   )}
-                  {item.photo_urls.length > 0 && (
+                  {item.kind === 'task' ? (
+                    attemptsFor(item).length > 0 && (
+                      <div className="mt-3 space-y-2.5">
+                        <p className="text-[10px] font-semibold uppercase tracking-wider text-[#8A857B]">
+                          Completion Evidence
+                        </p>
+                        {attemptsFor(item).map((attempt) => (
+                          <div
+                            key={attempt.submission_uid}
+                            className={`rounded-[10px] border p-3 ${
+                              attempt.status === 'pending'
+                                ? 'border-[#B7CFAA] bg-[#F7FAF4]'
+                                : 'border-[#E4DFD5] bg-[#FAF8F5]'
+                            }`}
+                          >
+                            <div className="flex items-center justify-between gap-2 flex-wrap">
+                              <div className="min-w-0">
+                                <p className="text-xs font-semibold text-[#24221F]">
+                                  Attempt {attempt.attempt_number} · {attempt.images.length} image{attempt.images.length === 1 ? '' : 's'}
+                                </p>
+                                <p className="text-[11px] text-[#6C675F] mt-0.5">
+                                  Submitted by {attempt.employee_name || 'Unknown'} · {fmtSubmitted(attempt.submitted_at)}
+                                </p>
+                                {attempt.reviewed_at && (
+                                  <p className="text-[11px] text-[#6C675F] mt-0.5">
+                                    Reviewed{attempt.reviewed_by_name ? ` by ${attempt.reviewed_by_name}` : ''} · {fmtSubmitted(attempt.reviewed_at)}
+                                  </p>
+                                )}
+                              </div>
+                              <Badge variant={attemptStatusBadge(attempt.status)} size="sm">
+                                {attemptStatusLabel(attempt.status)}
+                              </Badge>
+                            </div>
+                            {attempt.review_comment && (
+                              <p className="mt-2 text-[11px] text-[#555047] bg-white border border-[#EDE8DE] rounded-[8px] px-2.5 py-1.5">
+                                Review: {attempt.review_comment}
+                              </p>
+                            )}
+                            <div className="mt-2 flex gap-2 flex-wrap">
+                              {attempt.images.length === 0 ? (
+                                <span className="text-[11px] text-[#8A857B]">No images remain in this submission</span>
+                              ) : attempt.images.map((image, imageIndex) => (
+                                <button
+                                  key={image.image_uid || `${attempt.submission_uid}-${imageIndex}`}
+                                  type="button"
+                                  onClick={() => setViewer({
+                                    uid: item.uid,
+                                    title: `${item.title} — Attempt ${attempt.attempt_number}`,
+                                    images: attempt.images,
+                                    index: imageIndex,
+                                  })}
+                                  className="rounded-[8px] border border-[#E5E0D6] hover:border-[#8A9C72] focus:outline-none focus:ring-2 focus:ring-[#386641] cursor-zoom-in"
+                                >
+                                  <img
+                                    src={mediaUrl(image.url)}
+                                    alt={`Attempt ${attempt.attempt_number} evidence ${imageIndex + 1}`}
+                                    className="w-14 h-14 rounded-[6px] object-cover"
+                                  />
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )
+                  ) : item.photo_urls.length > 0 && (
                     <div className="mt-2 flex gap-2 flex-wrap">
-                      {item.photo_urls.slice(0, 4).map((u) => (
-                        <a key={u} href={mediaUrl(u)} target="_blank" rel="noreferrer">
+                      {item.photo_urls.map((url, imageIndex) => (
+                        <button
+                          key={url}
+                          type="button"
+                          onClick={() => setViewer({
+                            uid: item.uid,
+                            title: item.title,
+                            images: item.photo_urls.map((u) => ({ url: u })),
+                            index: imageIndex,
+                          })}
+                          className="rounded-[8px] border border-[#E5E0D6] hover:border-[#8A9C72] focus:outline-none focus:ring-2 focus:ring-[#386641] cursor-zoom-in"
+                        >
                           <img
-                            src={mediaUrl(u)}
+                            src={mediaUrl(url)}
                             alt="completion evidence"
-                            className="w-14 h-14 rounded-[8px] object-cover border border-[#E5E0D6]"
+                            className="w-14 h-14 rounded-[6px] object-cover"
                           />
-                        </a>
+                        </button>
                       ))}
                     </div>
                   )}
@@ -193,6 +318,17 @@ export const PendingCheckView: React.FC<Props> = ({ onOpenTask, onCountChange })
             </div>
           ))}
         </div>
+      )}
+
+      {viewer && (
+        <CompletionEvidenceLightbox
+          images={viewer.images}
+          initialIndex={viewer.index}
+          title={viewer.title}
+          canDelete={items.find((item) => item.uid === viewer.uid)?.kind === 'task'}
+          onClose={() => setViewer(null)}
+          onDelete={(image) => deleteEvidence(viewer.uid, image)}
+        />
       )}
 
       {/* Disapprove reason dialog */}

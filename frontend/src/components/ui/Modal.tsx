@@ -8,7 +8,7 @@ export interface ModalProps {
   title: string;
   description?: string;
   children: ReactNode;
-  maxWidth?: 'sm' | 'md' | 'lg' | 'xl';
+  maxWidth?: 'sm' | 'md' | 'lg' | 'xl' | '2xl';
   /** Optional sticky action bar — stays pinned below the scrollable content. */
   footer?: ReactNode;
 }
@@ -43,6 +43,7 @@ export const Modal: React.FC<ModalProps> = ({
     md: 'max-w-lg',
     lg: 'max-w-2xl',
     xl: 'max-w-4xl',
+    '2xl': 'max-w-5xl',
   };
 
   return (

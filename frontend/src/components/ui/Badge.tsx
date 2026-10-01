@@ -45,6 +45,125 @@ export const Badge: React.FC<BadgeProps> = ({
   );
 };
 
+// ---------------------------------------------------------------------------
+// THE canonical resource visual resolver — the only place the UI decides a
+// unit's color. It consumes the backend's two-axis state contract
+// (`visual_state` emitted by ResourceStateService) and NEVER reconstructs
+// state from task/ticket history.
+//
+//   maintenance              → red
+//   cleaning                 → beige   (occupied + cleaning is STILL beige —
+//                                       the operational blocker drives the
+//                                       temporary visual state; occupancy is
+//                                       an axis, not a color)
+//   inactive                 → neutral
+//   occupied + operational   → violet
+//   unoccupied + available   → green
+//   unknown / stale payload  → neutral + dev warning (never beige — a
+//                              guessed color masks real data problems)
+// ---------------------------------------------------------------------------
+export type UnitVisualState = 'green' | 'purple' | 'beige' | 'red' | 'neutral';
+
+export interface UnitStateInput {
+  status: string;
+  /** server-resolved axes — preferred source of truth */
+  visual_state?: string | null;
+  operational_state?: string | null;
+  occupancy_state?: string | null;
+  is_occupied?: boolean;
+  /** legacy aliases still accepted for unserialized callers */
+  occupied?: boolean;
+  blocked?: boolean;
+}
+
+export function unitVisualState(input: UnitStateInput): UnitVisualState {
+  // 1. the backend's canonical classification wins outright — the
+  //    frontend must not reinterpret it
+  switch (input.visual_state) {
+    case 'maintenance':
+      return 'red';
+    case 'cleaning':
+      return 'beige';
+    case 'inactive':
+      return 'neutral';
+    case 'occupied':
+      return 'purple';
+    case 'available':
+      return 'green';
+  }
+  // 2. fallback for objects serialized before the contract existed —
+  //    derive from the two axes exactly like the backend does
+  const operational =
+    input.operational_state ??
+    (input.status === 'occupied' ? 'available' : input.status);
+  if (operational === 'inactive') return 'neutral';
+  if (operational === 'maintenance') return 'red';
+  if (operational === 'cleaning' || input.blocked) return 'beige';
+  const occupied =
+    input.is_occupied === true ||
+    input.occupied === true ||
+    input.occupancy_state === 'occupied' ||
+    input.status === 'occupied';
+  if (
+    operational === 'available' ||
+    operational === 'operational' ||
+    operational === 'occupied'
+  ) {
+    return occupied ? 'purple' : 'green';
+  }
+  if (import.meta.env.DEV) {
+    console.warn('unitVisualState: unrecognized resource state', input);
+  }
+  return 'neutral';
+}
+
+export const UNIT_VISUAL_TINT: Record<UnitVisualState, string> = {
+  green: 'bg-[#EBF3EC] border-[#CEE4D1] text-[#244E2C]',
+  purple: 'bg-[#F2EFF9] border-[#DDD5F0] text-[#554388]',
+  beige: 'bg-[#FDF6EC] border-[#EFDDBE] text-[#7A540F]',
+  red: 'bg-[#FDE8E8] border-[#F9C3C3] text-[#A32A2A]',
+  neutral: 'bg-[#F3EFE9] border-[#E2DDD5] text-[#8C867C]',
+};
+
+/** Dot accent color per visual state — shared by every status list. */
+export const UNIT_VISUAL_DOT: Record<UnitVisualState, string> = {
+  green: 'bg-[#386641]',
+  purple: 'bg-[#7C3AED]',
+  beige: 'bg-[#D97706]',
+  red: 'bg-[#C53B3B]',
+  neutral: 'bg-[#A59F95]',
+};
+
+/** Text accent color per visual state. */
+export const UNIT_VISUAL_TEXT: Record<UnitVisualState, string> = {
+  green: 'text-[#2E6038]',
+  purple: 'text-[#554388]',
+  beige: 'text-[#9A4C07]',
+  red: 'text-[#A32A2A]',
+  neutral: 'text-[#736E65]',
+};
+
+/** Badge variant per visual state — status pills go through the resolver too. */
+export const UNIT_VISUAL_BADGE_VARIANT: Record<
+  UnitVisualState,
+  BadgeProps['variant']
+> = {
+  green: 'sage',
+  purple: 'lavender',
+  beige: 'orange',
+  red: 'red',
+  neutral: 'neutral',
+};
+
+/** Canonical label per visual state. */
+export const UNIT_VISUAL_LABEL: Record<UnitVisualState, string> = {
+  green: 'Available',
+  purple: 'Occupied',
+  beige: 'Cleaning',
+  red: 'Maintenance',
+  neutral: 'Inactive',
+};
+
 export const RoomStatusBadge: React.FC<{ status: RoomStatus; size?: 'sm' | 'md' }> = ({
   status,
   size = 'sm',
@@ -59,15 +178,15 @@ export const RoomStatusBadge: React.FC<{ status: RoomStatus; size?: 'sm' | 'md' 
       );
     case 'occupied':
       return (
-        <Badge variant="neutral" size={size} className="bg-[#EEF2F6] text-[#254668] border-[#CFDCEB]">
-          <span className="w-1.5 h-1.5 rounded-full bg-[#2563EB]" />
+        <Badge variant="lavender" size={size} className="bg-[#F2EFF9] text-[#554388] border-[#DDD5F0]">
+          <span className="w-1.5 h-1.5 rounded-full bg-[#7C3AED]" />
           Occupied
         </Badge>
       );
     case 'cleaning':
       return (
-        <Badge variant="orange" size={size}>
-          <span className="w-1.5 h-1.5 rounded-full bg-[#D97706]" />
+        <Badge variant="orange" size={size} className="bg-[#FDF6EC] text-[#7A540F] border-[#EFDDBE]">
+          <span className="w-1.5 h-1.5 rounded-full bg-[#D6A017]" />
           Cleaning
         </Badge>
       );
@@ -97,15 +216,15 @@ export const BedStatusBadge: React.FC<{ status: BedStatus; size?: 'sm' | 'md' }>
       );
     case 'occupied':
       return (
-        <Badge variant="neutral" size={size} className="bg-[#EEF2F6] text-[#254668] border-[#CFDCEB]">
-          <span className="w-1.5 h-1.5 rounded-full bg-[#2563EB]" />
+        <Badge variant="lavender" size={size} className="bg-[#F2EFF9] text-[#554388] border-[#DDD5F0]">
+          <span className="w-1.5 h-1.5 rounded-full bg-[#7C3AED]" />
           Occupied
         </Badge>
       );
     case 'cleaning':
       return (
-        <Badge variant="orange" size={size}>
-          <span className="w-1.5 h-1.5 rounded-full bg-[#D97706]" />
+        <Badge variant="orange" size={size} className="bg-[#FDF6EC] text-[#7A540F] border-[#EFDDBE]">
+          <span className="w-1.5 h-1.5 rounded-full bg-[#D6A017]" />
           Cleaning
         </Badge>
       );

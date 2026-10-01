@@ -1,24 +1,25 @@
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import {
   Wrench,
-  AlertTriangle,
-  Flame,
   CheckCircle2,
-  Clock,
   Camera,
   Pause,
   X,
   Filter,
   Search,
-  Ticket,
   UserCheck,
+  Trash2,
+  Activity,
+  History,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { Card } from '../ui/Card';
 import { Button } from '../ui/Button';
 import { Badge } from '../ui/Badge';
 import { Drawer } from '../ui/Drawer';
+import { ConfirmationDialog } from '../ui/ConfirmationDialog';
+import { CompletionEvidenceLightbox } from '../tasks/CompletionEvidenceLightbox';
 import { MaintenanceTicket } from '../../types';
 import * as mediaApi from '../../api/media';
 import {
@@ -28,6 +29,7 @@ import {
   isActiveTicket,
 } from '../../lib/maintenanceUtils';
 import { formatEventTime } from '../../lib/taskUtils';
+import { isEmployeeAssignable } from '../../lib/employeeUtils';
 
 const PRIORITY_STYLES: Record<string, string> = {
   low: 'bg-[#F4F0E8] text-[#6C675F]',
@@ -79,6 +81,7 @@ export const TicketDrawer: React.FC<{
     resolveMaintenanceTicket,
     closeMaintenanceTicket,
     disapproveMaintenanceTicket,
+    deleteMaintenanceTicket,
     addToast,
   } = useApp();
 
@@ -86,17 +89,28 @@ export const TicketDrawer: React.FC<{
   const [resolveMode, setResolveMode] = useState(false);
   const [disapproveMode, setDisapproveMode] = useState(false);
   const [disapproveReason, setDisapproveReason] = useState('');
+  const [deleteConfirm, setDeleteConfirm] = useState(false);
   const [resolveNotes, setResolveNotes] = useState('');
   const [resolvePhotos, setResolvePhotos] = useState<{ file: File; previewUrl: string }[]>([]);
+  const [attachmentIndex, setAttachmentIndex] = useState<number | null>(null);
   const [isWorking, setIsWorking] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
+  const resolvePhotosRef = useRef(resolvePhotos);
+  resolvePhotosRef.current = resolvePhotos;
 
-  // Other tickets on the SAME target (room / dorm / bed) — nulls never match
+  useEffect(
+    () => () => resolvePhotosRef.current.forEach((photo) => URL.revokeObjectURL(photo.previewUrl)),
+    []
+  );
+
+  // Other tickets on the SAME target (room / dorm / bed / washroom) — nulls never match
   const roomHistory = currentPropertyMaintenance.filter(
     (t) =>
       t.ticket_uid !== ticket.ticket_uid &&
       ((t.room_uid && t.room_uid === ticket.room_uid) ||
         (t.bed_uid && t.bed_uid === ticket.bed_uid) ||
+        (t.washroom_uid && t.washroom_uid === ticket.washroom_uid) ||
+        (t.washroom_name && t.washroom_name === ticket.washroom_name) ||
         (t.dorm_uid && !t.bed_uid && t.dorm_uid === ticket.dorm_uid && !ticket.bed_uid))
   );
 
@@ -134,7 +148,7 @@ export const TicketDrawer: React.FC<{
     started: 'Work started',
     held: 'Put on hold',
     resumed: 'Resumed',
-    resolved: 'Marked resolved',
+    resolved: 'Submitted for approval',
     closed: 'Ticket closed',
     cancelled: 'Cancelled',
     edited: 'Details edited',
@@ -142,7 +156,8 @@ export const TicketDrawer: React.FC<{
   };
 
   return (
-    <Drawer isOpen onClose={onClose} title={ticket.ticket_number}>
+    <>
+      <Drawer isOpen onClose={onClose} title={ticket.ticket_number}>
       <div className="space-y-5">
         {/* Header */}
         <div>
@@ -155,7 +170,7 @@ export const TicketDrawer: React.FC<{
             {ticket.issue}
           </h3>
           <p className="text-xs text-[#736E65] mt-0.5">
-            {ticket.location_label || `Room ${ticket.room_number || '—'}`} · {activeProperty?.name}
+            {ticket.location_label || ticket.room_number || '—'} · {activeProperty?.name}
           </p>
           {ticket.description && (
             <p className="text-sm text-[#555047] mt-2 leading-relaxed">{ticket.description}</p>
@@ -189,22 +204,9 @@ export const TicketDrawer: React.FC<{
           </div>
         )}
 
-        {/* Attachments */}
-        {ticket.attachments.length > 0 && (
-          <div>
-            <p className="text-[10px] font-semibold text-[#8C867C] uppercase tracking-wider mb-2">
-              Attachments ({ticket.attachments.length})
-            </p>
-            <div className="flex gap-2 flex-wrap">
-              {ticket.attachments.map((a) => (
-                <a key={a.attachment_uid} href={a.url} target="_blank" rel="noreferrer"
-                   className="block w-16 h-16 rounded-[10px] overflow-hidden border border-[#E5E0D6] hover:border-[#386641] transition-colors">
-                  <img src={a.url} alt={a.file_name || ''} className="w-full h-full object-cover" />
-                </a>
-              ))}
-            </div>
-          </div>
-        )}
+        {/* Attachments render inline on their timeline event below —
+            issue photos under "Ticket created", each resolution round
+            under its own "Marked resolved" */}
 
         {/* Assignment */}
         {canAssign && (
@@ -233,7 +235,7 @@ export const TicketDrawer: React.FC<{
               >
                 <option value="">Unassigned</option>
                 {currentPropertyEmployees
-                  .filter((e) => e.status === 'Active')
+                  .filter(isEmployeeAssignable)
                   .map((e) => (
                     <option key={e.employee_uid} value={e.employee_uid}>
                       {e.name} — {e.job_title}
@@ -354,7 +356,10 @@ export const TicketDrawer: React.FC<{
                   <img src={p.previewUrl} alt="" className="w-full h-full object-cover" />
                   <button
                     type="button"
-                    onClick={() => setResolvePhotos((prev) => prev.filter((_, j) => j !== i))}
+                    onClick={() => setResolvePhotos((prev) => {
+                      URL.revokeObjectURL(prev[i].previewUrl);
+                      return prev.filter((_, j) => j !== i);
+                    })}
                     className="absolute top-0.5 right-0.5 w-4 h-4 rounded-full bg-black/60 text-white flex items-center justify-center cursor-pointer"
                   >
                     <X className="w-2.5 h-2.5" />
@@ -371,13 +376,53 @@ export const TicketDrawer: React.FC<{
           </div>
         )}
 
+        {/* Delete — staff only; deleting releases the unit lock server-side */}
+        {isStaff && (
+          <div className="pt-3 border-t border-[#F2ECE3]">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setDeleteConfirm(true)}
+              className="text-[#A32A2A] border-[#F0C4C4] hover:bg-[#FDE8E8]"
+            >
+              <Trash2 className="w-3.5 h-3.5 mr-1" /> Delete Ticket
+            </Button>
+          </div>
+        )}
+
         {/* Timeline */}
         <div>
           <p className="text-[10px] font-semibold text-[#8C867C] uppercase tracking-wider mb-2.5">
             Activity Timeline
           </p>
           <div className="space-y-0 relative before:absolute before:left-[7px] before:top-2 before:bottom-2 before:w-px before:bg-[#E5E0D6]">
-            {ticket.events.map((e) => (
+            {(() => {
+              // Map each upload to the event it belongs to: report photos
+              // sit on "created"; a resolution round's photos sit on the
+              // nth "resolved" event (attempt NULL = first round).
+              const resolvedEvents = ticket.events.filter(
+                (e) => e.action === 'resolved'
+              );
+              const attachmentsFor = (e: (typeof ticket.events)[number]) => {
+                if (e.action === 'created') {
+                  return ticket.attachments
+                    .map((a, i) => ({ a, i }))
+                    .filter(({ a }) => a.kind === 'issue');
+                }
+                if (e.action === 'resolved') {
+                  const round = resolvedEvents.indexOf(e) + 1;
+                  return ticket.attachments
+                    .map((a, i) => ({ a, i }))
+                    .filter(
+                      ({ a }) =>
+                        a.kind === 'resolution' && (a.attempt ?? 1) === round
+                    );
+                }
+                return [];
+              };
+              return ticket.events.map((e) => {
+                const photos = attachmentsFor(e);
+                return (
               <div key={e.event_uid} className="flex gap-3 py-2 relative">
                 <span className="w-[15px] h-[15px] rounded-full bg-[#EBF3EC] border-2 border-[#386641] shrink-0 mt-0.5 relative z-10" />
                 <div className="min-w-0">
@@ -389,9 +434,27 @@ export const TicketDrawer: React.FC<{
                   {e.comment && (
                     <p className="text-xs text-[#555047] mt-0.5">{e.comment}</p>
                   )}
+                  {photos.length > 0 && (
+                    <div className="flex gap-1.5 flex-wrap mt-1.5">
+                      {photos.map(({ a, i }) => (
+                        <button key={a.attachment_uid} type="button"
+                           onClick={() => setAttachmentIndex(i)}
+                           title={
+                             a.kind === 'issue'
+                               ? 'Report evidence'
+                               : `Resolution evidence — attempt ${a.attempt ?? 1}`
+                           }
+                           className="block w-14 h-14 rounded-[8px] overflow-hidden border border-[#E5E0D6] hover:border-[#386641] transition-colors cursor-zoom-in">
+                          <img src={a.url} alt={a.file_name || ''} className="w-full h-full object-cover" />
+                        </button>
+                      ))}
+                    </div>
+                  )}
                 </div>
               </div>
-            ))}
+                );
+              });
+            })()}
           </div>
         </div>
 
@@ -399,7 +462,7 @@ export const TicketDrawer: React.FC<{
         {roomHistory.length > 0 && (
           <div>
             <p className="text-[10px] font-semibold text-[#8C867C] uppercase tracking-wider mb-2">
-              {ticket.location_label || `Room ${ticket.room_number}`} — Maintenance History
+              {ticket.location_label || ticket.room_number} — Maintenance History
             </p>
             <div className="space-y-1.5">
               {roomHistory.map((t) => (
@@ -415,7 +478,31 @@ export const TicketDrawer: React.FC<{
           </div>
         )}
       </div>
-    </Drawer>
+      </Drawer>
+      <ConfirmationDialog
+        isOpen={deleteConfirm}
+        onClose={() => setDeleteConfirm(false)}
+        onConfirm={() => {
+          void deleteMaintenanceTicket(ticket.ticket_uid).then(onClose).catch(() => {});
+        }}
+        entityType="Maintenance Ticket"
+        entityName={`${ticket.ticket_number} — ${ticket.issue}`}
+        impactMessage="The ticket, its timeline, and attachments will be permanently removed. The associated unit will be released from maintenance."
+      />
+
+      {/* In-app attachment viewer — never leaves the drawer for a new tab */}
+      {attachmentIndex !== null && (
+        <CompletionEvidenceLightbox
+          images={ticket.attachments.map((a) => ({
+            image_uid: a.attachment_uid,
+            url: a.url,
+          }))}
+          initialIndex={attachmentIndex}
+          title={`${ticket.ticket_number} — Attachments`}
+          onClose={() => setAttachmentIndex(null)}
+        />
+      )}
+    </>
   );
 };
 
@@ -426,6 +513,7 @@ export const TicketDrawer: React.FC<{
 export const MaintenanceView: React.FC = () => {
   const { currentPropertyMaintenance, activeProperty } = useApp();
   const [searchParams] = useSearchParams();
+  const [view, setView] = useState<'live' | 'history'>('live');
   const [statusFilter, setStatusFilter] = useState('all');
   const [search, setSearch] = useState('');
   const [openedTicketUid, setOpenedTicketUid] = useState<string | null>(
@@ -434,20 +522,16 @@ export const MaintenanceView: React.FC = () => {
 
   const tickets = currentPropertyMaintenance;
 
-  const stats = useMemo(() => {
-    const today = new Date().toDateString();
-    return {
-      open: tickets.filter((t) => t.status === 'open').length,
-      inProgress: tickets.filter((t) => t.status === 'in_progress').length,
-      high: tickets.filter((t) => t.priority === 'high' && isActiveTicket(t.status)).length,
-      critical: tickets.filter((t) => t.priority === 'critical' && isActiveTicket(t.status)).length,
-      resolvedToday: tickets.filter(
-        (t) => t.resolved_at && new Date(t.resolved_at).toDateString() === today
-      ).length,
-    };
-  }, [tickets]);
+  // Live = every non-terminal workflow state (incl. resolved→pending check);
+  // History = completed/cancelled tickets — the record is terminal.
+  const liveTickets = tickets.filter(
+    (t) => t.status !== 'closed' && t.status !== 'cancelled'
+  );
+  const historyTickets = tickets.filter(
+    (t) => t.status === 'closed' || t.status === 'cancelled'
+  );
 
-  const filtered = tickets.filter((t) => {
+  const filtered = (view === 'live' ? liveTickets : historyTickets).filter((t) => {
     if (statusFilter !== 'all' && t.status !== statusFilter) return false;
     if (search) {
       const q = search.toLowerCase();
@@ -478,23 +562,28 @@ export const MaintenanceView: React.FC = () => {
         </p>
       </div>
 
-      {/* Stats — computed from the live ticket list */}
-      <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
-        {[
-          { label: 'Open Tickets', value: stats.open, icon: <Ticket className="w-4 h-4" />, tone: 'text-[#9A4C07] bg-[#FDF0E5]' },
-          { label: 'In Progress', value: stats.inProgress, icon: <Clock className="w-4 h-4" />, tone: 'text-[#B45309] bg-[#FDF0E5]' },
-          { label: 'High Priority', value: stats.high, icon: <Flame className="w-4 h-4" />, tone: 'text-[#C8681A] bg-[#FDF0E5]' },
-          { label: 'Critical', value: stats.critical, icon: <AlertTriangle className="w-4 h-4" />, tone: 'text-[#A32A2A] bg-[#FBEBEB]' },
-          { label: 'Resolved Today', value: stats.resolvedToday, icon: <CheckCircle2 className="w-4 h-4" />, tone: 'text-[#386641] bg-[#EBF3EC]' },
-        ].map((s) => (
-          <Card key={s.label} className="p-3.5">
-            <div className={`w-8 h-8 rounded-[9px] flex items-center justify-center mb-2 ${s.tone}`}>
-              {s.icon}
-            </div>
-            <p className="font-display font-bold text-xl text-[#24221F]">{s.value}</p>
-            <p className="text-[11px] text-[#8C867C] font-medium">{s.label}</p>
-          </Card>
-        ))}
+      {/* Section nav — live workflow vs terminal record */}
+      <div className="flex items-center gap-1 bg-[#F0EDE6] rounded-[12px] p-1 w-fit">
+        {([
+          { v: 'live' as const, l: 'Current Live', icon: Activity },
+          { v: 'history' as const, l: 'History', icon: History },
+        ]).map((t) => {
+          const Icon = t.icon;
+          return (
+            <button
+              key={t.v}
+              onClick={() => setView(t.v)}
+              className={`flex items-center gap-2 px-4 py-2 rounded-[9px] text-[13px] font-semibold transition-all cursor-pointer ${
+                view === t.v
+                  ? 'bg-white text-[#24221F] shadow-sm'
+                  : 'text-[#6C675F] hover:text-[#24221F]'
+              }`}
+            >
+              <Icon className="w-4 h-4" />
+              {t.l}
+            </button>
+          );
+        })}
       </div>
 
       {/* Filters */}
@@ -530,9 +619,13 @@ export const MaintenanceView: React.FC = () => {
           <div className="w-12 h-12 rounded-full bg-[#FDF0E5] text-[#9A4C07] flex items-center justify-center mx-auto mb-3">
             <Wrench className="w-6 h-6" />
           </div>
-          <h3 className="font-display font-semibold text-lg text-[#24221F]">No maintenance tickets</h3>
+          <h3 className="font-display font-semibold text-lg text-[#24221F]">
+            {view === 'live' ? 'No live maintenance tickets' : 'No history yet'}
+          </h3>
           <p className="font-body text-sm text-[#6C675F] max-w-md mx-auto mt-1">
-            Flag a room for maintenance from the Rooms page — the ticket appears here.
+            {view === 'live'
+              ? 'Flag a room for maintenance from the Rooms page — the ticket appears here.'
+              : 'Completed and cancelled tickets are archived here.'}
           </p>
         </Card>
       ) : (
@@ -563,7 +656,7 @@ export const MaintenanceView: React.FC = () => {
                   </div>
                 </div>
                 <div className="text-right text-[11px] text-[#8C867C] shrink-0">
-                  <p className="font-semibold text-[#555047]">{t.location_label || `Room ${t.room_number || '—'}`}</p>
+                  <p className="font-semibold text-[#555047]">{t.location_label || t.room_number || '—'}</p>
                   <p>{t.assigned_to_name ? `→ ${t.assigned_to_name}` : 'Unassigned'}</p>
                 </div>
               </div>

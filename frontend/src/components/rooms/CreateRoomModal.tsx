@@ -1,7 +1,8 @@
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { useApp } from '../../context/AppContext';
 import { Modal } from '../ui/Modal';
 import { Button } from '../ui/Button';
+import { AlertTriangle } from 'lucide-react';
 import { zoneSupportsUnits } from '../../lib/zoneUtils';
 
 interface CreateRoomModalProps {
@@ -20,7 +21,7 @@ export const ROOM_TYPES = [
 ];
 
 export const CreateRoomModal: React.FC<CreateRoomModalProps> = ({ isOpen, onClose }) => {
-  const { createRoom, currentPropertyZones } = useApp();
+  const { createRoom, currentPropertyZones, currentPropertyRooms } = useApp();
 
   const [roomNumber, setRoomNumber] = useState('');
   const [type, setType] = useState(ROOM_TYPES[0]);
@@ -30,9 +31,17 @@ export const CreateRoomModal: React.FC<CreateRoomModalProps> = ({ isOpen, onClos
   const [zoneUid, setZoneUid] = useState<string>('');
   const [isSubmitting, setIsSubmitting] = useState(false);
 
+  // Instant name-conflict feedback — same check the backend enforces (409)
+  const roomNumberTaken = useMemo(() => {
+    const n = roomNumber.trim().toLowerCase();
+    return n !== '' && currentPropertyRooms.some(
+      (r) => r.room_number.toLowerCase().trim() === n
+    );
+  }, [roomNumber, currentPropertyRooms]);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!roomNumber.trim() || isSubmitting) return;
+    if (!roomNumber.trim() || roomNumberTaken || isSubmitting) return;
 
     setIsSubmitting(true);
     try {
@@ -73,8 +82,18 @@ export const CreateRoomModal: React.FC<CreateRoomModalProps> = ({ isOpen, onClos
             value={roomNumber}
             onChange={(e) => setRoomNumber(e.target.value)}
             placeholder="e.g. 205"
-            className="w-full px-3.5 py-2 bg-[#FAF8F5] border border-[#DDD7CB] rounded-[10px] text-sm text-[#24221F] focus:outline-none focus:ring-2 focus:ring-[#386641]"
+            className={`w-full px-3.5 py-2 bg-[#FAF8F5] border rounded-[10px] text-sm text-[#24221F] focus:outline-none focus:ring-2 ${
+              roomNumberTaken
+                ? 'border-[#E5A3A3] focus:ring-[#C53B3B]'
+                : 'border-[#DDD7CB] focus:ring-[#386641]'
+            }`}
           />
+          {roomNumberTaken && (
+            <p className="text-[11px] text-[#A82828] font-body mt-1 flex items-center gap-1">
+              <AlertTriangle className="w-3 h-3 shrink-0" />
+              A room named "{roomNumber.trim()}" already exists in this property.
+            </p>
+          )}
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
@@ -161,7 +180,7 @@ export const CreateRoomModal: React.FC<CreateRoomModalProps> = ({ isOpen, onClos
           <Button type="button" variant="outline" onClick={onClose} disabled={isSubmitting}>
             Cancel
           </Button>
-          <Button type="submit" variant="primary" isLoading={isSubmitting}>
+          <Button type="submit" variant="primary" disabled={roomNumberTaken} isLoading={isSubmitting}>
             Create Room
           </Button>
         </div>

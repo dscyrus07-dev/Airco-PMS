@@ -11,6 +11,7 @@ import {
 export interface MaintenanceListParams {
   property_uid?: string;
   room_uid?: string;
+  washroom_uid?: string;
   assigned_to?: string;
   status?: string;
   priority?: string;
@@ -57,6 +58,11 @@ export async function updateMaintenanceTicket(
     method: 'PATCH',
     body: req,
   });
+}
+
+/** Permanently delete the ticket; backend releases its unit lock first. */
+export async function deleteMaintenanceTicket(ticket_uid: string): Promise<void> {
+  return apiFetch<void>(`/maintenance/${ticket_uid}`, { method: 'DELETE' });
 }
 
 export async function assignMaintenanceTicket(
@@ -121,4 +127,23 @@ export async function roomMaintenanceHistory(
   room_uid: string
 ): Promise<ListResponse<MaintenanceTicket>> {
   return apiFetch<ListResponse<MaintenanceTicket>>(`/rooms/${room_uid}/maintenance`);
+}
+
+/** Per-washroom maintenance history. */
+export async function washroomMaintenanceHistory(
+  washroom_uid: string
+): Promise<ListResponse<MaintenanceTicket>> {
+  return apiFetch<ListResponse<MaintenanceTicket>>(
+    `/washrooms/${washroom_uid}/maintenance`
+  );
+}
+
+export interface EligibleLocations {
+  rooms: { room_uid: string; room_number: string; type: string; zone_name: string | null }[];
+  dorms: { dorm_uid: string; name: string; dorm_type: string; zone_name: string | null; bed_count: number }[];
+}
+
+/** Employee-facing: only rooms/dorms inside the caller's zone/area coverage. */
+export async function eligibleLocations(): Promise<EligibleLocations> {
+  return apiFetch<EligibleLocations>('/maintenance/eligible-locations');
 }

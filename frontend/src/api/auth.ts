@@ -41,8 +41,20 @@ export async function logout(): Promise<void> {
   }
 }
 
-export async function me(): Promise<MeResponse> {
-  return apiFetch<MeResponse>('/auth/me');
+// Single-flight /auth/me — startup mounts AppContext's bootstrap effect
+// twice under React StrictMode (and multiple consumers may race it);
+// everyone joins the same in-flight request. No result caching: the
+// promise clears on settle, so nothing can go stale and logout/login
+// always revalidate normally.
+let meInFlight: Promise<MeResponse> | null = null;
+
+export function me(): Promise<MeResponse> {
+  if (!meInFlight) {
+    meInFlight = apiFetch<MeResponse>('/auth/me').finally(() => {
+      meInFlight = null;
+    });
+  }
+  return meInFlight;
 }
 
 export async function registerCompany(req: RegisterCompanyRequest): Promise<AuthResponse> {

@@ -191,7 +191,7 @@ export const TaskHistoryView: React.FC<Props> = ({ onOpenTask }) => {
                     {t.ticket_number || '—'}
                   </td>
                   <td className="px-3 py-2.5 font-medium text-[#24221F] max-w-[200px] truncate">{t.title}</td>
-                  <td className="px-3 py-2.5 text-[#58534C]">{t.room_number ? `Room ${t.room_number}` : '—'}</td>
+                  <td className="px-3 py-2.5 text-[#58534C]">{t.room_number || '—'}</td>
                   <td className="px-3 py-2.5 text-[#58534C]">{t.zone_name || '—'}</td>
                   <td className="px-3 py-2.5 text-[#58534C]">{t.assigned_to || <span className="text-[#B5AEA2]">Unassigned</span>}</td>
                   <td className="px-3 py-2.5 text-[#8C867C] whitespace-nowrap">{fmtTs(t.generated_at)}</td>

@@ -21,6 +21,7 @@ import {
 import { useApp } from '../../context/AppContext';
 import { Employee, Zone } from '../../types';
 import { getInitials } from '../../lib/utils';
+import { isEmployeeAssignable } from '../../lib/employeeUtils';
 
 interface ZoneBoardProps {
   onOpenCreateModal: () => void;
@@ -222,13 +223,16 @@ export const ZoneBoard: React.FC<ZoneBoardProps> = ({ onOpenCreateModal }) => {
     currentPropertyAreas,
     currentPropertyZones,
     currentPropertyEmployees,
-    currentPropertyUnallocatedEmployees,
     assignEmployeeToZone,
     assignEmployeeToArea,
     activeProperty,
   } = useApp();
 
   const [activeDragEmp, setActiveDragEmp] = useState<Employee | null>(null);
+  const assignableEmployees = currentPropertyEmployees.filter(isEmployeeAssignable);
+  const assignableUnallocatedEmployees = assignableEmployees.filter(
+    (e) => !e.zone_uid && !e.area_uid
+  );
 
   const sensors = useSensors(
     useSensor(PointerSensor, {
@@ -283,7 +287,7 @@ export const ZoneBoard: React.FC<ZoneBoardProps> = ({ onOpenCreateModal }) => {
       id={zone.zone_uid}
       title={zone.name}
       subtitle={zone.code}
-      employees={currentPropertyEmployees.filter(
+      employees={assignableEmployees.filter(
         (e) => e.zone_uid === zone.zone_uid
       )}
     />
@@ -335,11 +339,11 @@ export const ZoneBoard: React.FC<ZoneBoardProps> = ({ onOpenCreateModal }) => {
             <DroppableColumn
               id="unallocated"
               title="Unallocated Staff"
-              subtitle={`${currentPropertyUnallocatedEmployees.length} person${
-                currentPropertyUnallocatedEmployees.length === 1 ? '' : 's'
+              subtitle={`${assignableUnallocatedEmployees.length} person${
+                assignableUnallocatedEmployees.length === 1 ? '' : 's'
               }`}
               kind="unallocated"
-              employees={currentPropertyUnallocatedEmployees}
+              employees={assignableUnallocatedEmployees}
             />
           </div>
 
@@ -347,10 +351,10 @@ export const ZoneBoard: React.FC<ZoneBoardProps> = ({ onOpenCreateModal }) => {
           <div className="flex-1 min-w-0 space-y-4">
             {sortedAreas.map((area) => {
               const areaZones = zonesByArea.get(area.area_uid) || [];
-              const areaEmployees = currentPropertyEmployees.filter(
+              const areaEmployees = assignableEmployees.filter(
                 (e) => e.area_uid === area.area_uid
               );
-              const zoneStaff = currentPropertyEmployees.filter((e) =>
+              const zoneStaff = assignableEmployees.filter((e) =>
                 areaZones.some((z) => z.zone_uid === e.zone_uid)
               ).length;
               return (

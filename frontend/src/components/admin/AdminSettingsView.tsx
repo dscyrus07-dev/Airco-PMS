@@ -4,6 +4,7 @@ import { useApp } from '../../context/AppContext';
 import { Card } from '../ui/Card';
 import { Button } from '../ui/Button';
 import { ApiError } from '../../api/client';
+import { HrAccountsCard } from './HrAccountsCard';
 
 export const AdminSettingsView: React.FC = () => {
   const {
@@ -150,6 +151,8 @@ export const AdminSettingsView: React.FC = () => {
           </div>
         </form>
       </Card>
+
+      <HrAccountsCard properties={companyProperties} />
 
       {/* Data Overview & Sync */}
       <Card className="p-6">

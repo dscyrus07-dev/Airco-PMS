@@ -12,6 +12,7 @@ from collections.abc import AsyncGenerator
 
 from fastapi import status
 from sqlalchemy import text
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -37,8 +38,22 @@ class DatabaseUnavailable(AppError):
     message = "The database is temporarily unavailable. Please try again."
 
 
+def _pgbouncer_connect_args() -> dict:
+    """pgbouncer transaction/statement poolers do not support asyncpg's
+    prepared-statement cache. Disable the cache when the URL points at a
+    Supabase pooler host so migrations and queries work reliably."""
+    try:
+        parsed = make_url(settings.database_url)
+        if parsed.host and "pooler" in parsed.host:
+            return {"prepared_statement_cache_size": 0}
+    except Exception:
+        pass
+    return {}
+
+
 engine: AsyncEngine = create_async_engine(
     settings.database_url,
+    connect_args=_pgbouncer_connect_args(),
     # pool_recycle handles stale connections at checkout — avoids paying an
     # extra DB round trip (~300ms to remote Supabase) on EVERY request.
     pool_pre_ping=False,

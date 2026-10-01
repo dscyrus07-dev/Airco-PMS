@@ -14,7 +14,7 @@ from arq.connections import RedisSettings
 from app.core.config import settings
 from app.core.database import close_db
 from app.core.logging import setup_logging
-from app.workers.jobs import generation_tick
+from app.workers.jobs import generation_tick, reconciliation_tick
 
 setup_logging()
 
@@ -41,11 +41,15 @@ def _redis_settings() -> RedisSettings:
 class WorkerSettings:
     redis_settings = _redis_settings()
 
-    functions = [generation_tick]
+    functions = [generation_tick, reconciliation_tick]
     cron_jobs = [
         # every minute — the template/repetitive generation sweep
         cron(generation_tick, minute=set(range(60)), unique=True,
              timeout=120, max_tries=1),
+        # every 15 minutes — resource-state reconciliation (detect + log;
+        # repair stays a deliberate Super Admin action via the API)
+        cron(reconciliation_tick, minute={0, 15, 30, 45}, unique=True,
+             timeout=300, max_tries=1),
     ]
 
     max_jobs = 20

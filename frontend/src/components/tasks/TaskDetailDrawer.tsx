@@ -1,4 +1,4 @@
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Calendar,
   Camera,
@@ -17,13 +17,21 @@ import {
   Pencil,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
+import * as tasksApi from '../../api/tasks';
+import { perfLog } from '../../dev/perf';
 import { uploadPhoto } from '../../api/media';
 import { mediaUrl } from '../../api/client';
+import { CompletionEvidenceLightbox, EvidenceImage } from './CompletionEvidenceLightbox';
+import {
+  ALLOWED_COMPLETION_IMAGE_TYPES,
+  MAX_COMPLETION_IMAGES,
+  MAX_UPLOAD_BYTES,
+} from '../../lib/mediaLimits';
 import { Drawer } from '../ui/Drawer';
 import { Badge, TaskStatusBadge, TaskTypeBadge } from '../ui/Badge';
 import { Button } from '../ui/Button';
 import { ConfirmationDialog } from '../ui/ConfirmationDialog';
-import { Task, TaskHistoryEvent } from '../../types';
+import { Task, TaskCompletionSubmission, TaskHistoryEvent } from '../../types';
 import {
   AUTOMATION_TRIGGER_LABELS,
   RECURRENCE_LABELS,
@@ -32,6 +40,7 @@ import {
   getEffectiveTaskStatus,
 } from '../../lib/taskUtils';
 import { getInitials } from '../../lib/utils';
+import { isEmployeeAssignable } from '../../lib/employeeUtils';
 
 interface TaskDetailDrawerProps {
   task: Task | null;
@@ -98,21 +107,35 @@ const EVENT_META: Record<
     icon: <Pencil className="w-3.5 h-3.5" />,
     dot: 'bg-[#8C867C]',
   },
+  evidence_deleted: {
+    label: 'Evidence image deleted',
+    icon: <Trash2 className="w-3.5 h-3.5" />,
+    dot: 'bg-[#8C867C]',
+  },
 };
 
 /** Evidence photo — hides itself entirely if the file can't be loaded
  *  (stale/deleted uploads must not render a broken-image icon). */
-const EvidenceFigure: React.FC<{ item: { photo: string; at: string; actor: string } }> = ({ item }) => {
+const EvidenceFigure: React.FC<{
+  item: { image_uid?: string | null; photo: string; at: string; actor: string };
+  onOpen: () => void;
+}> = ({ item, onOpen }) => {
   const [failed, setFailed] = useState(false);
   if (failed) return null;
   return (
     <figure className="rounded-[12px] overflow-hidden border border-[#E4DFD5] bg-white">
-      <img
-        src={mediaUrl(item.photo)}
-        alt={`Evidence by ${item.actor}`}
-        className="w-full h-28 object-cover"
-        onError={() => setFailed(true)}
-      />
+      <button
+        type="button"
+        onClick={onOpen}
+        className="block w-full cursor-zoom-in focus:outline-none focus:ring-2 focus:ring-[#386641]"
+      >
+        <img
+          src={mediaUrl(item.photo)}
+          alt={`Evidence by ${item.actor}`}
+          className="w-full h-28 object-cover"
+          onError={() => setFailed(true)}
+        />
+      </button>
       <figcaption className="px-2.5 py-1.5 text-[10px] text-[#6C675F] font-body">
         {item.actor} · {formatEventTime(item.at)}
       </figcaption>
@@ -120,7 +143,7 @@ const EvidenceFigure: React.FC<{ item: { photo: string; at: string; actor: strin
   );
 };
 
-export const TaskDetailDrawer: React.FC<TaskDetailDrawerProps> = ({ task, onClose, onEdit }) => {
+export const TaskDetailDrawer: React.FC<TaskDetailDrawerProps> = ({ task: taskSummary, onClose, onEdit }) => {
   const {
     currentUser,
     employees,
@@ -133,6 +156,7 @@ export const TaskDetailDrawer: React.FC<TaskDetailDrawerProps> = ({ task, onClos
     requestTaskRedo,
     reassignTask,
     deleteTask,
+    deleteTaskCompletionImage,
     addToast,
   } = useApp();
 
@@ -146,7 +170,43 @@ export const TaskDetailDrawer: React.FC<TaskDetailDrawerProps> = ({ task, onClos
   const [reassignMode, setReassignMode] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState(false);
   const [isCompleting, setIsCompleting] = useState(false);
+  const [viewer, setViewer] = useState<{
+    title: string;
+    images: EvidenceImage[];
+    index: number;
+  } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const evidencePhotosRef = useRef(evidencePhotos);
+  evidencePhotosRef.current = evidencePhotos;
+
+  // The tasks list is now a slim payload — history/images/submissions are
+  // loaded on demand when a task is opened. The summary prop renders
+  // instantly while the detail request is in flight; refetch when the
+  // collection entry's lifecycle fields change (mutation refresh).
+  const [taskDetail, setTaskDetail] = useState<Task | null>(null);
+  useEffect(() => {
+    setTaskDetail(null);
+    const uid = taskSummary?.task_uid;
+    if (!uid) return;
+    perfLog(
+      `[DETAIL] task=${uid.slice(0, 8)} status=${taskSummary?.status}` +
+      ` submitted=${taskSummary?.submitted_at ?? '-'} emp=${taskSummary?.employee_uid?.slice(0, 8) ?? '-'}`
+    );
+    let live = true;
+    void tasksApi.getTask(uid)
+      .then((t) => { if (live) setTaskDetail(t); })
+      .catch(() => {});
+    return () => { live = false; };
+  }, [
+    taskSummary?.task_uid, taskSummary?.status, taskSummary?.submitted_at,
+    taskSummary?.completed_at, taskSummary?.employee_uid,
+  ]);
+  const task = taskDetail ?? taskSummary;
+
+  useEffect(
+    () => () => evidencePhotosRef.current.forEach((photo) => URL.revokeObjectURL(photo.previewUrl)),
+    []
+  );
 
   const status = task ? getEffectiveTaskStatus(task) : 'pending';
   const isEmployeeRole = currentUser?.role === 'employee';
@@ -161,24 +221,59 @@ export const TaskDetailDrawer: React.FC<TaskDetailDrawerProps> = ({ task, onClos
     (e) => e.employee_uid === task?.employee_uid || e.employee_uid === task?.assigned_to_uid
   );
 
-  // All photo evidence attached to completion events, newest first
-  const evidenceGallery = useMemo(() => {
-    if (!task?.history) return [] as { photo: string; at: string; actor: string }[];
-    return task.history
-      .filter((h) => h.photos && h.photos.length > 0)
-      .flatMap((h) => h.photos!.map((p) => ({ photo: p, at: h.at, actor: h.actor_name })))
-      .reverse();
+  const evidenceAttempts = useMemo((): TaskCompletionSubmission[] => {
+    if (!task) return [];
+    if (task.completion_submissions?.length) {
+      return [...task.completion_submissions].sort(
+        (a, b) => b.attempt_number - a.attempt_number
+      );
+    }
+    const events = task.history.filter((h) => h.photos?.length);
+    return [...events].reverse().map((event, index) => ({
+      submission_uid: event.event_uid,
+      task_uid: task.task_uid,
+      event_uid: event.event_uid,
+      attempt_number: events.length - index,
+      employee_name: event.actor_name,
+      submitted_at: event.at,
+      status: index === 0 && task.status === 'submitted'
+        ? 'pending'
+        : event.type === 'completed' ? 'approved' : 'disapproved',
+      reviewed_at: undefined,
+      reviewed_by_name: undefined,
+      review_comment: undefined,
+      images: event.photos!.map((url) => ({ url })),
+    }));
   }, [task]);
 
   const handlePhotoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || []);
     if (files.length === 0) return;
-    files.forEach((file) => {
-      if (!file.type.startsWith('image/')) {
+    const accepted = files.slice(
+      0,
+      Math.max(MAX_COMPLETION_IMAGES - evidencePhotos.length, 0)
+    );
+    if (files.length > accepted.length) {
+      addToast({
+        type: 'error',
+        title: 'Too many photos',
+        description: `A submission can include at most ${MAX_COMPLETION_IMAGES} images.`,
+      });
+    }
+    accepted.forEach((file) => {
+      if (!ALLOWED_COMPLETION_IMAGE_TYPES.has(file.type)) {
         addToast({
           type: 'error',
           title: 'Photo upload failed',
-          description: `${file.name} is not an image file.`,
+          description: `${file.name} must be a JPEG, PNG, WebP, or HEIC image.`,
+        });
+        return;
+      }
+      if (file.size > MAX_UPLOAD_BYTES) {
+        addToast({
+          type: 'error',
+          title: 'Photo upload failed',
+          description: `${file.name} exceeds the 10 MB limit.`,
         });
         return;
       }
@@ -212,14 +307,23 @@ export const TaskDetailDrawer: React.FC<TaskDetailDrawerProps> = ({ task, onClos
     if (!task || isCompleting) return;
     setIsCompleting(true);
     try {
-      // Upload evidence photos, then submit for supervisor review
       const urls: string[] = [];
       for (const p of evidencePhotos) {
         const res = await uploadPhoto(p.file);
         urls.push(res.url);
       }
-      await submitTask(task.task_uid, completionNote.trim() || undefined, urls);
-      resetLocal();
+      const submitted = await submitTask(
+        task.task_uid,
+        completionNote.trim() || undefined,
+        urls
+      );
+      if (submitted) resetLocal();
+    } catch (err) {
+      addToast({
+        type: 'error',
+        title: 'Upload Failed',
+        description: err instanceof Error ? err.message : 'Could not upload evidence photos.',
+      });
     } finally {
       setIsCompleting(false);
     }
@@ -312,13 +416,13 @@ export const TaskDetailDrawer: React.FC<TaskDetailDrawerProps> = ({ task, onClos
                 </p>
               </div>
 
-              {task.room_number && (
+              {(task.room_number || task.dorm_name || task.washroom_name) && (
                 <div className="p-3 rounded-[12px] bg-white border border-[#EAE5DC]">
                   <span className="text-[10px] font-semibold text-[#8C867C] uppercase tracking-wider flex items-center gap-1">
-                    <Layers className="w-3 h-3" /> Room
+                    <Layers className="w-3 h-3" /> Resource
                   </span>
                   <p className="text-xs font-medium text-[#24221F] mt-1.5 truncate">
-                    Room {task.room_number}
+                    {task.room_number || task.dorm_name || task.washroom_name}
                   </p>
                 </div>
               )}
@@ -379,16 +483,77 @@ export const TaskDetailDrawer: React.FC<TaskDetailDrawerProps> = ({ task, onClos
               </div>
             )}
 
-            {/* Photo evidence gallery */}
-            {evidenceGallery.length > 0 && (
+            {evidenceAttempts.length > 0 && (
               <div>
                 <h4 className="font-display font-semibold text-sm text-[#24221F] flex items-center gap-2 mb-2.5">
                   <ImageIcon className="w-4 h-4 text-[#386641]" />
-                  Photo Evidence ({evidenceGallery.length})
+                  Completion Evidence
                 </h4>
-                <div className="grid grid-cols-2 gap-2.5">
-                  {evidenceGallery.map((item, i) => (
-                    <EvidenceFigure key={i} item={item} />
+                <div className="space-y-3">
+                  {evidenceAttempts.map((attempt) => (
+                    <div
+                      key={attempt.submission_uid}
+                      className={`rounded-[12px] border p-3 ${
+                        attempt.status === 'pending'
+                          ? 'border-[#B7CFAA] bg-[#F7FAF4]'
+                          : 'border-[#E4DFD5] bg-[#FAF8F5]'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2 flex-wrap">
+                        <div>
+                          <p className="text-xs font-semibold text-[#24221F]">
+                            Attempt {attempt.attempt_number} · {attempt.images.length} image{attempt.images.length === 1 ? '' : 's'}
+                          </p>
+                          <p className="text-[11px] text-[#6C675F] mt-0.5">
+                            {attempt.employee_name || 'Unknown'} · {attempt.submitted_at ? formatEventTime(attempt.submitted_at) : '—'}
+                          </p>
+                          {attempt.reviewed_at && (
+                            <p className="text-[11px] text-[#6C675F] mt-0.5">
+                              Reviewed{attempt.reviewed_by_name ? ` by ${attempt.reviewed_by_name}` : ''} · {formatEventTime(attempt.reviewed_at)}
+                            </p>
+                          )}
+                        </div>
+                        <Badge
+                          variant={attempt.status === 'approved' ? 'sage' : attempt.status === 'disapproved' ? 'red' : 'orange'}
+                          size="sm"
+                        >
+                          {attempt.status === 'approved'
+                            ? 'Approved'
+                            : attempt.status === 'disapproved'
+                              ? 'Disapproved'
+                              : 'Pending Review'}
+                        </Badge>
+                      </div>
+                      {attempt.review_comment && (
+                        <p className="mt-2 text-[11px] text-[#555047] bg-white border border-[#EDE8DE] rounded-[8px] px-2.5 py-1.5">
+                          Review: {attempt.review_comment}
+                        </p>
+                      )}
+                      {attempt.images.length > 0 ? (
+                        <div className="grid grid-cols-2 gap-2.5 mt-2.5">
+                          {attempt.images.map((image, i) => (
+                            <EvidenceFigure
+                              key={image.image_uid || `${attempt.submission_uid}-${i}`}
+                              item={{
+                                image_uid: image.image_uid,
+                                photo: image.url,
+                                at: image.created_at || attempt.submitted_at || task.created_at || '',
+                                actor: image.created_by_name || attempt.employee_name || 'Unknown',
+                              }}
+                              onOpen={() => setViewer({
+                                title: `Completion Evidence — Attempt ${attempt.attempt_number}`,
+                                images: attempt.images,
+                                index: i,
+                              })}
+                            />
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="mt-2 text-[11px] text-[#8A857B]">
+                          No images remain in this submission
+                        </p>
+                      )}
+                    </div>
                   ))}
                 </div>
               </div>
@@ -425,7 +590,7 @@ export const TaskDetailDrawer: React.FC<TaskDetailDrawerProps> = ({ task, onClos
                             {event.photos.map((p, i) => (
                               <img
                                 key={i}
-                                src={p}
+                                src={mediaUrl(p)}
                                 alt="evidence"
                                 className="w-12 h-12 rounded-[8px] object-cover border border-[#E4DFD5]"
                               />
@@ -453,7 +618,7 @@ export const TaskDetailDrawer: React.FC<TaskDetailDrawerProps> = ({ task, onClos
                 <input
                   ref={fileInputRef}
                   type="file"
-                  accept="image/*"
+                  accept="image/jpeg,image/png,image/webp,image/heic,image/heif"
                   multiple
                   className="hidden"
                   onChange={handlePhotoUpload}
@@ -466,11 +631,16 @@ export const TaskDetailDrawer: React.FC<TaskDetailDrawerProps> = ({ task, onClos
                     className="gap-1.5"
                   >
                     <Camera className="w-3.5 h-3.5" />
-                    <span>Add Photo{evidencePhotos.length > 0 ? ` (${evidencePhotos.length})` : ''}</span>
+                    <span>Add Photos</span>
                   </Button>
-                  {evidencePhotos.length === 0 && (
+                  {evidencePhotos.length === 0 ? (
                     <span className="text-[11px] text-[#A34A07] font-medium">
                       Required before submitting
+                    </span>
+                  ) : (
+                    <span className="text-[11px] text-[#6C675F] font-medium">
+                      {evidencePhotos.length} photo{evidencePhotos.length > 1 ? 's' : ''} selected
+                      · max {MAX_COMPLETION_IMAGES}
                     </span>
                   )}
                 </div>
@@ -708,7 +878,7 @@ export const TaskDetailDrawer: React.FC<TaskDetailDrawerProps> = ({ task, onClos
                       <option value="" disabled>
                         Select new assignee…
                       </option>
-                      {currentPropertyEmployees.map((emp) => (
+                      {currentPropertyEmployees.filter(isEmployeeAssignable).map((emp) => (
                         <option key={emp.employee_uid} value={emp.employee_uid}>
                           {emp.name} — {emp.job_title}
                         </option>
@@ -724,6 +894,32 @@ export const TaskDetailDrawer: React.FC<TaskDetailDrawerProps> = ({ task, onClos
           </div>
         )}
       </Drawer>
+
+      {task && viewer && (
+        <CompletionEvidenceLightbox
+          images={viewer.images}
+          initialIndex={viewer.index}
+          title={viewer.title}
+          canDelete={canManage}
+          onClose={() => setViewer(null)}
+          onDelete={async (image) => {
+            if (!image.image_uid) return false;
+            const updated = await deleteTaskCompletionImage(
+              task.task_uid,
+              image.image_uid
+            );
+            if (updated) {
+              setViewer((current) => current && ({
+                ...current,
+                images: current.images.filter(
+                  (i) => i.image_uid !== image.image_uid
+                ),
+              }));
+            }
+            return Boolean(updated);
+          }}
+        />
+      )}
 
       <ConfirmationDialog
         isOpen={deleteConfirm}

@@ -6,24 +6,35 @@ from pydantic import BaseModel, Field
 
 
 class AssignmentConfig(BaseModel):
-    mode: str = "automatic"  # team | individual | automatic
+    # automatic | individual | employees | team | department
+    mode: str = "automatic"
     team: str | None = None               # Housekeeping | Maintenance | …
     employee_uid: uuid.UUID | None = None
+    employee_uids: list[uuid.UUID] = Field(default_factory=list)
+    department: str | None = None
     supervisor_uid: uuid.UUID | None = None
     # zone_round_robin | supervisor — resolved by WorkAllocationService
     method: str | None = "zone_round_robin"
 
 
 class LocationConfig(BaseModel):
-    # property | zone | area | rooms | dorms | beds
+    # property | zone | area | rooms | dorms | beds | washrooms
     scope: str = "property"
     zone_uid: uuid.UUID | None = None
     area_uid: uuid.UUID | None = None
     room_uids: list[uuid.UUID] = Field(default_factory=list)
     dorm_uids: list[uuid.UUID] = Field(default_factory=list)
     bed_uids: list[uuid.UUID] = Field(default_factory=list)
-    # dynamic expansion inside a zone/area: rooms | dorms | beds | units | none
+    washroom_uids: list[uuid.UUID] = Field(default_factory=list)
+    # dynamic expansion inside a zone/area: rooms | dorms | beds | washrooms | units | none
     target: str | None = None
+    # occupancy condition — resolved against the CURRENT open-occupancy
+    # rows at generation time (all | occupied | unoccupied). Applies to
+    # rooms, beds and dorms (dorm occupancy derives from its beds — a dorm
+    # is occupied while at least one of its beds is). `occupied_only` is a
+    # legacy alias for occupancy="occupied".
+    occupancy: str | None = None
+    occupied_only: bool = False
 
 
 class ScheduleConfig(BaseModel):

@@ -26,6 +26,7 @@ import { ZoneWorkspace } from './ZoneWorkspace';
 import { ConfirmationDialog } from '../ui/ConfirmationDialog';
 import { Zone, Area, ZoneType } from '../../types';
 import { ZONE_TYPE_LABELS, ZONE_TYPE_OPTIONS, zoneSupportsUnits } from '../../lib/zoneUtils';
+import { isEmployeeAssignable } from '../../lib/employeeUtils';
 
 export const ZonesView: React.FC = () => {
   const {
@@ -178,7 +179,7 @@ export const ZonesView: React.FC = () => {
     const zoneRooms = currentPropertyRooms.filter((r) => r.zone_uid === zone.zone_uid);
     const zoneDorms = currentPropertyDorms.filter((d) => d.zone_uid === zone.zone_uid);
     const zoneEmployees = currentPropertyEmployees.filter(
-      (e) => e.zone_uid === zone.zone_uid
+      (e) => e.zone_uid === zone.zone_uid && isEmployeeAssignable(e)
     );
 
     const zoneDormBeds = zoneDorms.reduce((acc, d) => acc + d.beds.length, 0);
@@ -490,7 +491,10 @@ export const ZonesView: React.FC = () => {
               zones.some((z) => z.zone_uid === d.zone_uid)
             );
             const areaEmployees = currentPropertyEmployees.filter((e) =>
-              zones.some((z) => z.zone_uid === e.zone_uid)
+              isEmployeeAssignable(e) && (
+                e.area_uid === area.area_uid ||
+                zones.some((z) => z.zone_uid === e.zone_uid)
+              )
             );
             const areaDormBeds = areaDorms.reduce((acc, d) => acc + d.beds.length, 0);
             const areaRoomBeds = areaRooms.reduce((acc, r) => acc + r.bed_count, 0);
@@ -836,7 +840,7 @@ export const ZonesView: React.FC = () => {
           onConfirm={() => deleteZone(zoneToDelete.zone_uid)}
           entityType="Zone"
           entityName={zoneToDelete.name}
-          impactMessage={`Deleting this zone un-assigns all its rooms, dorms, and employees into the Unallocated pool. Their data will NOT be deleted.`}
+          impactMessage={`Deleting this Zone will permanently delete its Rooms, Dorms, Beds, Washrooms and other resources belonging to this Zone. Employees and task/ticket history are kept but unlinked.`}
         />
       )}
 
@@ -848,7 +852,7 @@ export const ZonesView: React.FC = () => {
           onConfirm={() => deleteArea(areaToDelete.area_uid)}
           entityType="Area"
           entityName={areaToDelete.name}
-          impactMessage={`Deleting this Area unlinks all its zones. The zones will remain intact as unassigned to an Area.`}
+          impactMessage={`Deleting this Area will permanently delete its Zones and all resources belonging to those Zones (rooms, dorms, beds, washrooms). Employees and task/ticket history are kept but unlinked.`}
         />
       )}
     </div>

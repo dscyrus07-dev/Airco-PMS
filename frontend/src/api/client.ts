@@ -19,6 +19,8 @@ export const mediaUrl = (p: string) =>
   p.startsWith('http') || !BASE_URL
     ? p
     : `${BASE_URL.replace(/\/api\/v\d+$/, '')}${p}`;
+import { corrForRequest, reqLog } from '../dev/perf';
+
 const TOKEN_KEY = 'mgmt_tool_auth_token';
 const REFRESH_KEY = 'mgmt_tool_refresh_token';
 const DEFAULT_TIMEOUT_MS = 20_000;
@@ -211,6 +213,12 @@ export async function apiFetch<T>(path: string, options: RequestOptions = {}): P
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
+  // dev-only perf instrumentation — mutation correlation + request timing
+  const perfCorr = corrForRequest(method);
+  const perfT0 = performance.now();
+  const perfDone = (status: number | string) =>
+    reqLog(method, url.toString(), perfCorr, performance.now() - perfT0, status);
+
   let response: Response;
   try {
     response = await fetch(url.toString(), {
@@ -220,6 +228,7 @@ export async function apiFetch<T>(path: string, options: RequestOptions = {}): P
       signal: controller.signal,
     });
   } catch (err) {
+    perfDone('ERR');
     if (err instanceof DOMException && err.name === 'AbortError') {
       throw new ApiError(0, 'The request timed out. Please try again.');
     }
@@ -239,6 +248,7 @@ export async function apiFetch<T>(path: string, options: RequestOptions = {}): P
   }
 
   if (!response.ok) {
+    perfDone(response.status);
     let bodyJson: unknown = null;
     try {
       bodyJson = await response.json();
@@ -248,11 +258,17 @@ export async function apiFetch<T>(path: string, options: RequestOptions = {}): P
     throw normalizeError(response.status, bodyJson);
   }
 
-  if (response.status === 204) return undefined as T;
+  if (response.status === 204) {
+    perfDone(204);
+    return undefined as T;
+  }
 
   try {
-    return (await response.json()) as T;
+    const parsed = (await response.json()) as T;
+    perfDone(response.status);
+    return parsed;
   } catch {
+    perfDone(response.status);
     return undefined as T; // empty 200 body
   }
 }

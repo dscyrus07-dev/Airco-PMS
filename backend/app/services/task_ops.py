@@ -19,6 +19,9 @@ from app.models.structure import Room, Zone
 from app.models.task import Task
 from app.models.template import TemplateGeneration, WorkTemplate
 from app.models.user import User, UserRole
+from app.schemas.workspace import (
+    completion_image_out, completion_submission_out,
+)
 from app.services.structure import StructureService, ValidationErr
 from app.services.template import TemplateService, compute_next_run
 
@@ -190,6 +193,7 @@ class TaskOpsService:
             "zone_name": tgt.get("zone_name"),
             "target_label": tgt.get("label"),
             "room_number": tgt.get("room_number"),
+            "washroom_name": tgt.get("washroom_name"),
         }
         if gen_task is not None:
             return {**base, "item_type": "task", "generation_state": "generated",
@@ -227,9 +231,9 @@ class TaskOpsService:
             "priority": t.priority,
             "scheduled_at": t.due_date,
             "zone_name": zone_name,
-            "target_label": (f"Room {t.room_number}" if t.room_number
-                             else t.dorm_name),
-            "room_number": t.room_number or t.dorm_name,
+            "target_label": (t.room_number or t.dorm_name or t.washroom_name),
+            "room_number": t.room_number or t.dorm_name or t.washroom_name,
+            "washroom_name": t.washroom_name,
             "generation_state": "generated",
             **self._task_fields(t),
         }
@@ -271,14 +275,19 @@ class TaskOpsService:
             MaintenanceTicket, MaintenanceTicketAttachment,
             MaintenanceTicketEvent,
         )
-        from app.models.task import TaskHistoryEvent
+        from app.models.task import TaskCompletionSubmission, TaskHistoryEvent
         from sqlalchemy.orm import selectinload
 
         prop = await self._property(user, property_id)
 
         res = await self.session.execute(
             select(Task)
-            .options(selectinload(Task.history))
+            .options(
+                selectinload(Task.history),
+                selectinload(Task.completion_images),
+                selectinload(Task.completion_submissions)
+                .selectinload(TaskCompletionSubmission.images),
+            )
             .where(Task.property_id == prop.id, Task.status == "submitted")
             .order_by(Task.submitted_at)
         )
@@ -286,6 +295,23 @@ class TaskOpsService:
         for t in res.unique().scalars():
             sub = next((e for e in reversed(t.history)
                         if e.type == "submitted"), None)
+            current_submission = next(
+                (s for s in t.completion_submissions
+                 if sub is not None and s.history_event_id == sub.id),
+                None,
+            )
+            images = (
+                current_submission.images
+                if current_submission is not None
+                else [
+                    i for i in t.completion_images
+                    if sub is not None and i.history_event_id == sub.id
+                ]
+            )
+            photo_urls = [i.url for i in images] or (
+                list(sub.photos) if sub and sub.photos else []
+            )
+            events_by_id = {e.id: e for e in t.history}
             items.append({
                 "kind": "task",
                 "uid": str(t.id),
@@ -294,14 +320,23 @@ class TaskOpsService:
                 "priority": t.priority,
                 "status": t.status,
                 "room_uid": str(t.room_id) if t.room_id else None,
-                "room_number": t.room_number or t.dorm_name,
+                "room_number": t.room_number or t.dorm_name or t.washroom_name,
                 "dorm_uid": str(t.dorm_id) if t.dorm_id else None,
                 "dorm_name": t.dorm_name,
                 "bed_uids": list(t.bed_ids) if t.bed_ids else None,
+                "washroom_uid": str(t.washroom_id) if t.washroom_id else None,
+                "washroom_name": t.washroom_name,
                 "employee": t.assigned_to_name,
                 "submitted_at": t.submitted_at.isoformat() if t.submitted_at else None,
                 "note": sub.note if sub else None,
-                "photo_urls": sub.photos if sub and sub.photos else [],
+                "photo_urls": photo_urls,
+                "completion_images": [completion_image_out(i) for i in images],
+                "completion_submissions": [
+                    completion_submission_out(
+                        s, events_by_id.get(s.history_event_id)
+                    )
+                    for s in t.completion_submissions
+                ],
             })
 
         res = await self.session.execute(
@@ -324,7 +359,9 @@ class TaskOpsService:
                 "priority": t.priority,
                 "status": t.status,
                 "room_uid": str(t.room_id) if t.room_id else None,
-                "room_number": t.room_number or t.dorm_name,
+                "room_number": t.room_number or t.dorm_name or t.washroom_name,
+                "washroom_uid": str(t.washroom_id) if t.washroom_id else None,
+                "washroom_name": t.washroom_name,
                 "employee": t.assigned_to_name,
                 "submitted_at": t.resolved_at.isoformat() if t.resolved_at else None,
                 "note": t.resolution_notes,
@@ -370,7 +407,8 @@ class TaskOpsService:
     async def history(self, user: User, *,
                       property_id: uuid.UUID | None = None,
                       date_from=None, date_to=None,
-                      zone_id=None, room_id=None, employee_id=None,
+                      zone_id=None, room_id=None, washroom_id=None,
+                      employee_id=None,
                       status=None, priority=None, task_type=None,
                       source=None, template_id=None, search=None,
                       page=1, page_size=50) -> dict:
@@ -389,6 +427,8 @@ class TaskOpsService:
             q = q.where(Task.zone_id == zone_id)
         if room_id:
             q = q.where(Task.room_id == room_id)
+        if washroom_id:
+            q = q.where(Task.washroom_id == washroom_id)
         if employee_id:
             q = q.where(Task.employee_id == employee_id)
         if status:
@@ -410,6 +450,7 @@ class TaskOpsService:
                 func.lower(Task.ticket_number).like(like),
                 func.lower(Task.assigned_to_name).like(like),
                 func.lower(Task.room_number).like(like),
+                func.lower(Task.washroom_name).like(like),
             ))
 
         count_q = select(func.count()).select_from(q.subquery())
@@ -434,7 +475,8 @@ class TaskOpsService:
             "ticket_number": t.ticket_number,
             "title": t.title,
             "task_type": t.task_type,
-            "room_number": t.room_number or t.dorm_name,
+            "room_number": t.room_number or t.dorm_name or t.washroom_name,
+            "washroom_name": t.washroom_name,
             "zone_name": zmap.get(t.zone_id),
             "assigned_to": t.assigned_to_name,
             "generated_at": t.created_at.isoformat() if t.created_at else None,

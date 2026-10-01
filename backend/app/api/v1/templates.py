@@ -169,5 +169,12 @@ async def generate_due(
     session: AsyncSession = Depends(get_db),
 ):
     """Scheduler tick — also invoked by the background loop; exposed here so
-    ops/tests can force a generation cycle. Idempotent via the ledger."""
-    return await TemplateService(session).run_due()
+    ops/tests can force a generation cycle. Idempotent via the ledger.
+    Scoped to the caller's tenant: a manual trigger can never generate work
+    for another company/property."""
+    from app.models.user import UserRole
+
+    return await TemplateService(session).run_due(
+        company_id=user.company_id if user.role == UserRole.SUPER_ADMIN else None,
+        property_id=None if user.role == UserRole.SUPER_ADMIN else user.property_id,
+    )

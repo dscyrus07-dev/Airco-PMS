@@ -7,12 +7,15 @@ assigned property (property_manager/employee).
 import uuid
 
 from fastapi import APIRouter, Depends, Query, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.core.database import get_db
 from app.core.exceptions import AppError
 from app.dependencies.auth import (
     get_current_user,
+    require_employee,
     require_property_manager,
     require_super_admin,
 )
@@ -33,8 +36,9 @@ from app.schemas.structure import (
     AllocationRequest,
     AreaCreateRequest,
     AreaUpdateRequest,
-    BedStatusUpdateRequest,
     BulkUnitStatusRequest,
+    CheckInRequest,
+    DormBulkCreateRequest,
     DormCreateRequest,
     DormUpdateRequest,
     EmployeeAllocationRequest,
@@ -53,6 +57,11 @@ from app.schemas.structure import (
     TaskRejectRequest,
     TaskSubmitRequest,
     TaskUpdateRequest,
+    ResourceTransitionRequest,
+    WashroomBulkCreateRequest,
+    WashroomCreateRequest,
+    WashroomFixtureUpdateRequest,
+    WashroomUpdateRequest,
     ZoneCreateRequest,
     ZoneUpdateRequest,
 )
@@ -105,6 +114,24 @@ async def create_property(
     """Create a property and its Property Manager account atomically."""
     prop = await PropertyService(session).create_property(user, payload)
     return ws.property_out(prop)
+
+
+@router.get("/properties/{property_id}/reconciliation")
+async def reconcile_resource_state(
+    property_id: uuid.UUID,
+    user: User = Depends(require_property_manager),
+    session: AsyncSession = Depends(get_db),
+):
+    """Read-only integrity scan — reports orphan/contradictory resource
+    states (spec §43/§44). It never repairs; corrections go through the
+    transition API."""
+    from app.services.reconciliation import reconcile_property
+
+    prop = await StructureService(session)._property_for_write(
+        user, property_id
+    )
+    findings = await reconcile_property(session, prop.id)
+    return {"property_id": str(prop.id), "findings": findings}
 
 
 @router.get("/properties/{property_id}")
@@ -161,7 +188,7 @@ async def list_rooms(
         status=status_,
         search=search,
     )
-    res["items"] = [ws.room_out(r) for r in res["items"]]
+    res["items"] = await ws.rooms_payload(session, res["items"])
     return res
 
 
@@ -175,7 +202,27 @@ async def list_dorms(
     res = await WorkspaceRepository(session).list_dorms(
         user, property_id=_uid(property_uid), zone_id=_uid(zone_uid)
     )
-    res["items"] = [ws.dorm_out(d) for d in res["items"]]
+    res["items"] = await ws.dorms_payload(session, res["items"])
+    return res
+
+
+@router.get("/washrooms")
+async def list_washrooms(
+    property_uid: str | None = Query(default=None),
+    zone_uid: str | None = Query(default=None),
+    status_: str | None = Query(default=None, alias="status"),
+    search: str | None = Query(default=None),
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+):
+    res = await WorkspaceRepository(session).list_washrooms(
+        user,
+        property_id=_uid(property_uid),
+        zone_id=_uid(zone_uid),
+        status=status_,
+        search=search,
+    )
+    res["items"] = [ws.washroom_out(w) for w in res["items"]]
     return res
 
 
@@ -225,7 +272,40 @@ async def list_tasks(
         page=page,
         limit=limit,
     )
-    res["items"] = [ws.task_out(t) for t in res["items"]]
+    tasks = res["items"]
+    from app.models.structure import Dorm, Room, Washroom, Zone
+    zone_ids = {t.zone_id for t in tasks if t.zone_id}
+    room_ids = {t.room_id for t in tasks if t.room_id}
+    dorm_ids = {t.dorm_id for t in tasks if t.dorm_id}
+    washroom_ids = {t.washroom_id for t in tasks if t.washroom_id}
+    zones = {
+        z.id: z for z in (await session.execute(
+            select(Zone).where(Zone.id.in_(zone_ids))
+        )).scalars()
+    } if zone_ids else {}
+    rooms = {
+        r.id: r for r in (await session.execute(
+            select(Room).where(Room.id.in_(room_ids))
+        )).scalars()
+    } if room_ids else {}
+    dorms = {
+        d.id: d for d in (await session.execute(
+            select(Dorm).where(Dorm.id.in_(dorm_ids))
+        )).scalars()
+    } if dorm_ids else {}
+    washrooms = {
+        w.id: w for w in (await session.execute(
+            select(Washroom).where(Washroom.id.in_(washroom_ids))
+        )).scalars()
+    } if washroom_ids else {}
+    for task in tasks:
+        zone = zones.get(task.zone_id)
+        unit = rooms.get(task.room_id) or dorms.get(task.dorm_id) \
+            or washrooms.get(task.washroom_id)
+        task._resolved_area_id = zone.area_id if zone and zone.area_id else (
+            unit.area_id if unit else None
+        )
+    res["items"] = [ws.task_out(t) for t in tasks]
     return res
 
 
@@ -248,6 +328,7 @@ async def tasks_history(
     date_to: str | None = Query(default=None),
     zone_uid: str | None = Query(default=None),
     room_uid: str | None = Query(default=None),
+    washroom_uid: str | None = Query(default=None),
     employee_uid: str | None = Query(default=None),
     status_: str | None = Query(default=None, alias="status"),
     priority: str | None = Query(default=None),
@@ -275,6 +356,7 @@ async def tasks_history(
         property_id=_uid(property_uid),
         date_from=_d(date_from), date_to=_d(date_to),
         zone_id=_uid(zone_uid), room_id=_uid(room_uid),
+        washroom_id=_uid(washroom_uid),
         employee_id=_uid(employee_uid),
         status=status_, priority=priority, task_type=task_type,
         source=source, template_id=_uid(template_uid), search=search,
@@ -373,7 +455,9 @@ async def create_room(
     user: User = Staff,
     session: AsyncSession = Depends(get_db),
 ):
-    return ws.room_out(await StructureService(session).create_room(user, payload))
+    return await ws.room_payload(
+        session, await StructureService(session).create_room(user, payload)
+    )
 
 
 @router.post("/rooms/bulk", status_code=status.HTTP_201_CREATED)
@@ -384,7 +468,7 @@ async def bulk_create_rooms(
 ):
     res = await StructureService(session).bulk_create_rooms(user, payload)
     return {
-        "created": [ws.room_out(r) for r in res["created"]],
+        "created": await ws.rooms_payload(session, res["created"]),
         "errors": res["errors"],
     }
 
@@ -405,8 +489,9 @@ async def update_room(
     user: User = Staff,
     session: AsyncSession = Depends(get_db),
 ):
-    return ws.room_out(
-        await StructureService(session).update_room(user, room_id, payload)
+    return await ws.room_payload(
+        session,
+        await StructureService(session).update_room(user, room_id, payload),
     )
 
 
@@ -422,7 +507,7 @@ async def allocate_room(
     room = await StructureService(session).allocate_unit(
         user, Room, room_id, payload.area_uid, payload.zone_uid
     )
-    return ws.room_out(room)
+    return await ws.room_payload(session, room)
 
 
 @router.delete("/rooms/{room_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -442,7 +527,22 @@ async def create_dorm(
     user: User = Staff,
     session: AsyncSession = Depends(get_db),
 ):
-    return ws.dorm_out(await StructureService(session).create_dorm(user, payload))
+    return await ws.dorm_payload(
+        session, await StructureService(session).create_dorm(user, payload)
+    )
+
+
+@router.post("/dorms/bulk", status_code=status.HTTP_201_CREATED)
+async def bulk_create_dorms(
+    payload: DormBulkCreateRequest,
+    user: User = Staff,
+    session: AsyncSession = Depends(get_db),
+):
+    res = await StructureService(session).bulk_create_dorms(user, payload)
+    return {
+        "created": await ws.dorms_payload(session, res["created"]),
+        "errors": res["errors"],
+    }
 
 
 @router.patch("/dorms/{dorm_id}")
@@ -452,8 +552,9 @@ async def update_dorm(
     user: User = Staff,
     session: AsyncSession = Depends(get_db),
 ):
-    return ws.dorm_out(
-        await StructureService(session).update_dorm(user, dorm_id, payload)
+    return await ws.dorm_payload(
+        session,
+        await StructureService(session).update_dorm(user, dorm_id, payload),
     )
 
 
@@ -469,7 +570,7 @@ async def allocate_dorm(
     dorm = await StructureService(session).allocate_unit(
         user, Dorm, dorm_id, payload.area_uid, payload.zone_uid
     )
-    return ws.dorm_out(dorm)
+    return await ws.dorm_payload(session, dorm)
 
 
 @router.delete("/dorms/{dorm_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -487,7 +588,11 @@ async def dorm_checkout(
     user: User = Staff,
     session: AsyncSession = Depends(get_db),
 ):
-    return ws.dorm_out(await StructureService(session).dorm_checkout(user, dorm_id))
+    res = await StructureService(session).dorm_checkout(user, dorm_id)
+    return {
+        **await ws.dorm_payload(session, res["dorm"]),
+        "generated_tasks": [ws.task_out(t) for t in res["generated"]],
+    }
 
 
 @router.post("/dorms/{dorm_id}/mark-cleaning")
@@ -496,22 +601,225 @@ async def dorm_mark_cleaning(
     user: User = Staff,
     session: AsyncSession = Depends(get_db),
 ):
-    return ws.dorm_out(
-        await StructureService(session).dorm_mark_cleaning(user, dorm_id)
+    return await ws.dorm_payload(
+        session,
+        await StructureService(session).dorm_mark_cleaning(user, dorm_id),
     )
 
 
-@router.patch("/beds/{bed_id}/status")
-async def update_bed_status(
-    bed_id: uuid.UUID,
-    payload: BedStatusUpdateRequest,
+@router.post("/dorms/{dorm_id}/mark-cleaned")
+async def dorm_mark_cleaned(
+    dorm_id: uuid.UUID,
+    user: User = Depends(require_super_admin),
+    session: AsyncSession = Depends(get_db),
+):
+    return await ws.dorm_payload(
+        session,
+        await StructureService(session).dorm_mark_cleaned(user, dorm_id),
+    )
+
+
+# --- Occupancy commands — OCCUPIED is a business state backed by an
+# `occupancies` row, never a raw status write (spec §11/§26) --------------
+
+@router.post("/rooms/{room_id}/check-in")
+async def room_check_in(
+    room_id: uuid.UUID,
+    payload: CheckInRequest,
     user: User = Staff,
     session: AsyncSession = Depends(get_db),
 ):
-    dorm = await StructureService(session).update_bed_status(
-        user, bed_id, payload.status, payload.guest_name
+    from app.services.occupancy import OccupancyService
+    room = await OccupancyService(session).check_in_room(
+        user, room_id, payload.guest_name
     )
-    return ws.dorm_out(dorm)
+    return await ws.room_payload(session, room)
+
+
+@router.post("/rooms/{room_id}/check-out")
+async def room_check_out(
+    room_id: uuid.UUID,
+    user: User = Staff,
+    session: AsyncSession = Depends(get_db),
+):
+    from app.services.occupancy import OccupancyService
+    res = await OccupancyService(session).check_out_room(user, room_id)
+    return {
+        **await ws.room_payload(session, res["room"]),
+        "generated_tasks": [ws.task_out(t) for t in res["generated"]],
+    }
+
+
+@router.post("/beds/{bed_id}/check-in")
+async def bed_check_in(
+    bed_id: uuid.UUID,
+    payload: CheckInRequest,
+    user: User = Staff,
+    session: AsyncSession = Depends(get_db),
+):
+    from app.services.occupancy import OccupancyService
+    dorm = await OccupancyService(session).check_in_bed(
+        user, bed_id, payload.guest_name
+    )
+    return await ws.dorm_payload(session, dorm)
+
+
+@router.post("/beds/{bed_id}/check-out")
+async def bed_check_out(
+    bed_id: uuid.UUID,
+    user: User = Staff,
+    session: AsyncSession = Depends(get_db),
+):
+    from app.services.occupancy import OccupancyService
+    res = await OccupancyService(session).check_out_bed(user, bed_id)
+    return {
+        **await ws.dorm_payload(session, res["dorm"]),
+        "generated_tasks": [ws.task_out(t) for t in res["generated"]],
+    }
+
+
+@router.post("/resources/{resource_type}/{resource_id}/transition")
+async def resource_transition(
+    resource_type: str,
+    resource_id: uuid.UUID,
+    payload: ResourceTransitionRequest,
+    user: User = Depends(require_super_admin),
+    session: AsyncSession = Depends(get_db),
+):
+    """Super Admin administrative transition — legal-transition validation
+    applies; ADMIN_OVERRIDE events are recorded with the mandatory reason."""
+    from app.domain.resource_events import SRC_ADMIN_OVERRIDE
+    from app.models.property import Property
+    from app.services.resource_state import ResourceStateService
+
+    svc = ResourceStateService(session)
+    row, prev, new = await svc.transition(
+        resource_type, resource_id, payload.to, user=user,
+        source=SRC_ADMIN_OVERRIDE, reason=payload.reason,
+    )
+    prop = await session.get(Property, row.property_id)
+    if prop is None or prop.company_id != user.company_id:
+        raise NotFound()
+    await session.commit()
+    return {
+        "resource_type": resource_type,
+        "resource_id": str(resource_id),
+        "previous_state": prev,
+        "new_state": new,
+    }
+
+
+@router.post("/resources/{resource_type}/{resource_id}/repair")
+async def resource_repair(
+    resource_type: str,
+    resource_id: uuid.UUID,
+    user: User = Depends(require_super_admin),
+    session: AsyncSession = Depends(get_db),
+):
+    """Super Admin reconciliation-repair — rewrites the materialized
+    status to the canonical projection (occupancy + blockers) with a
+    `state_reconciliation` audit event. Never deletes occupancy, task or
+    ticket records."""
+    from app.models.property import Property
+    from app.services.resource_state import ResourceStateService
+
+    result = await ResourceStateService(session).repair(
+        resource_type, resource_id, user=user,
+    )
+    await session.commit()
+    return result
+
+
+# ------------------------------- Washrooms --------------------------------
+
+@router.post("/washrooms", status_code=status.HTTP_201_CREATED)
+async def create_washroom(
+    payload: WashroomCreateRequest,
+    user: User = Staff,
+    session: AsyncSession = Depends(get_db),
+):
+    return ws.washroom_out(
+        await StructureService(session).create_washroom(user, payload)
+    )
+
+
+@router.post("/washrooms/bulk", status_code=status.HTTP_201_CREATED)
+async def bulk_create_washrooms(
+    payload: WashroomBulkCreateRequest,
+    user: User = Staff,
+    session: AsyncSession = Depends(get_db),
+):
+    res = await StructureService(session).bulk_create_washrooms(user, payload)
+    return {
+        "created": [ws.washroom_out(w) for w in res["created"]],
+        "errors": res["errors"],
+    }
+
+
+@router.get("/washrooms/{washroom_id}")
+async def get_washroom(
+    washroom_id: uuid.UUID,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+):
+    from app.models.structure import Washroom
+
+    washroom, _ = await StructureService(session)._get(
+        Washroom, washroom_id, user,
+        options=[selectinload(Washroom.fixtures)],
+    )
+    return ws.washroom_out(washroom)
+
+
+@router.patch("/washrooms/{washroom_id}")
+async def update_washroom(
+    washroom_id: uuid.UUID,
+    payload: WashroomUpdateRequest,
+    user: User = Staff,
+    session: AsyncSession = Depends(get_db),
+):
+    return ws.washroom_out(
+        await StructureService(session).update_washroom(
+            user, washroom_id, payload
+        )
+    )
+
+
+@router.patch("/washrooms/{washroom_id}/allocation")
+async def allocate_washroom(
+    washroom_id: uuid.UUID,
+    payload: AllocationRequest,
+    user: User = Staff,
+    session: AsyncSession = Depends(get_db),
+):
+    washroom = await StructureService(session).allocate_washroom(
+        user, washroom_id, payload.area_uid, payload.zone_uid
+    )
+    return ws.washroom_out(washroom)
+
+
+@router.patch("/washrooms/{washroom_id}/fixtures/{fixture_id}")
+async def update_washroom_fixture(
+    washroom_id: uuid.UUID,
+    fixture_id: uuid.UUID,
+    payload: WashroomFixtureUpdateRequest,
+    user: User = Depends(require_super_admin),
+    session: AsyncSession = Depends(get_db),
+):
+    return ws.washroom_out(
+        await StructureService(session).update_fixture(
+            user, washroom_id, fixture_id, payload.status
+        )
+    )
+
+
+@router.delete("/washrooms/{washroom_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_washroom(
+    washroom_id: uuid.UUID,
+    user: User = Staff,
+    session: AsyncSession = Depends(get_db),
+):
+    await StructureService(session).delete_washroom(user, washroom_id)
 
 
 @router.post("/units/bulk-status")
@@ -522,8 +830,9 @@ async def bulk_unit_status(
 ):
     res = await StructureService(session).bulk_unit_status(user, payload)
     return {
-        "rooms": [ws.room_out(r) for r in res["rooms"]],
-        "dorms": [ws.dorm_out(d) for d in res["dorms"]],
+        "rooms": await ws.rooms_payload(session, res["rooms"]),
+        "dorms": await ws.dorms_payload(session, res["dorms"]),
+        "washrooms": [ws.washroom_out(w) for w in res["washrooms"]],
         "generated_tasks": [ws.task_out(t) for t in res["generated_tasks"]],
         "skipped_blocked": res["skipped_blocked"],
     }
@@ -595,6 +904,17 @@ async def deactivate_employee(
     )
 
 
+@router.post("/employees/{employee_id}/reactivate")
+async def reactivate_employee(
+    employee_id: uuid.UUID,
+    user: User = Staff,
+    session: AsyncSession = Depends(get_db),
+):
+    return ws.employee_out(
+        await EmployeeService(session).reactivate(user, employee_id)
+    )
+
+
 @router.delete("/employees/{employee_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_employee(
     employee_id: uuid.UUID,
@@ -613,6 +933,18 @@ async def create_task(
     session: AsyncSession = Depends(get_db),
 ):
     return ws.task_out(await TaskService(session).create_task(user, payload))
+
+
+@router.get("/tasks/{task_id}")
+async def get_task(
+    task_id: uuid.UUID,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+):
+    """Task detail — history, completion images and submissions eager-loaded.
+    The list payload intentionally omits those collections; the Detail
+    Drawer calls this endpoint when a task is opened."""
+    return ws.task_out(await TaskService(session).get_task(user, task_id))
 
 
 @router.patch("/tasks/{task_id}")
@@ -721,6 +1053,18 @@ async def reject_task(
     )
 
 
+@router.delete("/tasks/{task_id}/completion-images/{image_id}")
+async def delete_task_completion_image(
+    task_id: uuid.UUID,
+    image_id: uuid.UUID,
+    user: User = Staff,
+    session: AsyncSession = Depends(get_db),
+):
+    return ws.task_out(
+        await TaskService(session).delete_completion_image(user, task_id, image_id)
+    )
+
+
 @router.post("/tasks/{task_id}/reopen")
 async def reopen_task(
     task_id: uuid.UUID,
@@ -738,18 +1082,33 @@ async def reopen_task(
 @router.post("/maintenance", status_code=status.HTTP_201_CREATED)
 async def create_maintenance_ticket(
     payload: MaintenanceCreateRequest,
-    user: User = Staff,
+    user: User = Depends(require_employee),
     session: AsyncSession = Depends(get_db),
 ):
+    """Managers/admins raise tickets anywhere; EMPLOYEE callers are
+    restricted to locations inside their zone/area coverage — enforced
+    in the service, not the frontend."""
     return ticket_out(
         await MaintenanceService(session).create_ticket(user, payload)
     )
+
+
+@router.get("/maintenance/eligible-locations")
+async def maintenance_eligible_locations(
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+):
+    """Employee-facing: rooms/dorms inside the caller's zone/area coverage.
+    Returns empty lists when the employee has no assignment — never a
+    full-property fallback."""
+    return await MaintenanceService(session).eligible_locations(user)
 
 
 @router.get("/maintenance")
 async def list_maintenance(
     property_uid: str | None = Query(default=None),
     room_uid: str | None = Query(default=None),
+    washroom_uid: str | None = Query(default=None),
     assigned_to: str | None = Query(default=None),
     status_: str | None = Query(default=None, alias="status"),
     priority: str | None = Query(default=None),
@@ -761,6 +1120,7 @@ async def list_maintenance(
         user,
         property_id=_uid(property_uid),
         room_id=_uid(room_uid),
+        washroom_id=_uid(washroom_uid),
         assigned_to=_uid(assigned_to),
         status_=status_,
         priority=priority,
@@ -790,6 +1150,15 @@ async def update_maintenance_ticket(
     return ticket_out(
         await MaintenanceService(session).update_ticket(user, ticket_id, payload)
     )
+
+
+@router.delete("/maintenance/{ticket_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_maintenance_ticket(
+    ticket_id: uuid.UUID,
+    user: User = Staff,
+    session: AsyncSession = Depends(get_db),
+):
+    await MaintenanceService(session).delete_ticket(user, ticket_id)
 
 
 @router.post("/maintenance/{ticket_id}/assign")
@@ -860,6 +1229,18 @@ async def close_maintenance_ticket(
     session: AsyncSession = Depends(get_db),
 ):
     return ticket_out(await MaintenanceService(session).close(user, ticket_id))
+
+
+@router.get("/washrooms/{washroom_id}/maintenance")
+async def washroom_maintenance_history(
+    washroom_id: uuid.UUID,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+):
+    tickets = await MaintenanceService(session).washroom_history(
+        user, washroom_id
+    )
+    return {"items": [ticket_out(t) for t in tickets], "total": len(tickets)}
 
 
 @router.get("/rooms/{room_id}/maintenance")

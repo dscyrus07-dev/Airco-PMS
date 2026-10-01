@@ -1,7 +1,8 @@
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { useApp } from '../../context/AppContext';
 import { Modal } from '../ui/Modal';
 import { Button } from '../ui/Button';
+import { AlertTriangle } from 'lucide-react';
 import { zoneSupportsUnits } from '../../lib/zoneUtils';
 
 interface CreateDormModalProps {
@@ -9,21 +10,36 @@ interface CreateDormModalProps {
   onClose: () => void;
 }
 
-export const CreateDormModal: React.FC<CreateDormModalProps> = ({ isOpen, onClose }) => {
-  const { createDorm, currentPropertyZones } = useApp();
+export const DORM_TYPES = ['Mixed Dorm', 'Female Dorm', 'Male Dorm'] as const;
+export const WASHROOM_TYPES = [
+  'Attached Washroom',
+  'Shared Washroom',
+  'No Washroom',
+] as const;
 
-  const [name, setName] = useState('Dorm 104');
+export const CreateDormModal: React.FC<CreateDormModalProps> = ({ isOpen, onClose }) => {
+  const { createDorm, currentPropertyZones, currentPropertyDorms } = useApp();
+
+  const [name, setName] = useState('');
   const [bedCount, setBedCount] = useState<number>(6);
-  const [dormType, setDormType] = useState<'Mixed Dorm' | 'Female Dorm' | 'Male Dorm'>('Mixed Dorm');
-  const [washroom, setWashroom] = useState<'Attached Washroom' | 'Shared Washroom' | 'No Washroom'>('Attached Washroom');
+  const [dormType, setDormType] = useState<(typeof DORM_TYPES)[number]>('Mixed Dorm');
+  const [washroom, setWashroom] = useState<(typeof WASHROOM_TYPES)[number]>('Attached Washroom');
   const [areaSqft, setAreaSqft] = useState('320');
   const [zoneUid, setZoneUid] = useState('');
   const [description, setDescription] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
 
+  // Instant name-conflict feedback — the backend enforces the same rule (409)
+  const nameTaken = useMemo(() => {
+    const n = name.trim().toLowerCase();
+    return n !== '' && currentPropertyDorms.some(
+      (d) => d.name.toLowerCase().trim() === n
+    );
+  }, [name, currentPropertyDorms]);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!name.trim() || bedCount <= 0 || isSubmitting) return;
+    if (!name.trim() || bedCount <= 0 || nameTaken || isSubmitting) return;
 
     setIsSubmitting(true);
     try {
@@ -66,8 +82,18 @@ export const CreateDormModal: React.FC<CreateDormModalProps> = ({ isOpen, onClos
             value={name}
             onChange={(e) => setName(e.target.value)}
             placeholder="e.g. Dorm 104 (Lotus Quarters)"
-            className="w-full px-3.5 py-2 bg-[#FAF8F5] border border-[#DDD7CB] rounded-[10px] text-sm text-[#24221F] focus:outline-none focus:ring-2 focus:ring-[#386641]"
+            className={`w-full px-3.5 py-2 bg-[#FAF8F5] border rounded-[10px] text-sm text-[#24221F] focus:outline-none focus:ring-2 ${
+              nameTaken
+                ? 'border-[#E5A3A3] focus:ring-[#C53B3B]'
+                : 'border-[#DDD7CB] focus:ring-[#386641]'
+            }`}
           />
+          {nameTaken && (
+            <p className="text-[11px] text-[#A82828] font-body mt-1 flex items-center gap-1">
+              <AlertTriangle className="w-3 h-3 shrink-0" />
+              A dorm named "{name.trim()}" already exists in this property.
+            </p>
+          )}
         </div>
 
         <div className="grid grid-cols-2 gap-3.5">
@@ -98,9 +124,11 @@ export const CreateDormModal: React.FC<CreateDormModalProps> = ({ isOpen, onClos
               onChange={(e) => setDormType(e.target.value as any)}
               className="w-full px-3.5 py-2 bg-[#FAF8F5] border border-[#DDD7CB] rounded-[10px] text-sm text-[#24221F] focus:outline-none focus:ring-2 focus:ring-[#386641]"
             >
-              <option value="Mixed Dorm">Mixed Dorm</option>
-              <option value="Female Dorm">Female Dorm</option>
-              <option value="Male Dorm">Male Dorm</option>
+              {DORM_TYPES.map((t) => (
+                <option key={t} value={t}>
+                  {t}
+                </option>
+              ))}
             </select>
           </div>
         </div>
@@ -115,9 +143,11 @@ export const CreateDormModal: React.FC<CreateDormModalProps> = ({ isOpen, onClos
               onChange={(e) => setWashroom(e.target.value as any)}
               className="w-full px-3.5 py-2 bg-[#FAF8F5] border border-[#DDD7CB] rounded-[10px] text-sm text-[#24221F] focus:outline-none focus:ring-2 focus:ring-[#386641]"
             >
-              <option value="Attached Washroom">Attached Washroom</option>
-              <option value="Shared Washroom">Shared Washroom</option>
-              <option value="No Washroom">No Washroom</option>
+              {WASHROOM_TYPES.map((w) => (
+                <option key={w} value={w}>
+                  {w}
+                </option>
+              ))}
             </select>
           </div>
 
@@ -169,7 +199,7 @@ export const CreateDormModal: React.FC<CreateDormModalProps> = ({ isOpen, onClos
           <Button type="button" variant="outline" onClick={onClose} disabled={isSubmitting}>
             Cancel
           </Button>
-          <Button type="submit" variant="primary" isLoading={isSubmitting}>
+          <Button type="submit" variant="primary" disabled={nameTaken} isLoading={isSubmitting}>
             Create Dorm & {bedCount} Beds
           </Button>
         </div>

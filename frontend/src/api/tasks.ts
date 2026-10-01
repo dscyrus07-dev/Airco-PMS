@@ -27,6 +27,12 @@ export async function listTasks(params: TaskListParams = {}): Promise<ListRespon
   return apiFetch<ListResponse<Task>>('/tasks', { query: params });
 }
 
+/** Full task detail — history, completion images and submissions.
+ * The list endpoint returns a slim shape; fetch this when opening a task. */
+export async function getTask(task_uid: string): Promise<Task> {
+  return apiFetch<Task>(`/tasks/${task_uid}`);
+}
+
 export async function createTask(req: TaskCreateRequest): Promise<Task> {
   return apiFetch<Task>('/tasks', { method: 'POST', body: req });
 }
@@ -98,6 +104,17 @@ export async function rejectTask(task_uid: string, reason: string): Promise<Task
     method: 'POST',
     body: { reason } satisfies TaskRejectRequest,
   });
+}
+
+/** Staff-only — removes one task evidence object without changing review state. */
+export async function deleteTaskCompletionImage(
+  task_uid: string,
+  image_uid: string
+): Promise<Task> {
+  return apiFetch<Task>(
+    `/tasks/${task_uid}/completion-images/${image_uid}`,
+    { method: 'DELETE' }
+  );
 }
 
 /** Reopen a completed/cancelled/rejected task. */

@@ -7,6 +7,7 @@ Docs: http://localhost:8000/docs
 
 import asyncio
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -38,10 +39,47 @@ logger = get_logger("app.main")
 _DB_STARTUP_ATTEMPTS = 3
 _DB_STARTUP_RETRY_DELAY = 2.0
 
+_ALEMBIC_INI = Path(__file__).resolve().parents[1] / "alembic.ini"
+
+
+async def check_schema_version() -> str | None:
+    """Compare the database's alembic_version with the script head.
+
+    A reachable-but-stale database is the silent-killer failure: every
+    query against a missing column surfaces as an unrelated 503. Returns
+    None when current, else a human-readable remediation string."""
+    from alembic.config import Config as AlembicConfig
+    from alembic.script import ScriptDirectory
+    from sqlalchemy import text
+
+    if not _ALEMBIC_INI.exists():
+        return None  # no migration config — nothing to compare
+    try:
+        cfg = AlembicConfig(str(_ALEMBIC_INI))
+        heads = set(ScriptDirectory.from_config(cfg).get_heads())
+        async with AsyncSessionLocal() as session:
+            rows = await session.execute(
+                text("SELECT version_num FROM alembic_version")
+            )
+            current = {r[0] for r in rows}
+    except Exception as exc:
+        return f"could not read schema version ({describe_db_error(exc)}) — run `alembic upgrade head`"
+    if current != heads:
+        return (
+            f"database schema is stale (at {sorted(current) or '[]'}, head is "
+            f"{sorted(heads)}) — run `alembic upgrade head`"
+        )
+    return None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting %s (%s)", settings.APP_NAME, settings.APP_ENV)
+    logger.info(
+        "Environment: %s | API prefix: %s | CORS origins: %s",
+        settings.APP_ENV, settings.API_V1_PREFIX,
+        ",".join(settings.cors_origins) or "(none)",
+    )
 
     # Fail fast on hard misconfiguration in production — a prod boot with no
     # JWT secret or no database is worse than no boot at all.
@@ -73,6 +111,14 @@ async def lifespan(app: FastAPI):
         # Server stays up so /health + diagnostics keep working; every
         # DB-backed route will report a real 503 until connectivity returns.
         logger.error("Database connection failed at startup: %s", last_error)
+    else:
+        # Schema drift check — a reachable DB on an old revision produces
+        # exactly the "endpoint 503s for no obvious reason" failure mode.
+        # Refuse to serve rather than boot half-broken.
+        stale = await check_schema_version()
+        if stale:
+            logger.error("FATAL: %s", stale)
+            raise RuntimeError(f"Database schema out of date: {stale}")
 
     # Scheduler ownership: embedded loop in dev/single-process mode; the arq
     # worker's cron owns it in production so the API stays stateless and
@@ -107,6 +153,7 @@ def _start_template_scheduler():
         from app.services.task import TaskService
         from app.services.template import TemplateService
         consecutive_failures = 0
+        ticks = 0
         while True:
             try:
                 async with AsyncSessionLocal() as session:
@@ -117,6 +164,36 @@ def _start_template_scheduler():
                     rep = await TaskService(session).run_due_repetitive()
                     if rep["generated"]:
                         logger.info("Repetitive-task scheduler: %s", rep)
+                ticks += 1
+                if ticks % 15 == 0:
+                    # state reconciliation sweep — detect + log, never
+                    # silently rewrite (repair is a deliberate SA action)
+                    from app.services.reconciliation import (
+                        reconcile_property,
+                    )
+                    from sqlalchemy import select
+
+                    from app.models.property import Property
+                    async with AsyncSessionLocal() as session:
+                        for pid in (await session.execute(
+                            select(Property.id)
+                        )).scalars():
+                            findings = await reconcile_property(session, pid)
+                            actionable = [
+                                f for f in findings
+                                if f.get("severity") != "info"
+                            ]
+                            if actionable:
+                                logger.warning(
+                                    "State reconciliation — property %s: "
+                                    "%d finding(s): %s", pid,
+                                    len(actionable),
+                                    [
+                                        f"{f['issue']} "
+                                        f"{f['resource_type']}:{f['label']}"
+                                        for f in actionable
+                                    ],
+                                )
                 if consecutive_failures:
                     logger.info("Template scheduler recovered after %d failed tick(s)", consecutive_failures)
                 consecutive_failures = 0
@@ -171,8 +248,6 @@ register_exception_handlers(app)
 # Serve /uploads unconditionally — rows created under local storage carry
 # relative /uploads/* URLs, and the mount resolves them whenever the files
 # exist on this host's disk (object-storage backends return absolute URLs).
-from pathlib import Path  # noqa: E402
-
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 
 from app.core.storage import LocalStorage  # noqa: E402
@@ -221,6 +296,12 @@ async def api_health() -> JSONResponse:
         status_["redis"] = "connected" if await check_redis() else "unreachable"
         if status_["redis"] == "unreachable":
             status_["status"] = "degraded"  # queue/limiter impaired
+    if status_["database"] == "connected":
+        stale = await check_schema_version()
+        status_["schema"] = "current" if stale is None else "stale"
+        if stale is not None:
+            status_["status"] = "degraded"
+            status_["schema_detail"] = stale
     return JSONResponse(
         status_code=200 if status_["status"] == "ok" else 503,
         content=status_,

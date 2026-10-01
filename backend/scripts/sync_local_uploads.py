@@ -15,7 +15,6 @@ Idempotent — already-migrated rows are skipped.
 """
 
 import asyncio
-import ssl
 import sys
 from pathlib import Path
 
@@ -32,38 +31,18 @@ load_dotenv(ROOT / ".env")
 
 from app.core.config import settings  # noqa: E402
 
-REF = "asuzvovuecxuztynidss"
-POOLER_HOST = "aws-0-ap-northeast-1.pooler.supabase.com"
-POOLER_IP = "35.79.125.133"  # fallback when the system resolver stalls
 
-
-def load_env() -> dict:
-    env = {}
-    for line in (ROOT / ".env").read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        env[k.strip()] = v.strip().strip('"')
-    return env
-
-
-async def connect(env: dict):
-    last: Exception | None = None
-    for attempt in range(3):
-        try:
-            return await asyncpg.connect(
-                host=POOLER_HOST, port=5432, user=f"postgres.{REF}",
-                password=env["SUPABASE_DB_PASSWORD"], database="postgres",
-                ssl="require", timeout=8)
-        except Exception as exc:  # DNS flakiness on some Windows setups
-            last = exc
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
+async def connect():
+    """Connect using the same env-driven settings as the application."""
     return await asyncpg.connect(
-        host=POOLER_IP, port=5432, user=f"postgres.{REF}",
-        password=env["SUPABASE_DB_PASSWORD"], database="postgres",
-        ssl=ctx, timeout=8)
+        host=settings.SUPABASE_DB_HOST,
+        port=settings.SUPABASE_DB_PORT,
+        user=settings.SUPABASE_DB_USER,
+        password=settings.SUPABASE_DB_PASSWORD,
+        database=settings.SUPABASE_DB_NAME,
+        ssl="require",
+        timeout=8,
+    )
 
 
 async def upload_to_bucket(key: str, path: Path, content_type: str) -> str:
@@ -79,9 +58,15 @@ CONTENT_TYPES = {".jpg": "image/jpeg", ".png": "image/png",
 
 
 async def main() -> None:
-    env = load_env()
+    # Rewrites database rows — refuse to run unless the environment is
+    # explicitly development. Never infer safety from the hostname.
+    if settings.APP_ENV != "development":
+        raise SystemExit(
+            f"Refusing to rewrite upload URLs: APP_ENV="
+            f"{settings.APP_ENV!r} (expected 'development')."
+        )
     uploads_dir = ROOT / settings.UPLOAD_DIR
-    conn = await connect(env)
+    conn = await connect()
 
     rows = await conn.fetch(
         "SELECT DISTINCT url FROM maintenance_ticket_attachments "

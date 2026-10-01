@@ -53,3 +53,53 @@ async def generation_tick(ctx: dict) -> dict:
     if tpl["generated"] or rep["generated"]:
         logger.info("Generation tick: %s", result)
     return result
+
+
+_RECON_LOCK_KEY = "mt:lock:reconcile-tick"
+_RECON_LOCK_TTL_MS = 10 * 60_000  # < cron interval
+
+
+async def reconciliation_tick(ctx: dict) -> dict:
+    """Periodic resource-state reconciliation — DETECT + LOG only.
+
+    Reports projection drift (occupancy conflicts, unflagged work, orphan
+    states) per property. It never mutates: safe corrections go through
+    ResourceStateService.repair() (POST /resources/{type}/{id}/repair).
+    """
+    redis = await get_redis()
+    if redis is not None:
+        try:
+            acquired = await redis.set(
+                _RECON_LOCK_KEY, "1", nx=True, px=_RECON_LOCK_TTL_MS
+            )
+            if not acquired:
+                return {"skipped": "locked"}
+        except Exception:
+            pass
+
+    from sqlalchemy import select
+
+    from app.models.property import Property
+    from app.services.reconciliation import reconcile_property
+
+    total = 0
+    async with AsyncSessionLocal() as session:
+        prop_ids = (await session.execute(
+            select(Property.id)
+        )).scalars().all()
+        for pid in prop_ids:
+            findings = await reconcile_property(session, pid)
+            actionable = [
+                f for f in findings if f.get("severity") != "info"
+            ]
+            if actionable:
+                logger.warning(
+                    "State reconciliation — property %s: %d finding(s): %s",
+                    pid, len(actionable),
+                    [
+                        f"{f['issue']} {f['resource_type']}:{f['label']}"
+                        for f in actionable
+                    ],
+                )
+            total += len(actionable)
+    return {"findings": total}

@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.dependencies.auth import get_current_user, require_property_manager
 from app.models.maintenance import MaintenanceTicket
-from app.models.task import Task
+from app.models.task import Task, TaskCompletionSubmission
 from app.models.user import User
 from app.models.work_allocation import WorkAllocationBatch
 from app.schemas.maintenance import MaintenanceCreateRequest, ticket_out
@@ -36,7 +36,10 @@ Staff = Depends(require_property_manager)
 @router.post("/work-batches", status_code=status.HTTP_201_CREATED)
 async def create_work_batch(
     payload: WorkBatchCreateRequest,
-    user: User = Staff,
+    # Any authenticated user (incl. employees) may raise a batch — per-item
+    # authorization runs inside MaintenanceService.create_ticket, which
+    # rejects out-of-coverage employee targets with 403.
+    user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ):
     svc = MaintenanceService(session)
@@ -58,6 +61,8 @@ async def create_work_batch(
             room_uid=item.room_uid,
             dorm_uid=item.dorm_uid,
             bed_uid=item.bed_uid,
+            washroom_uid=item.washroom_uid,
+            washroom_fixture_uid=item.washroom_fixture_uid,
             maintenance_type=item.maintenance_type or "",
             issue=item.issue or "",
             description=item.description,
@@ -65,13 +70,29 @@ async def create_work_batch(
             due_date=item.due_date,
             attachment_urls=item.attachment_urls,
         )
-        room, dorm, bed = await svc._resolve_target(prop, req)
-        zone_id = (room.zone_id if room else dorm.zone_id) if (room or dorm) else None
+        room, dorm, bed, washroom, _fixture = await svc._resolve_target(prop, req)
+        from app.services.task_location import resolve_task_location
+        location = await resolve_task_location(
+            session, property_id=prop.id,
+            room_id=room.id if room else None,
+            dorm_id=dorm.id if dorm else None,
+            bed_id=bed.id if bed else None,
+            washroom_id=washroom.id if washroom else None,
+        )
         # allocation unit = the physical unit: a room, or the dorm that owns
         # the bed. Same unit → same employee; different units rotate.
-        unit = room.id if room else (dorm.id if dorm else
-                                   (bed.dorm_id if bed else None))
-        resolved.append({"req": req, "zone_id": zone_id, "unit": unit})
+        unit = (
+            room.id if room else
+            washroom.id if washroom else
+            dorm.id if dorm else
+            (bed.dorm_id if bed else None)
+        )
+        resolved.append({
+            "req": req, "zone_id": location.zone_id,
+            "area_id": location.area_id,
+            "area_name": location.area.name if location.area else None,
+            "unit": unit,
+        })
 
     # Phase 2 — group by unit, allocate ONE employee per unit group.
     # All of a room's maintenance items share one assignee; the round-robin
@@ -97,6 +118,8 @@ async def create_work_batch(
             zone_name=zname,
             work_type="maintenance",
             manager_employee_id=prop.manager_employee_id,
+            area_id=items[0]["area_id"],
+            area_name=items[0]["area_name"],
         )
         tickets = []
         for it in items:
@@ -165,7 +188,12 @@ async def _batch_tickets(session: AsyncSession, batch_id: uuid.UUID) -> list[dic
     res = await session.execute(
         select(Task)
         .where(Task.allocation_batch_id == batch_id)
-        .options(selectinload(Task.history))
+        .options(
+            selectinload(Task.history),
+            selectinload(Task.completion_images),
+            selectinload(Task.completion_submissions)
+            .selectinload(TaskCompletionSubmission.images),
+        )
     )
     tickets += [task_out(t) for t in res.scalars()]
     return tickets

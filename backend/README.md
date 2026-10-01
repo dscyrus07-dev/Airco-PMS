@@ -34,7 +34,6 @@ app/
 ├── services/                # business logic (next phase)
 └── utils/
 alembic/                     # migration environment (URL from settings, not ini)
-tests/test_health.py         # /health + /health/db
 ```
 
 ## Setup
@@ -113,15 +112,6 @@ alembic current
 
 Alembic reads the database URL from `app.core.config.settings` — `alembic.ini`
 contains no credentials.
-
-## Tests
-
-```bash
-pytest
-```
-
-`tests/test_health.py` exercises `/health` and real PostgreSQL connectivity
-via `/health/db`.
 
 ## Security notes
 

@@ -76,9 +76,9 @@ Docker volumes are **not** backups. Use managed Postgres backups
 restore RTO/RPO before go-live. Uploads belong in object storage
 (`STORAGE_BACKEND=s3`), which provides its own durability.
 
-## Tests
+## Checks
 
 ```bash
-cd backend && .venv/Scripts/python -m pytest tests/ -q   # SQLite, no services needed
+cd backend && python -c "import app.main"                # import smoke check
 cd frontend && npx tsc --noEmit && npm run build
 ```
