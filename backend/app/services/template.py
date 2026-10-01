@@ -200,14 +200,17 @@ class TemplateService:
         self.session = session
         self.structure = StructureService(session)
         self.alloc = WorkAllocationService(session)
-        # Per-instance structure snapshot — _expand_targets used to issue a
+        # Per-instance structure snapshots — _expand_targets used to issue a
         # serial query per target/zone/dorm/bed (N+1s); against a remote DB
         # each RTT is ~300-400ms, so one prefetch of the property structure
         # (4 queries, cached per request/tick) replaces dozens of round trips.
-        self._struct: dict | None = None
+        # Keyed BY PROPERTY — the global scheduler tick iterates templates
+        # across properties, and a single cached snapshot would make every
+        # later property expand against the first one's structure.
+        self._struct: dict[uuid.UUID, dict] = {}
 
     async def _structure(self, pid: uuid.UUID) -> dict:
-        if self._struct is None:
+        if self._struct.get(pid) is None:
             zones = (await self.session.execute(
                 select(Zone).where(Zone.property_id == pid))).scalars().all()
             rooms = (await self.session.execute(
@@ -221,7 +224,7 @@ class TemplateService:
             beds = (await self.session.execute(
                 select(Bed).where(Bed.dorm_id.in_(dorm_ids)))).scalars().all() \
                 if dorm_ids else []
-            self._struct = {
+            st = {
                 "zones": {z.id: z for z in zones},
                 "rooms": rooms,
                 "dorms": dorms,
@@ -238,8 +241,8 @@ class TemplateService:
             }
             areas = (await self.session.execute(
                 select(Area).where(Area.property_id == pid))).scalars().all()
-            self._struct["areas"] = {a.id: a for a in areas}
-            self._struct["by_id"]["area"] = self._struct["areas"]
+            st["areas"] = {a.id: a for a in areas}
+            st["by_id"]["area"] = st["areas"]
             # Open occupancies — one grouped read; powers occupied_only
             # location filters (e.g. "clean every occupied room daily").
             occs = (await self.session.execute(
@@ -249,16 +252,17 @@ class TemplateService:
                     Occupancy.checked_out_at.is_(None),
                 )
             )).all()
-            self._struct["occupied_rooms"] = {o.room_id for o in occs if o.room_id}
-            self._struct["occupied_beds"] = {o.bed_id for o in occs if o.bed_id}
+            st["occupied_rooms"] = {o.room_id for o in occs if o.room_id}
+            st["occupied_beds"] = {o.bed_id for o in occs if o.bed_id}
             # Dorm occupancy is DERIVED from bed occupancy (the domain has
             # no dorm-level occupancy rows) — a dorm counts as occupied
             # while at least one of its beds holds an open occupancy.
-            self._struct["occupied_dorms"] = {
+            st["occupied_dorms"] = {
                 b.dorm_id for b in beds
-                if b.id in self._struct["occupied_beds"]
+                if b.id in st["occupied_beds"]
             }
-        return self._struct
+            self._struct[pid] = st
+        return self._struct[pid]
 
     # ------------------------------------------------------------------
     # Fetch / validation
@@ -634,24 +638,49 @@ class TemplateService:
         targets = await self._expand_targets(t)
         if not targets:
             return 0
+        is_maint = t.template_type == "maintenance"
 
-        from app.services.task_location import resolve_task_location
+        # Resolve every target's zone/area from the prefetched structure
+        # snapshot — zero extra queries regardless of unit count.
+        st = await self._structure(t.property_id)
         for tgt in targets:
-            location = await resolve_task_location(
-                self.session, property_id=t.property_id,
-                room_id=tgt.get("room_id"), dorm_id=tgt.get("dorm_id"),
-                bed_id=tgt.get("bed_id"), washroom_id=tgt.get("washroom_id"),
-                zone_id=tgt.get("zone_id"),
-                area_id=tgt.get("area_id"),
+            loc = self._snap_location(st, t.property_id, tgt)
+            tgt["zone_id"] = loc.zone_id
+            tgt["area_id"] = loc.area_id
+            tgt["zone_name"] = loc.zone.name if loc.zone else None
+            tgt["area_name"] = loc.area.name if loc.area else None
+            tgt["_loc"] = loc
+
+        # Idempotency prechecks, batched — ONE query each for the whole
+        # expansion instead of one per unit:
+        #  1. ledger: this occurrence already generated for the target
+        #  2. uq_tasks_open_room_title: an open task already covers this
+        #     (property, room, title) — skip BEFORE allocating so a covered
+        #     unit doesn't burn an allocation batch or rotation slot.
+        for tgt in targets:
+            tgt["_occ_key"] = f"{occurrence.isoformat()}|{tgt['key']}"
+        done = await self._generated_keys(
+            t.id, [tg["_occ_key"] for tg in targets]
+        )
+        targets = [tg for tg in targets if tg["_occ_key"] not in done]
+        if not targets:
+            return 0
+        if not is_maint:
+            covered = await self._open_task_rooms(
+                t, [tg["room_id"] for tg in targets if tg.get("room_id")]
             )
-            tgt["zone_id"] = location.zone_id
-            tgt["area_id"] = location.area_id
-            tgt["zone_name"] = location.zone.name if location.zone else None
+            targets = [
+                tg for tg in targets
+                if not tg.get("room_id") or tg["room_id"] not in covered
+            ]
+            if not targets:
+                return 0
 
         # group by UNIT (room/dorm/bed — zone/area/property targets keep
         # their own key) → ONE allocation batch per unit per occurrence.
         # All of one room's items land on one employee; each unit advances
-        # the zone's round-robin pointer so work distributes fairly.
+        # its ZONE's round-robin pointer so work distributes fairly inside
+        # the zone — never into a global property pool.
         by_unit: dict = {}
         for tgt in targets:
             unit = (tgt.get("room_id") or tgt.get("dorm_id")
@@ -659,30 +688,46 @@ class TemplateService:
                     or tgt["key"])
             by_unit.setdefault((tgt["zone_id"], unit), []).append(tgt)
 
+        logger.info(
+            "Template %s occurrence %s: matched %d targets across %d units",
+            t.name, occurrence.isoformat(), len(targets), len(by_unit),
+        )
+
         from app.models.property import Property
         prop = await self.session.get(Property, t.property_id)
+        a_mode = (t.assignment or {}).get("mode", "automatic")
+        allocs: dict = {}
+        if a_mode == "automatic":
+            # ONE batched pass — each unit allocated inside its own zone's
+            # pool (zone staff ∪ covering-area fallback), workload-balanced.
+            allocs = await self.alloc.allocate_units(
+                None,
+                property_id=t.property_id,
+                units=[
+                    {
+                        "key": ukey, "zone_id": ukey[0],
+                        "zone_name": items[0].get("zone_name"),
+                        "area_id": items[0].get("area_id"),
+                        "area_name": items[0].get("area_name"),
+                    }
+                    for ukey, items in by_unit.items()
+                ],
+                work_type=infer_task_work_type(
+                    template_type=t.template_type),
+                manager_employee_id=(
+                    prop.manager_employee_id if prop else None),
+                company_id=t.company_id,
+                actor_name="Scheduler",
+            )
+        people: list[Employee] | None = None
         count = 0
-        is_maint = t.template_type == "maintenance"
-        for (zone_id, _unit), items in by_unit.items():
-            # uq_tasks_open_room_title — an open task already covers this
-            # (property, room, title). Skip BEFORE allocating so a covered
-            # unit doesn't burn an allocation batch or rotation slot, and
-            # the occurrence commits cleanly instead of rolling back the
-            # whole template run on the unique-violation.
-            if not is_maint:
-                items = [
-                    i for i in items
-                    if not await self._open_task_exists(t, i)
-                ]
-                if not items:
-                    continue
-            zname = items[0]["zone_name"]
+        for ukey, items in by_unit.items():
             alloc = None
-            a_mode = (t.assignment or {}).get("mode", "automatic")
             if a_mode in ("employees", "team", "department"):
                 # people-oriented assignment — one pool per unit group,
                 # no zone/area semantics
-                people = await self._people_pool(t)
+                if people is None:
+                    people = await self._people_pool(t)
                 alloc = await self.alloc.allocate_people(
                     None,
                     property_id=t.property_id,
@@ -694,52 +739,84 @@ class TemplateService:
                     pool_label=self._people_label(t),
                 )
             elif a_mode == "automatic":
-                alloc = await self.alloc.allocate(
-                    None,
-                    property_id=t.property_id,
-                    zone_id=zone_id,
-                    zone_name=zname,
-                    work_type=infer_task_work_type(template_type=t.template_type),
-                    manager_employee_id=prop.manager_employee_id if prop else None,
-                    company_id=t.company_id,
-                    actor_name="Scheduler",
-                    area_id=items[0].get("area_id"),
-                    area_name=zname if zone_id is None else None,
-                )
+                alloc = allocs.get(ukey)
             for tgt in items:
                 row = await self._generate_for_target(
-                    t, tgt, occurrence, alloc=alloc, is_maint=is_maint
+                    t, tgt, occurrence, alloc=alloc, is_maint=is_maint,
+                    location=tgt["_loc"], ledger_checked=True,
                 )
                 if row is not None:
                     count += 1
         return count
 
+    def _snap_location(self, st: dict, property_id: uuid.UUID,
+                       tgt: dict):
+        """resolve_task_location against the prefetched structure snapshot —
+        same zone/area derivation, zero queries."""
+        from app.services.task_location import TaskLocation
+        room = st["by_id"]["room"].get(tgt.get("room_id"))
+        dorm = st["by_id"]["dorm"].get(tgt.get("dorm_id"))
+        wash = st["by_id"]["washroom"].get(tgt.get("washroom_id"))
+        if dorm is None and tgt.get("bed_id"):
+            bed = st["by_id"]["bed"].get(tgt["bed_id"])
+            dorm = st["by_id"]["dorm"].get(bed.dorm_id) if bed else None
+        zone_id = (
+            room.zone_id if room is not None
+            else dorm.zone_id if dorm is not None
+            else wash.zone_id if wash is not None
+            else tgt.get("zone_id")
+        )
+        zone = st["zones"].get(zone_id) if zone_id else None
+        unit_area_id = (
+            room.area_id if room is not None
+            else dorm.area_id if dorm is not None
+            else wash.area_id if wash is not None
+            else tgt.get("area_id")
+        )
+        area_id = (
+            zone.area_id if zone and zone.area_id else unit_area_id
+        )
+        area = st["areas"].get(area_id) if area_id else None
+        return TaskLocation(
+            property_id=property_id,
+            area_id=area_id, zone_id=zone_id,
+            room_id=room.id if room else tgt.get("room_id"),
+            dorm_id=dorm.id if dorm else tgt.get("dorm_id"),
+            washroom_id=wash.id if wash else tgt.get("washroom_id"),
+            room=room, dorm=dorm, washroom=wash, zone=zone, area=area,
+        )
+
     async def _generate_for_target(self, t: WorkTemplate, tgt: dict,
                                    occurrence: datetime, *,
-                                   alloc=None, is_maint: bool | None = None):
+                                   alloc=None, is_maint: bool | None = None,
+                                   location=None,
+                                   ledger_checked: bool = False):
         """Generate a single work item for one target at one occurrence.
 
         Idempotent via the ledger — returns None when the occurrence was
         already generated. `alloc` lets the batch path share ONE allocation
-        per zone; the on-demand path allocates per call."""
+        per zone; the on-demand path allocates per call. The batch path
+        also passes a snapshot-resolved `location` and `ledger_checked` so
+        neither is re-queried per unit."""
         from app.models.property import Property
         is_maint = (t.template_type == "maintenance"
                     if is_maint is None else is_maint)
         key = f"{occurrence.isoformat()}|{tgt['key']}"
-        if await self._already_generated(t.id, key):
+        if not ledger_checked and await self._already_generated(t.id, key):
             return None
 
-        from app.services.task_location import resolve_task_location
-        location = await resolve_task_location(
-            self.session, property_id=t.property_id,
-            room_id=tgt.get("room_id"), dorm_id=tgt.get("dorm_id"),
-            bed_id=tgt.get("bed_id"), washroom_id=tgt.get("washroom_id"),
-            zone_id=tgt.get("zone_id"),
-            area_id=tgt.get("area_id"),
-        )
-        tgt["zone_id"] = location.zone_id
-        tgt["area_id"] = location.area_id
-        tgt["zone_name"] = location.zone.name if location.zone else None
+        if location is None:
+            from app.services.task_location import resolve_task_location
+            location = await resolve_task_location(
+                self.session, property_id=t.property_id,
+                room_id=tgt.get("room_id"), dorm_id=tgt.get("dorm_id"),
+                bed_id=tgt.get("bed_id"), washroom_id=tgt.get("washroom_id"),
+                zone_id=tgt.get("zone_id"),
+                area_id=tgt.get("area_id"),
+            )
+            tgt["zone_id"] = location.zone_id
+            tgt["area_id"] = location.area_id
+            tgt["zone_name"] = location.zone.name if location.zone else None
 
         if alloc is None and (t.assignment or {}).get("mode") in (
                 "employees", "team", "department"):
@@ -823,6 +900,38 @@ class TemplateService:
         )
         t.generated_count += 1
         return row
+
+    async def _open_task_rooms(self, t: WorkTemplate,
+                               room_ids: list) -> set:
+        """Batched uq_tasks_open_room_title precheck — the room ids already
+        covered by an open task with this title. ONE query per run instead
+        of one per unit."""
+        if not room_ids:
+            return set()
+        res = await self.session.execute(
+            select(Task.room_id)
+            .where(
+                Task.property_id == t.property_id,
+                Task.room_id.in_(room_ids),
+                Task.title == t.name,
+                Task.status.notin_(("completed", "cancelled")),
+            )
+        )
+        return set(res.scalars())
+
+    async def _generated_keys(self, template_id: uuid.UUID,
+                              keys: list[str]) -> set:
+        """Batched ledger check — the occurrence keys already generated for
+        this template. ONE query per run instead of one per target."""
+        if not keys:
+            return set()
+        res = await self.session.execute(
+            select(TemplateGeneration.occurrence_key).where(
+                TemplateGeneration.template_id == template_id,
+                TemplateGeneration.occurrence_key.in_(keys),
+            )
+        )
+        return set(res.scalars())
 
     async def _open_task_exists(self, t: WorkTemplate, tgt: dict) -> bool:
         """An open (non-completed/cancelled) task already covers this

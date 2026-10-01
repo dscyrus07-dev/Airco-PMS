@@ -62,6 +62,10 @@ frontend/               # React 19 + TS + Vite 8 + Tailwind v4 + react-router-do
   employee pool as fallback, department eligibility by work_type
   (cleaning→housekeeping, maintenance→maintenance/engineering).
   WorkAllocationBatch = one POST → N tickets, one employee per unit.
+  `allocate_units()` = batched zone-aware path used by template
+  generation: one property-wide staff/workload fetch, pools grouped by
+  zone in memory, one lock + rotation seed per scope — a unit NEVER
+  leaves its zone pool (zone ∪ covering-area fallback only).
   Manual reassign never moves the pointer; everything audited in
   WorkAllocationHistory.
 - **ResourceStateService** (`services/resource_state.py`): THE authoritative

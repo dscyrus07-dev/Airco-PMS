@@ -45,6 +45,38 @@ async def next_batch_number(session: AsyncSession) -> str:
     return f"WB-{year}-{n:05d}"
 
 
+async def next_batch_numbers(session: AsyncSession, n: int) -> list[str]:
+    """n batch numbers in ONE query (Postgres generate_series); the SQLite
+    fallback counts once and offsets — no per-number round trips."""
+    if n <= 0:
+        return []
+    year = datetime.now(timezone.utc).year
+    try:
+        res = await session.execute(
+            text("SELECT nextval('work_batch_seq') "
+                 "FROM generate_series(1, :n)"),
+            {"n": n},
+        )
+        nums = [int(r[0]) for r in res.all()]
+    except Exception:
+        res = await session.execute(
+            select(func.count()).select_from(WorkAllocationBatch)
+        )
+        start = int(res.scalar_one()) + 1
+        nums = list(range(start, start + n))
+    return [f"WB-{year}-{i:05d}" for i in nums]
+
+
+def _pool_order(e: Employee):
+    """The scope-agnostic ordering every pool shares — coverage never
+    affects position."""
+    return (
+        e.created_at.replace(tzinfo=None) if e.created_at
+        else datetime.min.replace(tzinfo=None),
+        e.id,
+    )
+
+
 # Structured department eligibility is decided before zone/area scoping.
 # The production values are full department names; matching on these stable
 # terms also accepts compatible variants such as "Cleaning" or "Engineering".
@@ -637,6 +669,246 @@ class WorkAllocationService:
             previous_index=previous_index, selected_index=selected_index,
             next_index=next_index,
         )
+
+    # ------------------------------------------------------------------
+    # Batched zone-aware allocation — one run = one pool fetch + one
+    # workload fetch + one lock/rotation-seed per DISTINCT scope; the pick
+    # itself is allocate()'s workload-first rotation replayed in memory.
+    # A 200-unit expansion costs ~5 queries + 2 per zone instead of ~7 per
+    # unit (≈1,400 WAN round trips).
+    # ------------------------------------------------------------------
+
+    async def allocate_units(
+        self,
+        user: User | None,
+        *,
+        property_id: uuid.UUID,
+        units: list[dict],
+        work_type: str,
+        manager_employee_id: uuid.UUID | None = None,
+        company_id: uuid.UUID | None = None,
+        actor_name: str | None = None,
+    ) -> dict:
+        """Allocate every work unit inside its OWN zone's pool.
+
+        Each entry in `units` is a resolved work unit —
+        ``{"key", "zone_id", "zone_name", "area_id", "area_name"}``. The
+        zone determines the pool: zone staff UNION the covering area's
+        floor staff (the existing permitted fallback) — never a global
+        property pick when the unit has a zone. Units with no zone use the
+        area pool; no zone and no area → the property pool.
+
+        Returns ``{unit["key"]: AllocationResult}`` — one batch row per
+        unit, so downstream audit/history keeps per-unit granularity.
+        """
+        departments = eligible_departments(work_type)
+        # The whole run's data, once — no per-unit employee/zone queries.
+        staff = await self._employee_pool(
+            property_id,
+            manager_employee_id=manager_employee_id,
+            departments=departments,
+        )
+        zones = {
+            z.id: z for z in (await self.session.execute(
+                select(Zone).where(Zone.property_id == property_id)
+            )).scalars()
+        }
+        areas = {
+            a.id: a for a in (await self.session.execute(
+                select(Area).where(Area.property_id == property_id)
+            )).scalars()
+        }
+        area_zone_ids: dict[uuid.UUID, list[uuid.UUID]] = {}
+        for z in zones.values():
+            if z.area_id:
+                area_zone_ids.setdefault(z.area_id, []).append(z.id)
+        by_zone: dict[uuid.UUID, list[Employee]] = {}
+        by_area: dict[uuid.UUID, list[Employee]] = {}
+        for e in staff:
+            if e.zone_id:
+                by_zone.setdefault(e.zone_id, []).append(e)
+            if e.area_id:
+                by_area.setdefault(e.area_id, []).append(e)
+        loads = await self._active_workloads(
+            property_id, [e.id for e in staff]
+        )
+
+        def union(*groups: list[Employee]) -> list[Employee]:
+            seen: set[uuid.UUID] = set()
+            pool: list[Employee] = []
+            for group in groups:
+                for e in group:
+                    if e.id not in seen:
+                        seen.add(e.id)
+                        pool.append(e)
+            pool.sort(key=_pool_order)
+            return pool
+
+        def scope_key(u: dict) -> tuple:
+            if u.get("zone_id") is not None:
+                return ("zone", u["zone_id"])
+            if u.get("area_id") is not None:
+                return ("area", u["area_id"])
+            return ("property", None)
+
+        # One context per distinct scope — pool, level, rotation pointer,
+        # and the serialization lock are resolved once, then replayed in
+        # memory for every unit in that scope.
+        scopes: dict[tuple, dict] = {}
+        for u in units:
+            key = scope_key(u)
+            if key in scopes:
+                scopes[key]["units"] += 1
+                continue
+            zid, aid = u.get("zone_id"), u.get("area_id")
+            if zid is not None:
+                zone = zones.get(zid)
+                cover = (zone.area_id if zone and zone.area_id else None) \
+                    or aid
+                zp = by_zone.get(zid, [])
+                ap = by_area.get(cover, []) if cover else []
+                scopes[key] = {
+                    "kind": "zone", "zone_id": zid, "area_id": cover,
+                    "zone_name": u.get("zone_name"),
+                    "area_name": (areas[cover].name if cover in areas
+                                  else None),
+                    "pool": union(zp, ap),
+                    "level": ("zone+area" if zp and ap
+                              else "zone" if zp
+                              else "area" if ap else None),
+                    "zone_count": len(zp), "area_count": len(ap),
+                    "units": 1, "assigned": 0,
+                    "seeded": False, "last": None, "state": None,
+                }
+            elif aid is not None:
+                pool = union(
+                    by_area.get(aid, []),
+                    *(by_zone.get(z, [])
+                      for z in area_zone_ids.get(aid, [])),
+                )
+                scopes[key] = {
+                    "kind": "area", "zone_id": None, "area_id": aid,
+                    "zone_name": None,
+                    "area_name": (areas[aid].name if aid in areas
+                                  else u.get("area_name")),
+                    "pool": pool, "level": "area" if pool else None,
+                    "zone_count": 0, "area_count": len(pool),
+                    "units": 1, "assigned": 0,
+                    "seeded": False, "last": None, "state": None,
+                }
+            else:
+                scopes[key] = {
+                    "kind": "property", "zone_id": None, "area_id": None,
+                    "zone_name": None, "area_name": None,
+                    "pool": list(staff),
+                    "level": "property" if staff else None,
+                    "zone_count": 0, "area_count": 0,
+                    "units": 1, "assigned": 0,
+                    "seeded": False, "last": None, "state": None,
+                }
+
+        # Serialize each scope once — the same row locks allocate() takes.
+        for ent in scopes.values():
+            if not ent["pool"]:
+                continue
+            if ent["kind"] == "zone" and ent["zone_id"] in zones:
+                ent["state"] = await self._locked_state(
+                    property_id, ent["zone_id"]
+                )
+            elif ent["kind"] == "area":
+                await self._locked_area(ent["area_id"])
+            elif ent["kind"] == "property":
+                await self._locked_property(property_id)
+
+        numbers = await next_batch_numbers(self.session, len(units))
+        results: dict = {}
+        for u, number in zip(units, numbers):
+            ent = scopes[scope_key(u)]
+            pool = ent["pool"]
+            employee: Employee | None = None
+            method, reason = "round_robin", None
+            previous_index = selected_index = next_index = None
+            if not pool:
+                method, reason = "none", "no_eligible_employee"
+            else:
+                min_load = min(loads[e.id] for e in pool)
+                candidate_positions = [
+                    i for i, e in enumerate(pool) if loads[e.id] == min_load
+                ]
+                if not ent["seeded"]:
+                    ent["last"] = await self._last_rotation_employee(
+                        property_id,
+                        [pool[i] for i in candidate_positions],
+                        work_type=work_type,
+                        pool_level=ent["level"] or "zone",
+                        zone_id=ent["zone_id"], area_id=ent["area_id"],
+                        area_name=ent["area_name"],
+                    )
+                    ent["seeded"] = True
+                previous_index = next(
+                    (i for i, e in enumerate(pool) if e.id == ent["last"]),
+                    None,
+                )
+                after = [
+                    i for i in candidate_positions
+                    if previous_index is not None and i > previous_index
+                ]
+                selected_index = after[0] if after else candidate_positions[0]
+                employee = pool[selected_index]
+                next_index = candidate_positions[
+                    (candidate_positions.index(selected_index) + 1)
+                    % len(candidate_positions)
+                ]
+                loads[employee.id] += 1
+                ent["last"] = employee.id
+                ent["assigned"] += 1
+                if ent["state"] is not None:
+                    ent["state"].last_assigned_employee_id = employee.id
+                    ent["state"].last_assigned_at = datetime.now(timezone.utc)
+                    ent["state"].version += 1
+            zone_name = u.get("zone_name")
+            if u.get("zone_id") is None and zone_name is None:
+                zone_name = ent["area_name"]
+            batch = WorkAllocationBatch(
+                batch_number=number,
+                company_id=user.company_id if user else company_id,
+                property_id=property_id,
+                zone_id=u.get("zone_id"),
+                zone_name=zone_name,
+                employee_id=employee.id if employee else None,
+                employee_name=employee.name if employee else None,
+                work_type=work_type,
+                allocation_status=(
+                    "auto_assigned" if employee else "unassigned"
+                ),
+                allocation_reason=reason,
+                created_by=user.id if user else None,
+                created_by_name=user.name if user else actor_name,
+            )
+            self.session.add(batch)
+            results[u["key"]] = AllocationResult(
+                batch=batch, employee=employee, method=method,
+                reason=reason, level=ent["level"],
+                zone_employee_count=ent["zone_count"],
+                area_employee_count=ent["area_count"],
+                pool_employees=pool,
+                previous_index=previous_index,
+                selected_index=selected_index, next_index=next_index,
+            )
+        await self.session.flush()
+        # One summary line per scope — the zone-level distribution view in
+        # the log, instead of burying it in per-unit entries.
+        for ent in scopes.values():
+            logger.info(
+                "Zone allocation summary: scope=%s label=%s units=%d "
+                "eligible=%d (zone=%d area=%d) assigned=%d unassigned=%d",
+                (ent["level"] or "none").upper(),
+                ent["zone_name"] or ent["area_name"] or "property",
+                ent["units"], len(ent["pool"]), ent["zone_count"],
+                ent["area_count"], ent["assigned"],
+                ent["units"] - ent["assigned"],
+            )
+        return results
 
     def log_task_allocation(
         self, result: AllocationResult, *, task_id, room=None, dorm=None,
