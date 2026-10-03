@@ -641,3 +641,42 @@ async def test_deactivate_delete_recreate_employee(session, seed):
         ),
     )
     assert new_emp.email == emp.email
+
+
+# ---------------------------------------------------------------------------
+# Detail-read scoping (mobile audit — IDOR hardening)
+# ---------------------------------------------------------------------------
+
+async def test_employee_cannot_read_other_task_detail(session, seed):
+    task = make_task(session, seed["prop"], seed["employee"], title="Cleaning — 101")
+    await session.commit()
+
+    svc = TaskService(session)
+    # assignee reads fine
+    assert (await svc.get_task(seed["emp_user"], task.id)).id == task.id
+    # staff read fine
+    assert (await svc.get_task(seed["pm"], task.id)).id == task.id
+    # another employee in the same property cannot bypass list scoping
+    with pytest.raises(Forbidden):
+        await svc.get_task(seed["emp_user2"], task.id)
+
+
+async def test_employee_ticket_detail_scope(session, seed, stub_tasks):
+    svc = MaintenanceService(session)
+    ticket = await svc.create_ticket(
+        seed["pm"], maint_req(seed["prop"], room_uid=seed["room"].id)
+    )
+    # unassigned, reported by PM → another employee cannot read it
+    with pytest.raises(Forbidden):
+        await svc.get_ticket(seed["emp_user"], ticket.id)
+    # assigned employee can
+    ticket.assigned_to = seed["employee"].id
+    await session.commit()
+    assert (await svc.get_ticket(seed["emp_user"], ticket.id)).id == ticket.id
+    # ...and the reporting employee can even when unassigned to them
+    ticket.assigned_to = None
+    ticket.reported_by = seed["emp_user"].id
+    await session.commit()
+    assert (await svc.get_ticket(seed["emp_user"], ticket.id)).id == ticket.id
+    with pytest.raises(Forbidden):
+        await svc.get_ticket(seed["emp_user2"], ticket.id)

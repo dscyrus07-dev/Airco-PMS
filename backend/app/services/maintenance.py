@@ -480,10 +480,13 @@ class MaintenanceService:
                 return []
             q = q.where(MaintenanceTicket.property_id == user.property_id)
             if user.role == UserRole.EMPLOYEE:
-                # Employees only see tickets assigned to them (mirrors list_tasks)
-                if not user.employee_id:
-                    return []
-                q = q.where(MaintenanceTicket.assigned_to == user.employee_id)
+                # Employees see tickets assigned to them OR tickets they
+                # reported (raising a ticket must stay trackable) — mirrors
+                # the get_ticket detail scope.
+                q = q.where(or_(
+                    MaintenanceTicket.assigned_to == user.employee_id,
+                    MaintenanceTicket.reported_by == user.id,
+                ))
         if room_id:
             q = q.where(MaintenanceTicket.room_id == room_id)
         if washroom_id:
@@ -506,7 +509,17 @@ class MaintenanceService:
         return list(res.scalars())
 
     async def get_ticket(self, user: User, ticket_id: uuid.UUID):
-        return await self._get_ticket(user, ticket_id)
+        ticket = await self._get_ticket(user, ticket_id)
+        # Mirror list scoping: employees read only tickets assigned to them
+        # or tickets they reported — property membership alone is not enough.
+        if user.role == UserRole.EMPLOYEE and (
+            user.employee_id is None
+            or ticket.assigned_to != user.employee_id
+        ) and ticket.reported_by != user.id:
+            from app.dependencies.auth import Forbidden
+
+            raise Forbidden()
+        return ticket
 
     async def room_history(self, user: User, room_id: uuid.UUID):
         res = await self.session.execute(select(Room).where(Room.id == room_id))

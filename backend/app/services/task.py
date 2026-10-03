@@ -211,7 +211,26 @@ class TaskService:
     async def get_task(self, user: User, task_id: uuid.UUID) -> Task:
         """Fully-loaded task detail (history + evidence) for the detail
         drawer — the list endpoint intentionally returns a slim shape."""
-        return await self._get_task(user, task_id)
+        task = await self._get_task(user, task_id)
+        # List scoping hides other employees' tasks — the detail read must
+        # enforce the same boundary or the list scope is trivially bypassed.
+        if user.role == UserRole.EMPLOYEE and (
+            user.employee_id is None or task.employee_id != user.employee_id
+        ):
+            from app.dependencies.auth import Forbidden
+
+            raise Forbidden()
+        # Surface the template's checklist + evidence rules on the detail
+        # payload — the list stays slim; clients render what the server
+        # resolves (mirrors _resolved_area_id).
+        if task.template_id:
+            from app.models.template import WorkTemplate
+
+            tpl = await self.session.get(WorkTemplate, task.template_id)
+            if tpl:
+                task._checklist = tpl.checklist or []
+                task._verification = tpl.verification or {}
+        return task
 
     def _require_assignee(self, user: User, task: Task) -> None:
         """Only the assigned employee — or staff — may act on a task. HR

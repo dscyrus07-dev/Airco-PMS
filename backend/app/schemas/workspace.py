@@ -466,4 +466,8 @@ def task_out(t: Task) -> dict:
         "submitted_at": t.submitted_at.isoformat() if t.submitted_at else None,
         "completed_at": t.completed_at.isoformat() if t.completed_at else None,
         "created_at": t.created_at,
+        # Detail-only: template checklist + evidence rules resolved by
+        # TaskService.get_task; absent/null on list payloads.
+        "checklist": getattr(t, "_checklist", None),
+        "verification": getattr(t, "_verification", None),
     }
