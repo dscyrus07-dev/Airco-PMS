@@ -12,8 +12,10 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import and_, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.company import Company
 from app.models.employee import Employee
 from app.models.structure import Room, Zone
 from app.models.task import Task
@@ -22,8 +24,12 @@ from app.models.user import User, UserRole
 from app.schemas.workspace import (
     completion_image_out, completion_submission_out,
 )
+from app.services.rollover import (
+    RolloverService, operational_day_bounds, operational_day_key,
+    parse_day_start,
+)
 from app.services.structure import StructureService, ValidationErr
-from app.services.template import TemplateService, compute_next_run
+from app.services.template import TemplateService, compute_next_run, _tz
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -85,7 +91,7 @@ class TaskOpsService:
                     and_(
                         Task.due_date.is_not(None),
                         Task.due_date < tomorrow_iso,
-                        Task.status.notin_(("completed", "cancelled")),
+                        Task.status.notin_(("completed", "cancelled", "abandoned")),
                     ),
                 ),
             )
@@ -149,11 +155,38 @@ class TaskOpsService:
                         continue  # employees see only their own generated work
                     items.append(self._occurrence_item(t, tgt, occ, key, gen_task))
 
+        # ---- tasks abandoned today ------------------------------------
+        # Authoritative filter is abandoned_at inside the current
+        # OPERATIONAL day — the list resets at the configured day start
+        # (06:00 default), not the IST calendar midnight. A stale task
+        # killed by the daily rollover or an occurrence that expired
+        # after midnight still belongs here.
+        cres = await self.session.execute(
+            select(Company.operational_day_start)
+            .where(Company.id == prop.company_id)
+        )
+        day_start = parse_day_start(cres.scalar_one_or_none())
+        now_utc = datetime.now(timezone.utc)
+        op_start_utc, op_end_utc = operational_day_bounds(now_utc, day_start)
+        aq = (
+            select(Task)
+            .where(
+                Task.property_id == prop.id,
+                Task.status == "abandoned",
+                Task.abandoned_at >= op_start_utc,
+                Task.abandoned_at < op_end_utc,
+            )
+        )
+        if is_employee:
+            aq = aq.where(Task.employee_id == user.employee_id)
+        res = await self.session.execute(aq.order_by(Task.abandoned_at.desc()))
+        abandoned = list(res.unique().scalars())
+
         # ---- manual/one-time generated tasks (not from templates) ------
         # Resolve zone names so the Today zone filter works — template
         # occurrences get theirs from target expansion, task rows carry
         # only zone_id.
-        zids = {t.zone_id for t in tasks if t.zone_id}
+        zids = {t.zone_id for t in tasks + abandoned if t.zone_id}
         zmap: dict[uuid.UUID, str] = {}
         if zids:
             res = await self.session.execute(
@@ -167,7 +200,17 @@ class TaskOpsService:
                                          zone_name=zmap.get(t.zone_id)))
 
         items.sort(key=lambda x: (x["scheduled_at"] or "", x["title"]))
-        return {"date": today_iso, "summary": self._summary(items), "items": items}
+        return {
+            "date": today_iso,
+            "abandoned_day": operational_day_key(
+                now_utc.astimezone(IST), day_start),
+            "summary": self._summary(items),
+            "items": items,
+            "abandoned_today": [
+                self._abandoned_item(t, zone_name=zmap.get(t.zone_id))
+                for t in abandoned
+            ],
+        }
 
     def _today_occurrences(self, t: WorkTemplate,
                            start_utc: datetime, end_utc: datetime) -> list[datetime]:
@@ -238,11 +281,31 @@ class TaskOpsService:
             **self._task_fields(t),
         }
 
+    def _abandoned_item(self, t: Task, zone_name=None) -> dict:
+        return {
+            "task_uid": str(t.id),
+            "ticket_number": t.ticket_number,
+            "title": t.title,
+            "source": ("template" if t.template_id
+                       else "recurring" if t.recurrence else "manual"),
+            "template_uid": str(t.template_id) if t.template_id else None,
+            "priority": t.priority,
+            "zone_name": zone_name,
+            "target_label": (t.room_number or t.dorm_name or t.washroom_name),
+            "room_number": t.room_number or t.dorm_name or t.washroom_name,
+            "assignee": t.assigned_to_name,
+            "scheduled_for": t.scheduled_for.isoformat() if t.scheduled_for else None,
+            "expires_at": t.expires_at.isoformat() if t.expires_at else None,
+            "abandoned_at": t.abandoned_at.isoformat() if t.abandoned_at else None,
+            "abandoned_reason": t.abandoned_reason,
+            "abandoned_from_status": t.abandoned_from_status,
+        }
+
     def _summary(self, items: list[dict]) -> dict:
         s = {
             "total_planned": len(items), "generated": 0, "pending_generation": 0,
             "assigned": 0, "in_progress": 0, "completed": 0, "overdue": 0,
-            "unassigned": 0,
+            "unassigned": 0, "abandoned": 0,
         }
         for i in items:
             if i["generation_state"] == "generated":
@@ -256,6 +319,8 @@ class TaskOpsService:
                 s["in_progress"] += 1
             elif ws in ("completed", "submitted"):
                 s["completed"] += 1
+            elif ws == "abandoned":
+                s["abandoned"] += 1
             elif ws == "overdue":
                 s["overdue"] += 1
             elif ws in ("pending", "unassigned"):
@@ -391,11 +456,46 @@ class TaskOpsService:
         except ValueError:
             raise ValidationErr("Invalid occurrence key.")
 
-        # delegate to the shared generation path — allocates + writes ledger
-        created = await self.templates._generate_for_target(t, tgt, occurrence)
+        # Same lifecycle as the ordered tick, scoped to THIS target —
+        # generating one room's occurrence supersedes only that room's
+        # still-open predecessor (its window ends at the occurrence
+        # boundary). The other targets' instances of the same occurrence
+        # stay valid until their own expiry; unrelated open tasks
+        # (manual work, other templates) still block below.
+        await RolloverService(self.session).expire_due(
+            template_id=t.id, target=tgt, boundary=occurrence)
+
+        # On-demand path precheck — the batch path does this via
+        # _open_task_rooms; without it a covered room walks straight into
+        # uq_tasks_open_room_title at flush time.
+        if (t.template_type != "maintenance"
+                and await self.templates._open_task_exists(t, tgt)):
+            raise ValidationErr(
+                "An open task already covers this room — complete or cancel "
+                "it before generating this occurrence."
+            )
+
+        # delegate to the shared generation path — allocates + writes
+        # ledger; stamp the same validity window the batch path would
+        expires = compute_next_run(t.schedule, occurrence)
+        cres = await self.session.execute(
+            select(Company.operational_day_start)
+            .where(Company.id == t.company_id)
+        )
+        op_key = operational_day_key(
+            occurrence.astimezone(_tz(t.schedule or {})),
+            parse_day_start(cres.scalar_one_or_none()),
+        )
+        created = await self.templates._generate_for_target(
+            t, tgt, occurrence, expires_at=expires, op_key=op_key)
         if created is None:
             raise ValidationErr("This occurrence was already generated.")
-        await self.session.commit()
+        try:
+            await self.session.commit()
+        except IntegrityError:
+            # ledger/unique race — a concurrent tick generated this occurrence
+            await self.session.rollback()
+            raise ValidationErr("This occurrence was already generated.")
         # reload with history eagerly loaded for serialization
         from app.services.task import TaskService
         return await TaskService(self.session)._get_task(user, created.id)
@@ -480,7 +580,12 @@ class TaskOpsService:
             "zone_name": zmap.get(t.zone_id),
             "assigned_to": t.assigned_to_name,
             "generated_at": t.created_at.isoformat() if t.created_at else None,
-            "scheduled_for": t.due_date,
+            # Real occurrence instant for recurring instances; legacy
+            # rows only have the display due_date string.
+            "scheduled_for": (
+                t.scheduled_for.isoformat() if t.scheduled_for
+                else t.due_date
+            ),
             "status": t.status,
             "priority": t.priority,
             "source": "template" if t.template_id else ("recurring" if t.recurrence else "manual"),

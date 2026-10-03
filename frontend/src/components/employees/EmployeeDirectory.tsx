@@ -20,6 +20,7 @@ import { ConfirmationDialog } from '../ui/ConfirmationDialog';
 import { Employee } from '../../types';
 import { getInitials } from '../../lib/utils';
 import { isEmployeeDeactivated } from '../../lib/employeeUtils';
+import { fmtDateTimeIST } from '../../lib/datetime';
 
 export const EmployeeDirectory: React.FC<{ deactivated?: boolean }> = ({
   deactivated = false,
@@ -363,7 +364,7 @@ export const EmployeeDirectory: React.FC<{ deactivated?: boolean }> = ({
 
                   {isDeactivated ? (
                     <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-[#FDE8E8] text-[#A82828]">
-                      Deactivated{emp.deactivated_at ? ` · ${new Date(emp.deactivated_at).toLocaleString()}` : ''}
+                      Deactivated{emp.deactivated_at ? ` · ${fmtDateTimeIST(emp.deactivated_at)}` : ''}
                     </span>
                   ) : emp.status === 'On Leave' || emp.leave_status ? (
                     <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-[#FEF3E8] text-[#8C3F03]">

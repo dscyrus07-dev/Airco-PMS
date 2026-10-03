@@ -9,20 +9,13 @@ import { Badge } from '../ui/Badge';
 import { Button } from '../ui/Button';
 import { mediaUrl } from '../../api/client';
 import { CompletionEvidenceLightbox, EvidenceImage } from './CompletionEvidenceLightbox';
+import { fmtDateTimeIST } from '../../lib/datetime';
 
 interface Props {
   onOpenTask: (uid: string, kind: 'task' | 'maintenance') => void;
 }
 
-function fmtSubmitted(iso?: string | null): string {
-  if (!iso) return '—';
-  const d = new Date(iso);
-  if (isNaN(d.getTime())) return iso;
-  return d.toLocaleString('en-IN', {
-    day: 'numeric', month: 'short',
-    hour: '2-digit', minute: '2-digit', hour12: true,
-  });
-}
+const fmtSubmitted = fmtDateTimeIST;
 
 /**
  * Pending Check — employee-submitted work awaiting Property Manager review.

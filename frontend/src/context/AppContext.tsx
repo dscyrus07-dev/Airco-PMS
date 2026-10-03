@@ -32,7 +32,7 @@ import {
 import { generateId } from '../lib/utils';
 import { can } from '../lib/permissions';
 import { isEmployeeDeactivated } from '../lib/employeeUtils';
-import { ApiError, setUnauthorizedHandler } from '../api/client';
+import { ApiError, getAuthToken, setUnauthorizedHandler } from '../api/client';
 import * as authApi from '../api/auth';
 import * as companiesApi from '../api/companies';
 import * as propertiesApi from '../api/properties';
@@ -112,6 +112,7 @@ interface AppContextType {
     phone?: string;
     address?: string;
     pin_code?: string;
+    operational_day_start?: string;
   }) => Promise<void>;
 
   // Normalized Data (server state)
@@ -614,12 +615,34 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     await p;
   }, [activePropertyUid, currentUser]);
 
+  // Wipe every tenant-scoped collection — shared by logout and the
+  // unauthorized handler so a dead session can't leave stale data behind
+  // for the next user who signs in on this browser.
+  const clearSessionState = useCallback(() => {
+    setCurrentUser(null);
+    setCompany(null);
+    setActivePropertyUid('');
+    setProperties([]);
+    setAreas([]);
+    setZones([]);
+    setRooms([]);
+    setDorms([]);
+    setWashrooms([]);
+    setEmployees([]);
+    setTasks([]);
+    setMaintenanceTickets([]);
+  }, []);
+
   // -------------------------------------------------------------------
   // Session bootstrap: token present → GET /auth/me → load workspace
   // -------------------------------------------------------------------
   useEffect(() => {
     let cancelled = false;
     const bootstrap = async () => {
+      // No stored access token → no session to restore. Skip /auth/me
+      // entirely — calling it would produce a doomed 401 that fires the
+      // unauthorized handler and bounces public pages to /login.
+      if (!getAuthToken()) return;
       try {
         const { user, company: userCompany } = await authApi.me();
         if (cancelled) return;
@@ -637,15 +660,15 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     };
   }, [loadWorkspace]);
 
-  // Session expiry: API client fires this on any 401
+  // Session expiry: API client fires this when a 401 survives the
+  // single refresh retry — clear the full session, not just the user.
   useEffect(() => {
     setUnauthorizedHandler(() => {
-      setCurrentUser(null);
-      setCompany(null);
+      clearSessionState();
       routerNavigate('/login');
     });
     return () => setUnauthorizedHandler(null);
-  }, [routerNavigate]);
+  }, [routerNavigate, clearSessionState]);
 
   const currentRole: UserRole = currentUser?.role || 'super_admin';
   const isAuthenticated = !!currentUser;
@@ -773,24 +796,14 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   const logout = useCallback(() => {
     void authApi.logout(); // best-effort server-side invalidation
-    setCurrentUser(null);
-    setCompany(null);
-    setProperties([]);
-    setAreas([]);
-    setZones([]);
-    setRooms([]);
-    setDorms([]);
-    setWashrooms([]);
-    setEmployees([]);
-    setTasks([]);
-    setMaintenanceTickets([]);
+    clearSessionState();
     routerNavigate('/');
     addToast({
       type: 'info',
       title: 'Logged Out',
       description: 'You have been signed out of Management Tool.',
     });
-  }, [routerNavigate, addToast]);
+  }, [routerNavigate, addToast, clearSessionState]);
 
   const registerCompanyAccount = useCallback(
     async (payload: RegisterCompanyRequest) => {
@@ -841,6 +854,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       phone?: string;
       address?: string;
       pin_code?: string;
+      operational_day_start?: string;
     }) => {
       if (!company) return;
       const updated = await companiesApi.updateCompany(company.company_uid, updates);

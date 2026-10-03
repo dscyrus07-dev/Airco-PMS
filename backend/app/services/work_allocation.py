@@ -344,7 +344,7 @@ class WorkAllocationService:
                 Task.property_id == property_id,
                 Task.employee_id.in_(employee_ids),
                 Task.status.notin_(
-                    ("completed", "cancelled", "scheduled")
+                    ("completed", "cancelled", "scheduled", "abandoned")
                 ),
             )
             .group_by(Task.employee_id)

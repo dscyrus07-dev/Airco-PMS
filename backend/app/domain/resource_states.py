@@ -39,8 +39,9 @@ BLOCKING_TASK = {
     "reopened", "scheduled", "overdue",
 }
 
-# Terminal work states — the inverse of BLOCKING_TASK.
-TERMINAL_TASK = {"completed", "cancelled"}
+# Terminal work states — the inverse of BLOCKING_TASK. `abandoned` is set
+# only by the daily rollover when an unfinished task's operational day ends.
+TERMINAL_TASK = {"completed", "cancelled", "abandoned"}
 TERMINAL_TICKET = {"closed", "cancelled"}
 
 # States derive() is allowed to release from. "occupied" and "available" are

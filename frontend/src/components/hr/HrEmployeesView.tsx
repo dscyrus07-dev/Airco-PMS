@@ -10,6 +10,7 @@ import { ApiError } from '../../api/client';
 import * as hrApi from '../../api/hr';
 import { DEPARTMENTS } from '../employees/CreateEmployeeModal';
 import { Employee } from '../../types';
+import { fmtDateIST, fmtDateTimeIST } from '../../lib/datetime';
 
 const inputCls =
   'w-full px-3.5 py-2.5 bg-white border border-[#DDD7CB] rounded-[10px] font-body text-sm text-[#24221F] placeholder-[#B5AFA1] focus:outline-none focus:ring-[3px] focus:ring-[#386641]/15 focus:border-[#386641] transition-all';
@@ -190,7 +191,7 @@ export const HrEmployeesView: React.FC = () => {
                       <div className="text-xs text-[#8C867C]">{e.department || '—'}</div>
                     </div>
                     <div className="text-xs text-[#8C867C]">
-                      {e.created_at ? new Date(e.created_at).toLocaleDateString('en-IN') : ''}
+                      {e.created_at ? fmtDateIST(e.created_at) : ''}
                     </div>
                   </div>
                 ))}
@@ -303,11 +304,7 @@ export const HrEmployeesView: React.FC = () => {
                   </div>
                 </div>
                 <div className="text-xs text-[#8C867C] shrink-0">
-                  {l.created_at
-                    ? new Date(l.created_at).toLocaleString('en-IN', {
-                        day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit',
-                      })
-                    : ''}
+                  {l.created_at ? fmtDateTimeIST(l.created_at) : ''}
                 </div>
               </div>
             ))}

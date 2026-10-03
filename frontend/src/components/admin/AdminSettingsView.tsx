@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Building2, Database, RefreshCw } from 'lucide-react';
+import { Building2, Clock3, Database, RefreshCw } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { Card } from '../ui/Card';
 import { Button } from '../ui/Button';
@@ -32,6 +32,9 @@ export const AdminSettingsView: React.FC = () => {
   const [phone, setPhone] = useState(company?.phone || '');
   const [isSaving, setIsSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [dayStart, setDayStart] = useState(company?.operational_day_start || '06:00');
+  const [isSavingDay, setIsSavingDay] = useState(false);
+  const [dayError, setDayError] = useState<string | null>(null);
 
   const handleSaveCompany = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -149,6 +152,72 @@ export const AdminSettingsView: React.FC = () => {
               Save Organization Info
             </Button>
           </div>
+        </form>
+      </Card>
+
+      {/* Operational Day — drives the daily rollover + task analysis */}
+      <Card className="p-6">
+        <div className="flex items-center gap-2 mb-2">
+          <Clock3 className="w-4 h-4 text-[#386641]" />
+          <h3 className="font-display font-bold text-base text-[#24221F]">
+            Operational Day
+          </h3>
+        </div>
+        <p className="text-xs text-[#6C675F] font-body mb-4">
+          The time each operational day begins (IST). At this moment every
+          unfinished task from the previous day is automatically marked
+          Abandoned, and the task calendar/analysis group work by this window.
+        </p>
+
+        {dayError && (
+          <div
+            role="alert"
+            className="mb-4 p-3 rounded-[10px] bg-[#FDE8E8] border border-[#F9C3C3] text-[#A32A2A] text-xs font-medium"
+          >
+            {dayError}
+          </div>
+        )}
+
+        <form
+          onSubmit={async (e) => {
+            e.preventDefault();
+            if (isSavingDay) return;
+            setIsSavingDay(true);
+            setDayError(null);
+            try {
+              await updateCompanyDetails({ operational_day_start: dayStart });
+              addToast({
+                type: 'success',
+                title: 'Settings Saved',
+                description: `Operational day now starts at ${dayStart} IST.`,
+              });
+            } catch (err) {
+              setDayError(
+                err instanceof ApiError
+                  ? err.message
+                  : 'Could not save the operational day start.'
+              );
+            } finally {
+              setIsSavingDay(false);
+            }
+          }}
+          className="flex items-end gap-4"
+        >
+          <div>
+            <label className="block text-xs font-semibold text-[#45413B] uppercase tracking-wider mb-1">
+              Operational Day Starts At (IST)
+            </label>
+            <input
+              type="time"
+              required
+              value={dayStart}
+              onChange={(e) => setDayStart(e.target.value)}
+              className="px-3.5 py-2 bg-[#FAF8F5] border border-[#DDD7CB] rounded-[10px] text-sm text-[#24221F] focus:outline-none focus:ring-2 focus:ring-[#386641]"
+            />
+          </div>
+          <Button type="submit" variant="primary" isLoading={isSavingDay}>
+            Save
+          </Button>
         </form>
       </Card>
 

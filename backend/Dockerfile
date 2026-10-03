@@ -29,7 +29,7 @@ USER appuser
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=6s --start-period=20s --retries=3 \
-    CMD ["python", "-c", "import os,sys,urllib.request; sys.exit(0) if os.environ.get('PROCESS_ROLE') == 'worker' else urllib.request.urlopen('http://localhost:8000/health', timeout=4)"]
+    CMD ["python", "-c", "import os,sys,urllib.request; sys.exit(0) if os.environ.get('PROCESS_ROLE') == 'worker' else urllib.request.urlopen('http://localhost:' + os.environ.get('PORT', '8000') + '/health', timeout=4)"]
 
 # --proxy-headers: trust X-Forwarded-* from nginx so request.base_url and
 # client IPs reflect the real client.

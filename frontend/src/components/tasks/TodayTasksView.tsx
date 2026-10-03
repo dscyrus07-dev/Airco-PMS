@@ -8,6 +8,7 @@ import { usePolling } from '../../hooks/usePolling';
 import * as tasksApi from '../../api/tasks';
 import { TodayTaskItem, TodayTasksResponse } from '../../api/types';
 import { Badge } from '../ui/Badge';
+import { fmtTimeIST, fmtDateLongIST } from '../../lib/datetime';
 
 const inputCls =
   'px-3 py-2 text-sm bg-white border border-[#E2DCD0] rounded-[10px] focus:outline-none focus:ring-[3px] focus:ring-[#386641]/15 focus:border-[#386641]';
@@ -23,22 +24,11 @@ const WORK_BADGE: Record<string, 'sage' | 'orange' | 'red' | 'lavender' | 'neutr
   assigned: 'lavender', pending: 'neutral', in_progress: 'orange',
   completed: 'sage', submitted: 'sage', overdue: 'red',
   unassigned: 'neutral', reopened: 'orange', cancelled: 'neutral',
+  abandoned: 'neutral',
 };
 
-function fmtTime(iso?: string): string {
-  if (!iso) return '—';
-  const d = new Date(iso);
-  return isNaN(d.getTime())
-    ? iso.slice(11, 16) || '—'
-    : d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true });
-}
+const fmtTime = fmtTimeIST;
 
-function hourKey(iso?: string): string {
-  if (!iso) return 'Unscheduled';
-  const d = new Date(iso);
-  if (isNaN(d.getTime())) return 'Unscheduled';
-  return d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true });
-}
 
 interface Props {
   onOpenTask: (taskUid: string) => void;
@@ -93,7 +83,7 @@ export const TodayTasksView: React.FC<Props> = ({ onOpenTask }) => {
     if (!data) return [];
     return data.items.filter((i) => {
       // finished work belongs in Task History, not today's schedule
-      if (i.work_status === 'completed' || i.work_status === 'cancelled') return false;
+      if (['completed', 'cancelled', 'abandoned'].includes(i.work_status || '')) return false;
       if (search && !`${i.title} ${i.ticket_number || ''} ${i.assignee || ''} ${i.room_number || ''}`
         .toLowerCase().includes(search.toLowerCase())) return false;
       if (zoneFilter && i.zone_name !== zoneFilter) return false;
@@ -106,14 +96,31 @@ export const TodayTasksView: React.FC<Props> = ({ onOpenTask }) => {
     });
   }, [data, search, zoneFilter, sourceFilter, scope]);
 
-  const timeline = useMemo(() => {
-    const groups = new Map<string, TodayTaskItem[]>();
-    for (const i of filtered) {
-      const k = hourKey(i.scheduled_at);
-      groups.set(k, [...(groups.get(k) || []), i]);
-    }
-    return [...groups.entries()];
+  const rows = useMemo(() => {
+    // Chronological day schedule — the next pending occurrence sits on
+    // top, not the farthest-future one. Generated work lands before its
+    // successor occurrences naturally since it generated earlier.
+    const t = (i: TodayTaskItem) => {
+      const d = i.scheduled_at ? new Date(i.scheduled_at).getTime() : NaN;
+      return isNaN(d) ? Number.MAX_SAFE_INTEGER : d;
+    };
+    return [...filtered].sort((a, b) => t(a) - t(b));
   }, [filtered]);
+
+  // Row aging tint — generated = green baseline; open task stale >1h yellow,
+  // >3h red (red wins over yellow wins over green). Age is measured from the
+  // item's scheduled time.
+  const rowTint = (i: TodayTaskItem): string => {
+    if (i.generation_state !== 'generated') return '';
+    const open = !i.work_status
+      || !['completed', 'cancelled', 'abandoned'].includes(i.work_status);
+    if (open && i.scheduled_at) {
+      const hrs = (Date.now() - new Date(i.scheduled_at).getTime()) / 3.6e6;
+      if (hrs > 3) return 'bg-[#FDE8E8]';
+      if (hrs > 1) return 'bg-[#FDF3DC]';
+    }
+    return 'bg-[#EDF6EF]';
+  };
 
   const summary = data?.summary;
   const attention = summary
@@ -131,7 +138,7 @@ export const TodayTasksView: React.FC<Props> = ({ onOpenTask }) => {
         <div>
           <h2 className="font-display font-bold text-xl text-[#24221F]">Today's Tasks</h2>
           <p className="text-sm text-[#8C867C]">
-            {data ? new Date(data.date + 'T00:00:00').toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' }) : ''}
+            {data ? fmtDateLongIST(data.date) : ''}
           </p>
         </div>
         {summary && (
@@ -140,7 +147,7 @@ export const TodayTasksView: React.FC<Props> = ({ onOpenTask }) => {
               ['Planned', summary.total_planned], ['Generated', summary.generated],
               ['Pending', summary.pending_generation], ['Assigned', summary.assigned],
               ['In Progress', summary.in_progress], ['Completed', summary.completed],
-              ['Overdue', summary.overdue],
+              ['Abandoned', summary.abandoned], ['Overdue', summary.overdue],
             ].map(([l, n]) => (
               <span key={l as string} className={`px-2.5 py-1.5 rounded-[9px] text-[11px] font-semibold border ${
                 l === 'Overdue' && (n as number) > 0
@@ -206,10 +213,10 @@ export const TodayTasksView: React.FC<Props> = ({ onOpenTask }) => {
         </button>
       </div>
 
-      {/* Timeline */}
+      {/* Table */}
       {loading ? (
         <p className="text-sm text-[#8C867C] py-12 text-center">Loading today's schedule…</p>
-      ) : timeline.length === 0 ? (
+      ) : rows.length === 0 ? (
         <div className="py-16 text-center">
           <CalendarCheck className="w-10 h-10 text-[#D5CFC3] mx-auto mb-3" />
           <p className="text-sm font-medium text-[#6C675F]">No work scheduled for today</p>
@@ -218,83 +225,91 @@ export const TodayTasksView: React.FC<Props> = ({ onOpenTask }) => {
           </p>
         </div>
       ) : (
-        <div className="space-y-5">
-          {timeline.map(([hour, items]) => (
-            <div key={hour}>
-              <div className="flex items-center gap-3 mb-2.5">
-                <span className="text-[11px] font-bold text-[#8C867C] tracking-wider">{hour}</span>
-                <div className="flex-1 h-px bg-[#EAE5DC]" />
-                <span className="text-[10px] text-[#B5AEA2]">{items.length} item{items.length > 1 ? 's' : ''}</span>
-              </div>
-              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-                {items.map((item) => {
-                  const pending = item.generation_state === 'pending_generation';
-                  const gen = GEN_BADGE[item.generation_state] || GEN_BADGE.generated;
-                  return (
-                    <div
-                      key={item.occurrence_key || item.task_uid}
-                      className={`rounded-[12px] border p-3.5 flex flex-col gap-2 transition-all ${
-                        pending
-                          ? 'bg-[#FDFCF9] border-dashed border-[#D9D3C7]'
-                          : 'bg-white border-[#EAE5DC] hover:border-[#D5CFC3] hover:shadow-sm'
-                      }`}
-                    >
-                      <div className="flex items-start justify-between gap-2">
-                        <p className="font-semibold text-[14px] text-[#24221F] leading-tight">{item.title}</p>
-                        <div className="flex flex-col items-end gap-1">
-                          <Badge variant={gen.variant} size="sm">{gen.label}</Badge>
-                          {item.work_status && (
-                            <Badge variant={WORK_BADGE[item.work_status] || 'neutral'} size="sm">
-                              {item.work_status.replace(/_/g, ' ')}
-                            </Badge>
-                          )}
-                        </div>
-                      </div>
-                      <p className="text-[12px] text-[#58534C]">
-                        {item.target_label || item.room_number || 'Property-wide'}
-                        {item.zone_name ? ` · ${item.zone_name}` : ''}
-                      </p>
-                      <p className="flex items-center gap-1.5 text-[11.5px] text-[#8C867C]">
-                        <Clock className="w-3 h-3" /> Today · {fmtTime(item.scheduled_at)}
-                      </p>
-                      {pending ? (
-                        <p className="text-[11.5px] text-[#8C867C]">
-                          {item.allocation_method === 'zone_round_robin'
-                            ? 'Automatic · Zone Round Robin'
-                            : item.assignment_mode === 'individual' ? 'Individual assignment' : item.assignment_mode}
-                          {item.template_name ? ` · via ${item.template_name}` : ''}
-                        </p>
-                      ) : (
-                        <p className="text-[11.5px] text-[#58534C]">
-                          {item.assignee ? `Assigned to ${item.assignee}` : 'Unassigned'}
-                          {item.ticket_number ? ` · ${item.ticket_number}` : ''}
-                        </p>
+        <div className="rounded-[12px] border border-[#EAE5DC] bg-white overflow-x-auto">
+          <table className="w-full text-left text-sm min-w-[860px]">
+            <thead>
+              <tr className="border-b border-[#EAE5DC] text-[10.5px] uppercase tracking-wider text-[#8C867C]">
+                <th className="px-3.5 py-2.5 font-semibold">Time</th>
+                <th className="px-3.5 py-2.5 font-semibold">Task</th>
+                <th className="px-3.5 py-2.5 font-semibold">Target</th>
+                <th className="px-3.5 py-2.5 font-semibold">Zone</th>
+                <th className="px-3.5 py-2.5 font-semibold">Assignee</th>
+                <th className="px-3.5 py-2.5 font-semibold">Generation</th>
+                <th className="px-3.5 py-2.5 font-semibold">Status</th>
+                <th className="px-3.5 py-2.5 font-semibold text-right">Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((item) => {
+                const pending = item.generation_state === 'pending_generation';
+                const gen = GEN_BADGE[item.generation_state] || GEN_BADGE.generated;
+                return (
+                  <tr
+                    key={item.occurrence_key || item.task_uid}
+                    className={`border-b border-[#F0ECE4] last:border-0 ${rowTint(item)}`}
+                  >
+                    <td className="px-3.5 py-2.5 whitespace-nowrap text-[12px] text-[#58534C]">
+                      <span className="inline-flex items-center gap-1.5">
+                        <Clock className="w-3 h-3 text-[#A59F95]" /> {fmtTime(item.scheduled_at)}
+                      </span>
+                    </td>
+                    <td className="px-3.5 py-2.5">
+                      <p className="font-semibold text-[13px] text-[#24221F] leading-tight">{item.title}</p>
+                      {item.ticket_number && (
+                        <p className="text-[10.5px] text-[#8C867C]">{item.ticket_number}</p>
                       )}
-                      <div className="flex justify-end pt-1.5 border-t border-[#F0ECE4] mt-auto">
-                        {pending ? (
-                          <button
-                            onClick={() => void generate(item)}
-                            disabled={generating === item.occurrence_key}
-                            className="px-2.5 py-1.5 text-xs font-semibold text-[#386641] hover:bg-[#EBF3EC] rounded-[8px] inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
-                          >
-                            <Zap className="w-3.5 h-3.5" />
-                            {generating === item.occurrence_key ? 'Generating…' : 'Generate Now'}
-                          </button>
-                        ) : (
-                          <button
-                            onClick={() => item.task_uid && onOpenTask(item.task_uid)}
-                            className="px-2.5 py-1.5 text-xs font-semibold text-[#386641] hover:bg-[#EBF3EC] rounded-[8px] inline-flex items-center gap-1 cursor-pointer"
-                          >
-                            Open Task <ChevronRight className="w-3.5 h-3.5" />
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          ))}
+                    </td>
+                    <td className="px-3.5 py-2.5 text-[12px] text-[#58534C]">
+                      {item.target_label || item.room_number || 'Property-wide'}
+                    </td>
+                    <td className="px-3.5 py-2.5 text-[12px] text-[#58534C] whitespace-nowrap">
+                      {item.zone_name || '—'}
+                    </td>
+                    <td className="px-3.5 py-2.5 text-[12px] whitespace-nowrap">
+                      {pending ? (
+                        <span className="text-[#8C867C]">
+                          {item.allocation_method === 'zone_round_robin'
+                            ? 'Auto · Round Robin'
+                            : item.assignment_mode === 'individual' ? 'Individual' : item.assignment_mode || '—'}
+                        </span>
+                      ) : (
+                        <span className="text-[#58534C]">{item.assignee || 'Unassigned'}</span>
+                      )}
+                    </td>
+                    <td className="px-3.5 py-2.5 whitespace-nowrap">
+                      <Badge variant={gen.variant} size="sm">{gen.label}</Badge>
+                    </td>
+                    <td className="px-3.5 py-2.5 whitespace-nowrap">
+                      {item.work_status ? (
+                        <Badge variant={WORK_BADGE[item.work_status] || 'neutral'} size="sm">
+                          {item.work_status.replace(/_/g, ' ')}
+                        </Badge>
+                      ) : '—'}
+                    </td>
+                    <td className="px-3.5 py-2.5 text-right whitespace-nowrap">
+                      {pending ? (
+                        <button
+                          onClick={() => void generate(item)}
+                          disabled={generating === item.occurrence_key}
+                          className="px-2.5 py-1.5 text-xs font-semibold text-[#386641] hover:bg-[#EBF3EC] rounded-[8px] inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                        >
+                          <Zap className="w-3.5 h-3.5" />
+                          {generating === item.occurrence_key ? 'Generating…' : 'Generate Now'}
+                        </button>
+                      ) : (
+                        <button
+                          onClick={() => item.task_uid && onOpenTask(item.task_uid)}
+                          className="px-2.5 py-1.5 text-xs font-semibold text-[#386641] hover:bg-[#EBF3EC] rounded-[8px] inline-flex items-center gap-1 cursor-pointer"
+                        >
+                          Open <ChevronRight className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
         </div>
       )}
     </div>

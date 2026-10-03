@@ -147,3 +147,25 @@ export interface EligibleLocations {
 export async function eligibleLocations(): Promise<EligibleLocations> {
   return apiFetch<EligibleLocations>('/maintenance/eligible-locations');
 }
+
+/** Super Admin: per-operational-day maintenance activity for a month. */
+export async function maintenanceCalendar(
+  month: string,
+  property_uid?: string
+): Promise<import('./types').MaintenanceCalendarResponse> {
+  return apiFetch<import('./types').MaintenanceCalendarResponse>(
+    '/maintenance/calendar',
+    { query: { month, property_uid } }
+  );
+}
+
+/** Super Admin: full maintenance analysis for one operational day. */
+export async function maintenanceDayAnalysis(
+  day: string,
+  property_uid?: string
+): Promise<import('./types').MaintenanceDayAnalysis> {
+  return apiFetch<import('./types').MaintenanceDayAnalysis>(
+    `/maintenance/history/${day}`,
+    { query: { property_uid } }
+  );
+}

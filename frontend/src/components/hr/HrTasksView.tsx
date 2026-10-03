@@ -3,6 +3,7 @@ import { CheckSquare, Search, ChevronDown } from 'lucide-react';
 import { Card } from '../ui/Card';
 import { Badge } from '../ui/Badge';
 import * as hrApi from '../../api/hr';
+import { fmtDateTimeIST } from '../../lib/datetime';
 
 const inputCls =
   'w-full px-3.5 py-2.5 bg-white border border-[#DDD7CB] rounded-[10px] font-body text-sm text-[#24221F] placeholder-[#B5AFA1] focus:outline-none focus:ring-[3px] focus:ring-[#386641]/15 focus:border-[#386641] transition-all';
@@ -182,11 +183,7 @@ export const HrTasksView: React.FC = () => {
                     </div>
                   </div>
                   <div className="text-xs text-[#8C867C] shrink-0">
-                    {t.created_at
-                      ? new Date(t.created_at).toLocaleString('en-IN', {
-                          day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit',
-                        })
-                      : ''}
+                    {t.created_at ? fmtDateTimeIST(t.created_at) : ''}
                   </div>
                 </button>
                 {openUid === t.task_uid && (
@@ -205,9 +202,7 @@ export const HrTasksView: React.FC = () => {
                             </div>
                             <div className="text-[11px] text-[#8C867C]">
                               {e.actor_name || 'System'}
-                              {e.at ? ` · ${new Date(e.at).toLocaleString('en-IN', {
-                                day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit',
-                              })}` : ''}
+                              {e.at ? ` · ${fmtDateTimeIST(e.at)}` : ''}
                               {e.note ? ` — ${e.note}` : ''}
                             </div>
                           </li>

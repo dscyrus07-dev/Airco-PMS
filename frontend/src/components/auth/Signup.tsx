@@ -3,6 +3,7 @@ import { Navigate } from 'react-router-dom';
 import { useApp } from '../../context/AppContext';
 import { Card } from '../ui/Card';
 import { Button } from '../ui/Button';
+import { BackButton } from '../ui/BackButton';
 import { FormField } from './FormField';
 import { PasswordInput } from './PasswordInput';
 import { ApiError } from '../../api/client';
@@ -106,6 +107,9 @@ export const Signup: React.FC = () => {
   return (
     <div className="min-h-[calc(100vh-56px)] flex flex-col items-center justify-center px-4 py-10">
       <div className="w-full max-w-2xl">
+        <div className="mb-6">
+          <BackButton to="/" label="Back to home" />
+        </div>
         {/* Title */}
         <div className="text-center mb-7">
           <div className="inline-flex w-12 h-12 rounded-[14px] bg-[#386641] text-white items-center justify-center font-display font-bold text-xl mb-3 shadow-xs">

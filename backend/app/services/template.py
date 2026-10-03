@@ -18,11 +18,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger
 
+from app.models.company import Company
 from app.models.employee import Employee, employee_is_assignable
 from app.models.maintenance import MaintenanceTicket
 from app.models.occupancy import Occupancy
 from app.models.structure import Area, Bed, Dorm, Room, Washroom, Zone
-from app.models.task import Task, TaskCompletionSubmission
+from app.models.task import Task, TaskCompletionSubmission, TaskHistoryEvent
 from app.models.template import (
     TEMPLATE_STATUSES,
     TEMPLATE_TYPES,
@@ -33,6 +34,11 @@ from app.models.template import (
 from app.models.user import User
 from app.schemas.template import TemplateCreateRequest, TemplateUpdateRequest
 from app.services.maintenance import next_ticket_number
+from app.services.rollover import (
+    RolloverService,
+    operational_day_key,
+    parse_day_start,
+)
 from app.services.structure import (
     ConflictErr,
     NotFoundErr,
@@ -51,10 +57,9 @@ RELATIVE_WEEKS = {"first": 0, "second": 1, "third": 2, "fourth": 3, "last": -1}
 
 
 def _tz(schedule: dict) -> ZoneInfo:
-    try:
-        return ZoneInfo(schedule.get("timezone") or DEFAULT_TZ)
-    except Exception:
-        return ZoneInfo(DEFAULT_TZ)
+    # Single-timezone product: every schedule is interpreted in IST. Any
+    # `timezone` value stored in a template config is ignored by design.
+    return ZoneInfo(DEFAULT_TZ)
 
 
 def _parse_hm(value: str | None, default: dtime) -> dtime:
@@ -75,6 +80,8 @@ def compute_next_run(schedule: dict, after: datetime,
     allows past, so one-time templates terminate after their single run."""
     if not schedule:
         return None
+    if after.tzinfo is None:
+        after = after.replace(tzinfo=timezone.utc)  # sqlite round-trip
     tz = _tz(schedule)
     now_local = after.astimezone(tz)
     start_d = None
@@ -122,11 +129,14 @@ def compute_next_run(schedule: dict, after: datetime,
                             dtime(10, 0))
     cursor = (start_d or now_local.date())
 
-    if freq == "hourly":
-        # every N hours inside a daily window [start_time, window_end]
+    if freq in ("hourly", "minutes"):
+        # every N hours/minutes inside a daily window
+        # [start_time, window_end] — e.g. minutes×30 → 10:00,10:30,11:00…
         win_start = _parse_hm(schedule.get("start_time"), dtime(0, 0))
         win_end = _parse_hm(schedule.get("end_time") or schedule.get("window_end"),
                             dtime(23, 59))
+        step = (timedelta(hours=every) if freq == "hourly"
+                else timedelta(minutes=every))
         for day_off in range(0, 380):
             d = cursor + timedelta(days=day_off)
             t = datetime.combine(d, win_start, tzinfo=tz)
@@ -134,7 +144,7 @@ def compute_next_run(schedule: dict, after: datetime,
             while t <= end:
                 if ok(t):
                     return t.astimezone(timezone.utc)
-                t += timedelta(hours=every)
+                t += step
         return None
 
     for day_off in range(0, 3660):
@@ -574,8 +584,14 @@ class TemplateService:
     ) -> dict:
         """Generate work for every active template whose run is due.
 
-        Only the latest missed occurrence is generated — a restarted server
-        doesn't spam a backlog of stale daily tasks.
+        Catch-up policy: only the LATEST due occurrence is materialized —
+        when the scheduler missed multiple slots (downtime), superseded
+        occurrences are skipped without rows and `next_run_at` advances
+        straight to the newest due slot, which then gets its full
+        validity window. A restarted server never dumps a backlog of
+        instantly-expired stale tasks. Previously live instances are
+        still expired at their own `expires_at` by the sweep — downtime
+        never extends a task's validity.
 
         The scheduler calls this unscoped (global tick); the API endpoint
         passes the caller's tenant scope so a manual trigger can only fire
@@ -595,8 +611,24 @@ class TemplateService:
         stats = {"templates": 0, "generated": 0, "skipped": 0}
         for t in res.scalars():
             stats["templates"] += 1
+            # Collapse missed slots: find the LATEST due occurrence —
+            # every superseded slot is skipped, none of them materialize
+            # (no tasks, no ledger rows). The cursor is only advanced
+            # AFTER successful generation, so a failed run retries the
+            # occurrence next tick instead of losing it.
+            occurrence = t.next_run_at or now
+            nxt = compute_next_run(t.schedule, occurrence)
+            while nxt is not None and nxt <= now:
+                occurrence, nxt = nxt, compute_next_run(t.schedule, nxt)
             try:
-                created = await self._generate(t, now)
+                # Insurance for direct calls (manual API trigger) that
+                # bypass the ordered tick: expire this template's own
+                # due instances so a still-open predecessor can't block
+                # its successor through uq_tasks_open_room_title.
+                await RolloverService(self.session).expire_due(
+                    now, template_id=t.id)
+                created = await self._generate(
+                    t, now, occurrence=occurrence)
                 stats["generated"] += created
             except IntegrityError:
                 logger.warning(
@@ -612,8 +644,8 @@ class TemplateService:
                 await self.session.rollback()
                 stats["skipped"] += 1
                 continue
-            t.last_run_at = t.next_run_at or now
-            t.next_run_at = compute_next_run(t.schedule, t.next_run_at or now)
+            t.last_run_at = occurrence
+            t.next_run_at = nxt
             try:
                 await self.session.commit()
             except IntegrityError:
@@ -633,8 +665,23 @@ class TemplateService:
                 stats["generated"] -= created
         return stats
 
-    async def _generate(self, t: WorkTemplate, now: datetime) -> int:
-        occurrence = t.next_run_at or now
+    async def _generate(self, t: WorkTemplate, now: datetime,
+                        *, occurrence: datetime | None = None) -> int:
+        occurrence = occurrence or t.next_run_at or now
+        # Validity window: each instance lives until the NEXT scheduled
+        # boundary (None when the schedule is exhausted — the final
+        # occurrence then falls back to the daily rollover like any
+        # other task). Computed from the recurrence interval, never
+        # hardcoded.
+        expires = compute_next_run(t.schedule, occurrence)
+        cres = await self.session.execute(
+            select(Company.operational_day_start)
+            .where(Company.id == t.company_id)
+        )
+        op_key = operational_day_key(
+            occurrence.astimezone(_tz(t.schedule or {})),
+            parse_day_start(cres.scalar_one_or_none()),
+        )
         targets = await self._expand_targets(t)
         if not targets:
             return 0
@@ -744,6 +791,7 @@ class TemplateService:
                 row = await self._generate_for_target(
                     t, tgt, occurrence, alloc=alloc, is_maint=is_maint,
                     location=tgt["_loc"], ledger_checked=True,
+                    expires_at=expires, op_key=op_key,
                 )
                 if row is not None:
                     count += 1
@@ -790,7 +838,9 @@ class TemplateService:
                                    occurrence: datetime, *,
                                    alloc=None, is_maint: bool | None = None,
                                    location=None,
-                                   ledger_checked: bool = False):
+                                   ledger_checked: bool = False,
+                                   expires_at=None,
+                                   op_key: str | None = None):
         """Generate a single work item for one target at one occurrence.
 
         Idempotent via the ledger — returns None when the occurrence was
@@ -850,10 +900,18 @@ class TemplateService:
             row = await self._make_ticket(t, tgt, alloc, num)
         else:
             num = await next_ticket_number(self.session, "task")
-            row = await self._make_task(t, tgt, alloc, num, occurrence)
-        self.session.add(row)
+            row = await self._make_task(t, tgt, alloc, num, occurrence,
+                                        expires_at=expires_at,
+                                        op_key=op_key)
+        # Snapshot strings BEFORE the flush — if the savepoint path fails the
+        # session expires ORM attrs and a lazy reload here would re-raise.
+        tname, tlabel = t.name, tgt["label"]
         try:
+            # begin_nested() must run BEFORE the row is added: entering the
+            # context eagerly flushes pending objects, so an add()ed row would
+            # INSERT outside the savepoint and poison the outer transaction.
             async with self.session.begin_nested():  # SAVEPOINT — one dup
+                self.session.add(row)
                 await self.session.flush()           # can't kill the batch
         except IntegrityError:
             # uq_tasks_open_room_title race — a concurrent generation or
@@ -861,7 +919,7 @@ class TemplateService:
             # between the pre-check and this insert. Skip just this target.
             logger.info(
                 "Template %s occurrence %s skipped — duplicate open task "
-                "for target %s", t.name, key, tgt["label"],
+                "for target %s", tname, key, tlabel,
             )
             return None
         if is_maint:
@@ -874,6 +932,18 @@ class TemplateService:
             )
         else:
             row._resolved_area_id = location.area_id
+            occ_dt = occurrence
+            if occ_dt.tzinfo is None:
+                occ_dt = occ_dt.replace(tzinfo=timezone.utc)
+            self.session.add(TaskHistoryEvent(
+                task_id=row.id, type="auto_generated",
+                actor_name="Template Scheduler",
+                note=(
+                    f"Generated for the "
+                    f"{occ_dt.astimezone(_tz(t.schedule or {})).strftime('%Y-%m-%d %H:%M')} "
+                    f"occurrence of template '{t.name}'"
+                ),
+            ))
         if alloc:
             self.alloc.log_task_allocation(
                 alloc, task_id=row.id, room=location.room_label,
@@ -914,7 +984,7 @@ class TemplateService:
                 Task.property_id == t.property_id,
                 Task.room_id.in_(room_ids),
                 Task.title == t.name,
-                Task.status.notin_(("completed", "cancelled")),
+                Task.status.notin_(("completed", "cancelled", "abandoned")),
             )
         )
         return set(res.scalars())
@@ -945,7 +1015,7 @@ class TemplateService:
                 Task.property_id == t.property_id,
                 Task.room_id == tgt["room_id"],
                 Task.title == t.name,
-                Task.status.notin_(("completed", "cancelled")),
+                Task.status.notin_(("completed", "cancelled", "abandoned")),
             )
             .limit(1)
         )
@@ -1022,7 +1092,8 @@ class TemplateService:
             return None
         return emp
 
-    async def _make_task(self, t, tgt, alloc, num, occurrence) -> Task:
+    async def _make_task(self, t, tgt, alloc, num, occurrence, *,
+                         expires_at=None, op_key: str | None = None) -> Task:
         emp_id, emp_name = None, None
         status_, amethod, areason = "pending", self._assign_method(t), None
         if alloc and alloc.employee:
@@ -1066,6 +1137,8 @@ class TemplateService:
             start_time=(t.schedule or {}).get("start_time"),
             created_by_name="Template Scheduler",
             template_id=t.id, template_version=t.version,
+            scheduled_for=occurrence, expires_at=expires_at,
+            operational_date=op_key,
             allocation_batch_id=alloc.batch.id if alloc else None,
             allocation_status="auto_assigned" if emp_id else "unassigned",
             allocation_method=amethod, allocation_reason=areason,
@@ -1161,6 +1234,13 @@ class TemplateService:
             zid = _uid(loc.get("zone_uid"))
             target = loc.get("target") or "units"
             zname = zn(zid)
+            if target == "common_area":
+                # common-area work is per-zone — one task for everything
+                # shared (corridors, café, pool washroom…) not per unit
+                return [{"key": f"zone:{zid}", "zone_id": zid,
+                         "zone_name": zname,
+                         "label": f"{zname} common area" if zname
+                                  else "Common area"}]
             if target in ("rooms", "units", "rooms_beds"):
                 for r in st["rooms"]:
                     if r.zone_id != zid or not keep_room(r):
@@ -1205,6 +1285,20 @@ class TemplateService:
             # units inside the area — directly (unit.area_id) or via their zone
             area_zones = [z for z in st["zones"].values() if z.area_id == aid]
             zone_ids = {z.id for z in area_zones}
+
+            if target == "common_area":
+                for z in sorted(area_zones, key=lambda z: z.name or ""):
+                    out.append({"key": f"zone:{z.id}", "zone_id": z.id,
+                                "zone_name": z.name,
+                                "label": f"{z.name} common area"})
+                if not out:
+                    a = st["areas"].get(aid)
+                    out.append({"key": f"area:{aid}", "zone_id": None,
+                                "area_id": aid,
+                                "zone_name": a.name if a else None,
+                                "label": f"{a.name} common area" if a
+                                         else "Common area"})
+                return out
 
             def in_area(u) -> bool:
                 return u.area_id == aid or u.zone_id in zone_ids
@@ -1355,6 +1449,16 @@ class TemplateService:
             # rooms instead of collapsing into ONE property-wide task handed
             # to a single employee.
             target = "rooms"
+        if target == "common_area":
+            # One task per zone — the zone is the unit of common-area work.
+            for z in sorted(st["zones"].values(), key=lambda z: z.name or ""):
+                out.append({"key": f"zone:{z.id}", "zone_id": z.id,
+                            "zone_name": z.name,
+                            "label": f"{z.name} common area"})
+            if not out:
+                out.append({"key": f"property:{pid}", "zone_id": None,
+                            "zone_name": None, "label": "Common area"})
+            return out
         if target in ("rooms", "units", "rooms_beds"):
             for r in st["rooms"]:
                 if not keep_room(r):

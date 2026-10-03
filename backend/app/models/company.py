@@ -20,6 +20,11 @@ class Company(Base):
     email: Mapped[str] = mapped_column(String(255), nullable=False)
     phone_number: Mapped[str] = mapped_column(String(32), nullable=False)
     legal_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # 'HH:MM' IST wall-clock — rollover closes the operational day at this
+    # time; analysis groups work by it. Default 06:00 (hotel convention).
+    operational_day_start: Mapped[str] = mapped_column(
+        String(5), nullable=False, default="06:00", server_default="06:00"
+    )
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

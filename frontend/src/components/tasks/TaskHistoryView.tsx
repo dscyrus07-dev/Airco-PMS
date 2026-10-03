@@ -4,6 +4,7 @@ import { useApp } from '../../context/AppContext';
 import * as tasksApi from '../../api/tasks';
 import { TaskHistoryItem, TaskHistoryResponse } from '../../api/types';
 import { Badge } from '../ui/Badge';
+import { fmtTimeIST, fmtDateTimeIST, parseIso, isSameISTDay, istDateKeyOffset } from '../../lib/datetime';
 
 const inputCls =
   'px-2.5 py-2 text-xs bg-white border border-[#E2DCD0] rounded-[9px] focus:outline-none focus:ring-[3px] focus:ring-[#386641]/15 focus:border-[#386641]';
@@ -11,7 +12,7 @@ const inputCls =
 const STATUS_VARIANT: Record<string, 'sage' | 'orange' | 'red' | 'lavender' | 'neutral'> = {
   assigned: 'lavender', pending: 'neutral', in_progress: 'orange',
   completed: 'sage', submitted: 'sage', overdue: 'red', cancelled: 'neutral',
-  reopened: 'orange',
+  abandoned: 'red', reopened: 'orange',
 };
 
 const DATE_PRESETS = [
@@ -21,11 +22,8 @@ const DATE_PRESETS = [
 ];
 
 function dateRange(preset: string): { date_from?: string; date_to?: string } {
-  const d = (off: number) => {
-    const x = new Date();
-    x.setDate(x.getDate() + off);
-    return x.toISOString().slice(0, 10);
-  };
+  // IST calendar days — not UTC slices; IST has no DST so day math is exact
+  const d = istDateKeyOffset;
   switch (preset) {
     case 'today': return { date_from: d(0), date_to: d(0) };
     case 'yesterday': return { date_from: d(-1), date_to: d(-1) };
@@ -36,14 +34,9 @@ function dateRange(preset: string): { date_from?: string; date_to?: string } {
 }
 
 function fmtTs(iso?: string): string {
-  if (!iso) return '—';
-  const d = new Date(iso);
-  if (isNaN(d.getTime())) return iso.slice(0, 16);
-  const today = new Date().toDateString() === d.toDateString();
-  return today
-    ? d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })
-    : d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' }) +
-        ' ' + d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' });
+  const d = parseIso(iso);
+  if (!d) return '—';
+  return isSameISTDay(d) ? fmtTimeIST(d) : fmtDateTimeIST(d);
 }
 
 interface Props {
@@ -143,7 +136,7 @@ export const TaskHistoryView: React.FC<Props> = ({ onOpenTask }) => {
         </select>
         <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} className={`${inputCls} cursor-pointer`}>
           <option value="">All statuses</option>
-          {['pending', 'assigned', 'in_progress', 'submitted', 'completed', 'overdue', 'cancelled', 'reopened'].map((s) =>
+          {['pending', 'assigned', 'in_progress', 'submitted', 'completed', 'overdue', 'cancelled', 'abandoned', 'reopened'].map((s) =>
             <option key={s} value={s}>{s.replace(/_/g, ' ')}</option>)}
         </select>
         <select value={priorityFilter} onChange={(e) => setPriorityFilter(e.target.value)} className={`${inputCls} cursor-pointer`}>

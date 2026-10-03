@@ -80,6 +80,12 @@ class NotFound(AppError):
     message = "The requested resource was not found."
 
 
+class BadRequest(AppError):
+    status_code = status.HTTP_400_BAD_REQUEST
+    code = "BAD_REQUEST"
+    message = "Invalid request."
+
+
 def _uid(v: str | None) -> uuid.UUID | None:
     if not v:
         return None
@@ -381,6 +387,37 @@ async def tasks_pending_check(
     Tasks in 'submitted' + maintenance tickets in 'resolved'."""
     from app.services.task_ops import TaskOpsService
     return await TaskOpsService(session).pending_check(user, _uid(property_uid))
+
+
+@router.get("/tasks/calendar")
+async def tasks_calendar(
+    month: str = Query(...),
+    property_uid: str | None = Query(default=None),
+    user: User = Depends(require_super_admin),
+    session: AsyncSession = Depends(get_db),
+):
+    """Task calendar — per-operational-day activity counts for a month
+    (YYYY-MM). Dates with any task activity come back in `days`."""
+    from app.services.day_analysis import DayAnalysisService
+    return await DayAnalysisService(session).calendar(
+        user, _uid(property_uid), month
+    )
+
+
+@router.get("/tasks/history/{day}")
+async def tasks_day_analysis(
+    day: str,
+    property_uid: str | None = Query(default=None),
+    user: User = Depends(require_super_admin),
+    session: AsyncSession = Depends(get_db),
+):
+    """Daily task analysis — full breakdown for one operational day
+    (YYYY-MM-DD): summary, per-task lifecycle, employee/zone/area/category
+    aggregates."""
+    from app.services.day_analysis import DayAnalysisService
+    return await DayAnalysisService(session).day(
+        user, _uid(property_uid), day
+    )
 
 
 # ------------------------------- Areas -----------------------------------
@@ -1129,6 +1166,37 @@ async def list_maintenance(
     return {"items": [ticket_out(t) for t in tickets], "total": len(tickets)}
 
 
+@router.get("/maintenance/calendar")
+async def maintenance_calendar(
+    month: str = Query(...),
+    property_uid: str | None = Query(default=None),
+    user: User = Depends(require_super_admin),
+    session: AsyncSession = Depends(get_db),
+):
+    """Maintenance calendar — per-operational-day ticket activity for one
+    month (YYYY-MM)."""
+    from app.services.maintenance_analysis import MaintenanceAnalysisService
+    return await MaintenanceAnalysisService(session).calendar(
+        user, _uid(property_uid), month
+    )
+
+
+@router.get("/maintenance/history/{day}")
+async def maintenance_day_analysis(
+    day: str,
+    property_uid: str | None = Query(default=None),
+    user: User = Depends(require_super_admin),
+    session: AsyncSession = Depends(get_db),
+):
+    """Daily maintenance analysis — tickets raised/carried/resolved/closed
+    during one operational day (YYYY-MM-DD) with employee/zone/area/
+    category/resource-impact breakdowns."""
+    from app.services.maintenance_analysis import MaintenanceAnalysisService
+    return await MaintenanceAnalysisService(session).day(
+        user, _uid(property_uid), day
+    )
+
+
 @router.get("/maintenance/{ticket_id}")
 async def get_maintenance_ticket(
     ticket_id: uuid.UUID,
@@ -1315,6 +1383,15 @@ async def update_company(
         data["company_name"] = data.pop("name")
     if "phone" in data:
         data["phone_number"] = data.pop("phone")
+    if "operational_day_start" in data:
+        if data["operational_day_start"] is None:
+            data.pop("operational_day_start")
+        else:
+            hh, mm = data["operational_day_start"].split(":")
+            if not (0 <= int(hh) <= 23 and 0 <= int(mm) <= 59):
+                raise BadRequest(
+                    "Operational day start must be a valid HH:MM time."
+                )
     for k, v in data.items():
         setattr(company, k, v)
     await session.commit()

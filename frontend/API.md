@@ -1457,6 +1457,25 @@ scoped server-side. Response: `{ items, total }` sorted newest-first.
 `GET /rooms/{room_uid}/maintenance` — all tickets ever raised for the room,
 newest-first, with timelines.
 
+## Maintenance Calendar + Daily Analysis (super_admin)
+
+`GET /maintenance/calendar?month=YYYY-MM&property_uid=` — per-operational-day
+counts `{raised, carried, resolved, closed, cancelled}` for every day up to
+the current operational day. `carried` = raised earlier, still open during
+that day's window.
+
+`GET /maintenance/history/{YYYY-MM-DD}?property_uid=` — full day analysis:
+summary counts + per-ticket lifecycle (raise/alloc/start/resolve/close/cancel
+times, durations, `status_at_day_end` replayed from the event stream),
+employee/zone/area/category buckets, and resource-state transitions
+(`ResourceStateEvent` chain + live status). All times IST operational-day
+windows from `companies.operational_day_start` — same setting as tasks.
+
+Rollover policy: maintenance tickets **carry forward** — they are never
+auto-abandoned (a ticket is a real-world defect record; abandoning would
+release a still-broken resource). `cancelled` is the existing
+terminal-without-resolution outcome, surfaced as its own metric.
+
 # Task Ticket Workflow (implemented)
 
 Every task now carries `ticket_number` (`TASK-YYYY-NNNNN`, PostgreSQL
@@ -1643,6 +1662,7 @@ assignment reuses the shared WorkAllocationService (one batch per zone).
 - `location.scope`: `property` | `zone` (+`zone_uid`, `target`:
   `rooms|dorms|beds|units`) | `area` | `rooms`/`dorms`/`beds` (+uid lists).
 - `schedule`: `one_time` (`date`,`time`,`end_time`) or `recurring` —
+  `minutes` (`every`, `start_time`, `window_end`),
   `hourly` (`every`, `start_time`, `window_end`), `daily` (`every`, `time`),
   `weekly` (`weekdays` 0=Mon–6=Sun, `time`), `monthly` (`day_of_month` or
   `relative_week`+`relative_weekday`, `time`), `custom` (`every`,
@@ -1650,6 +1670,40 @@ assignment reuses the shared WorkAllocationService (one batch per zone).
 - `status`: `draft` (no generation) → `active` → `paused` → `archived`.
 - `template_type: "maintenance"` generates maintenance tickets; other types
   generate tasks.
+
+### Recurring task instance lifecycle
+
+Every scheduled occurrence is an INDEPENDENT task row — never one task
+repeatedly updated. Each instance carries `scheduled_for` (the occurrence
+instant) and `expires_at` (the NEXT scheduled boundary — the hard validity
+end, derived from the recurrence interval and never extended by scheduler
+downtime). `due_date` remains the display deadline; the new timestamp
+fields are the authoritative lifecycle clock.
+
+- The tick order is `expire_due` → `run_due` → `run_due_repetitive` →
+  daily rollover: an unfinished predecessor is abandoned FIRST so it can
+  never block its successor's `(property, room, title)` slot.
+- At `expires_at` the sweep marks the instance `abandoned` with
+  `abandoned_reason = NEXT_SCHEDULED_OCCURRENCE` (distinct from
+  `SYSTEM_DAILY_ROLLOVER`), `abandoned_at`, `abandoned_from_status`,
+  `operational_date` = the occurrence's own op-day. Conditional updates
+  arbitrate the completion race — a `completed`/`submitted` row is never
+  flipped; a `submitted` task survives expiry (work delivered in-window
+  awaits review) while `pending|assigned|in_progress|reopened|overdue`
+  expire.
+- `start`/`submit`/`complete`/`reopen` on an expired instance return
+  `409` — post-boundary work cannot land. A zero-target occurrence still
+  expires its predecessor.
+- Missed slots: catch-up materializes only the LATEST due occurrence —
+  superseded slots are skipped entirely (no rows), and existing
+  instances keep their original `expires_at`.
+- `tasks` payload exposes `scheduled_for`, `expires_at`,
+  `abandoned_*`, `template_id`, `series_id`; day analysis adds
+  `scheduled_for`/`expires_at` per row and counts
+  `NEXT_SCHEDULED_OCCURRENCE` under `auto_abandoned`.
+- The daily operational rollover skips instances whose `expires_at`
+  is still in the future (a 05:30→06:30 instance survives the 06:00
+  op-day boundary and dies at 06:30 instead).
 
 ---
 
@@ -1667,7 +1721,8 @@ Two different read models — never the same query:
 {
   "date": "2026-09-23",
   "summary": {"total_planned": 32, "generated": 24, "pending_generation": 8,
-              "assigned": 21, "in_progress": 6, "completed": 12, "overdue": 3},
+              "assigned": 21, "in_progress": 6, "completed": 12, "overdue": 3,
+              "abandoned": 2},
   "items": [{
     "item_type": "occurrence",               // or "task"
     "occurrence_key": "<iso>|<target>",
@@ -1676,11 +1731,21 @@ Two different read models — never the same query:
     "template_uid": "…", "template_name": "…",
     "scheduled_at": "…", "zone_name": "…", "target_label": "Room 101",
     "task_uid": null, "ticket_number": null, "assignee": null
+  }],
+  "abandoned_today": [{
+    "task_uid": "…", "ticket_number": "TASK-2026-10990", "title": "…",
+    "source": "template", "priority": "medium", "zone_name": "…",
+    "target_label": "201", "assignee": "Jabir",
+    "scheduled_for": "…", "expires_at": "…",
+    "abandoned_at": "…", "abandoned_from_status": "assigned",
+    "abandoned_reason": "NEXT_SCHEDULED_OCCURRENCE"  // or SYSTEM_DAILY_ROLLOVER
   }]
 }
 ```
 
-Employees only see occurrences/tasks assigned to them.
+`abandoned_today` is keyed off `abandoned_at` within the IST day — a task
+created earlier but abandoned today (expiry sweep or daily rollover)
+still appears. Employees only see occurrences/tasks assigned to them.
 
 ### GET /tasks/history
 
@@ -1689,6 +1754,17 @@ employee_uid, status, priority, task_type, source (template|recurring|
 manual), template_uid, search (id/title/employee/room), page, page_size`.
 Returns `{items, pagination: {page, page_size, total, total_pages}}` —
 server-side filtered and paginated.
+
+### Task Calendar + Daily Analysis (super_admin)
+
+`GET /tasks/calendar?month=YYYY-MM&property_uid=` — per-operational-day
+counts `{generated, allocated, completed, abandoned, active}`.
+
+`GET /tasks/history/{YYYY-MM-DD}?property_uid=` — full day analysis:
+summary metrics, per-task lifecycle (gen/alloc/start/submit/complete/
+abandon times), employee/zone/area/category buckets. All times use the
+IST operational-day window defined by `companies.operational_day_start`
+(read/write via `GET/PATCH /companies/{id}`).
 
 ### POST /templates/{id}/generate-occurrence
 

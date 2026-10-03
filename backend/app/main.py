@@ -12,6 +12,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy.engine import make_url
 
 from app.api.v1.router import api_router
 from app.core.config import settings
@@ -92,11 +93,17 @@ async def lifespan(app: FastAPI):
     for w in settings.production_warnings():
         logger.warning("Production warning: %s", w)
 
+    try:
+        parsed_db = make_url(settings.database_url)
+        db_host, db_port = parsed_db.host, parsed_db.port or 5432
+    except Exception:
+        db_host, db_port = settings.database_host_port, None
+
     last_error: str | None = None
     for attempt in range(1, _DB_STARTUP_ATTEMPTS + 1):
         try:
             await check_database()
-            logger.info("Database connection verified")
+            logger.info("Database connection verified (%s:%s)", db_host, db_port)
             last_error = None
             break
         except Exception as exc:
@@ -108,9 +115,21 @@ async def lifespan(app: FastAPI):
                 )
                 await asyncio.sleep(_DB_STARTUP_RETRY_DELAY)
     if last_error is not None:
-        # Server stays up so /health + diagnostics keep working; every
-        # DB-backed route will report a real 503 until connectivity returns.
-        logger.error("Database connection failed at startup: %s", last_error)
+        # Refuse to serve — an API that cannot reach its only data store
+        # must not log "startup complete" and look healthy. The process
+        # exits non-zero so the launcher/orchestrator reports the failure.
+        # Sanitized: host/port/env/reason only — never credentials.
+        logger.error(
+            "Database connection failed — startup aborted\n"
+            "  Host:        %s\n"
+            "  Port:        %s\n"
+            "  Environment: %s\n"
+            "  Reason:      %s",
+            db_host, db_port, settings.APP_ENV, last_error,
+        )
+        raise RuntimeError(
+            f"Database unavailable at startup ({db_host}:{db_port}): {last_error}"
+        )
     else:
         # Schema drift check — a reachable DB on an old revision produces
         # exactly the "endpoint 503s for no obvious reason" failure mode.
@@ -156,6 +175,15 @@ def _start_template_scheduler():
         ticks = 0
         while True:
             try:
+                # Order is load-bearing: occurrence expiry runs BEFORE
+                # generation so a still-open predecessor releases its
+                # (property, room, title) slot and never blocks the next
+                # recurring instance.
+                async with AsyncSessionLocal() as session:
+                    from app.services.rollover import RolloverService
+                    exp = await RolloverService(session).expire_due()
+                    if exp["expired"]:
+                        logger.info("Occurrence expiry: %s", exp)
                 async with AsyncSessionLocal() as session:
                     stats = await TemplateService(session).run_due()
                     if stats["generated"]:
@@ -164,6 +192,10 @@ def _start_template_scheduler():
                     rep = await TaskService(session).run_due_repetitive()
                     if rep["generated"]:
                         logger.info("Repetitive-task scheduler: %s", rep)
+                async with AsyncSessionLocal() as session:
+                    roll = await RolloverService(session).run()
+                    if roll["abandoned"]:
+                        logger.info("Daily rollover: %s", roll)
                 ticks += 1
                 if ticks % 15 == 0:
                     # state reconciliation sweep — detect + log, never

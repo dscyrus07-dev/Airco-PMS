@@ -50,6 +50,15 @@ frontend/               # React 19 + TS + Vite 8 + Tailwind v4 + react-router-do
   (`automation_rule` JSONB). `series_id` links recurring clones.
   Partial unique index `uq_tasks_open_room_title` = one open task per
   (property, room, title).
+  Recurring instances (template- or series-generated) carry
+  `scheduled_for`/`expires_at` — the occurrence instant and the NEXT
+  scheduled boundary. `RolloverService.expire_due` abandons unfinished
+  (non-`submitted`) instances at `expires_at` with reason
+  `NEXT_SCHEDULED_OCCURRENCE` BEFORE generation runs (tick order matters:
+  an open predecessor must not block its successor). `submitted` survives
+  expiry; the daily op-day rollover (`SYSTEM_DAILY_ROLLOVER`) skips
+  still-valid instances. `uq_tasks_series_due` = one row per
+  (series_id, due_date).
 - **MaintenanceTicket**: `open → assigned → in_progress → on_hold → resolved
   → closed | cancelled`; disapprove reopens. Exactly one target:
   room | dorm | bed | washroom(+fixture). `MT-YYYY-NNNNN` from PG sequence.
@@ -123,7 +132,8 @@ Supabase (Postgres + S3 storage). CI: `.github/workflows/ci.yml`.
 - `cd backend && python -m pytest tests/ -x -q` — 127 tests (sqlite,
   pytest-asyncio) covering allocation fairness, occupancy, lifecycle, and
   the resource-state pipeline.
-- `SUPABASE_DB_HOST` has a hardcoded project default in config.py.
+- DB has no hardcoded default — `DATABASE_URL` (or `SUPABASE_DB_*` parts)
+  must come from env; boot fails fast otherwise.
 - `backend/uploads/` holds real dev-uploaded images referenced by the DB —
   gitignored, but do not delete casually.
 - `frontend/API.md` + `backend/API.md` are the API contract docs; keep in sync.

@@ -34,6 +34,7 @@ import { BulkCreateDormsModal } from './BulkCreateDormsModal';
 import { WashroomModal } from './WashroomModal';
 import { BulkCreateWashroomsModal } from './BulkCreateWashroomsModal';
 import { WashroomsView } from './WashroomsView';
+import { BackButton } from '../ui/BackButton';
 import { WashroomDetailModal } from './WashroomDetailModal';
 import {
   fixtureCountsFor,
@@ -289,6 +290,9 @@ export const RoomsDormsView: React.FC = () => {
       {/* Top Header & CTAs */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
+          <div className="mb-2">
+            <BackButton to={`/property/${activeProperty?.property_uid}/zones`} />
+          </div>
           <div className="flex items-center gap-2">
             <h1 className="font-display font-bold text-2xl sm:text-[28px] text-[#24221F] tracking-tight">
               Accommodations Management

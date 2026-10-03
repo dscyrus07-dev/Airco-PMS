@@ -32,10 +32,11 @@ from app.services.structure import (
 )
 
 # pending=open · assigned · in_progress · submitted (awaiting review)
-# reopened (was rejected) · completed · cancelled · scheduled · overdue
+# reopened (was rejected) · completed · cancelled · abandoned (rollover)
+# scheduled · overdue
 TASK_STATUSES = {
     "pending", "assigned", "in_progress", "submitted", "reopened",
-    "completed", "cancelled", "overdue", "scheduled",
+    "completed", "cancelled", "abandoned", "overdue", "scheduled",
 }
 TASK_TYPES = {"fixed", "repetitive", "automated"}
 PRIORITIES = {"low", "medium", "high", "urgent", "critical"}
@@ -141,6 +142,30 @@ def next_occurrence(task: Task, after: datetime) -> datetime | None:
             return datetime.combine(next_d, anchor)
         next_d += timedelta(days=days)
     return None
+
+
+def _expired(task: Task) -> bool:
+    """Recurring instance past its validity boundary?
+
+    `expires_at` (the next scheduled occurrence) is the authoritative
+    lifecycle clock — never extended by scheduler downtime. A task past
+    it is a dead occurrence: it cannot be worked on, only abandoned by
+    the sweep.
+    """
+    exp = task.expires_at
+    if exp is None:
+        return False
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)  # sqlite round-trip
+    return exp <= datetime.now(timezone.utc)
+
+
+def _raise_if_expired(task: Task) -> None:
+    if _expired(task):
+        raise ConflictErr(
+            "This task's occurrence has expired — the next scheduled "
+            "instance supersedes it."
+        )
 
 
 def _occurrence_due_string(task: Task, occ: datetime) -> str:
@@ -547,6 +572,9 @@ class TaskService:
         task._resolved_area_id = area_id
         if task.task_type == "repetitive":
             task.series_id = task.id  # self-rooted series
+            anchor = _due_dt(task)
+            if anchor is not None:
+                await self._stamp_occurrence_window(task, anchor)
         if auto_alloc:
             self.alloc.log_task_allocation(
                 auto_alloc, task_id=task.id, room=location.room_label,
@@ -743,6 +771,7 @@ class TaskService:
     async def start_task(self, user: User, task_id: uuid.UUID) -> Task:
         task = await self._get_task(user, task_id)
         self._require_assignee(user, task)
+        _raise_if_expired(task)
         if task.status not in {"pending", "assigned", "reopened"}:
             raise ConflictErr(
                 f"Cannot start a {task.status} task."
@@ -808,8 +837,9 @@ class TaskService:
                 "Employees submit work for approval; direct completion "
                 "requires the Super Admin role."
             )
-        if task.status in {"completed", "cancelled", "submitted"}:
+        if task.status in {"completed", "cancelled", "submitted", "abandoned"}:
             raise ConflictErr(f"Task is already {task.status}.")
+        _raise_if_expired(task)
         self._require_resource_authority(user, task)
         urls = await self._evidence_urls(task, payload.photo_urls)
         if not urls:
@@ -859,11 +889,43 @@ class TaskService:
         if occ is None:
             return None
         return await self._spawn_instance(
-            task, _occurrence_due_string(task, occ), actor=user.name
+            task, _occurrence_due_string(task, occ), actor=user.name,
+            occ=occ,
         )
 
+    async def _stamp_occurrence_window(
+        self, task: Task, occ_naive: datetime
+    ) -> None:
+        """Validity window + op-day anchor for one series instance.
+
+        scheduled_for = the occurrence instant; expires_at = the NEXT
+        occurrence on the series grid (None once the schedule ends — the
+        last instance then falls back to daily rollover). Values are
+        naive-IST on the series grid and stored aware-UTC.
+        """
+        from app.models.company import Company
+        from app.models.property import Property
+        from app.services.rollover import (
+            operational_day_key, parse_day_start,
+        )
+        task.scheduled_for = occ_naive.replace(
+            tzinfo=IST).astimezone(timezone.utc)
+        nxt = next_occurrence(task, occ_naive)
+        task.expires_at = (
+            nxt.replace(tzinfo=IST).astimezone(timezone.utc)
+            if nxt else None
+        )
+        res = await self.session.execute(
+            select(Company.operational_day_start)
+            .join(Property, Property.company_id == Company.id)
+            .where(Property.id == task.property_id)
+        )
+        task.operational_date = operational_day_key(
+            occ_naive, parse_day_start(res.scalar_one_or_none()))
+
     async def _spawn_instance(
-        self, task: Task, due: str, *, actor: str
+        self, task: Task, due: str, *, actor: str,
+        occ: datetime | None = None,
     ) -> Task | None:
         """Clone `task` as the next series occurrence.
 
@@ -968,6 +1030,8 @@ class TaskService:
             allocation_method=amethod,
             allocation_reason=areason,
         )
+        if occ is not None:
+            await self._stamp_occurrence_window(new_task, occ)
         self.session.add(new_task)
         await self.session.flush()
         new_task._resolved_area_id = location.area_id
@@ -997,6 +1061,12 @@ class TaskService:
         series so a long-stalled chain doesn't dump a backlog.
         """
         now_l = (now or _local_now()).replace(tzinfo=None)
+        # Insurance for direct calls bypassing the ordered tick: expire
+        # due instances first so a still-open predecessor can't block its
+        # successor through uq_tasks_open_room_title.
+        from app.services.rollover import RolloverService
+        await RolloverService(self.session).expire_due(
+            now_l.replace(tzinfo=IST).astimezone(timezone.utc))
         res = await self.session.execute(
             select(Task).where(
                 Task.task_type == "repetitive",
@@ -1029,7 +1099,8 @@ class TaskService:
                 continue
             try:
                 if await self._spawn_instance(
-                    head, _occurrence_due_string(head, occ), actor="Scheduler"
+                    head, _occurrence_due_string(head, occ),
+                    actor="Scheduler", occ=occ,
                 ):
                     stats["generated"] += 1
                 await self.session.commit()
@@ -1050,8 +1121,9 @@ class TaskService:
         self._require_assignee(user, task)
         if task.status == "submitted":
             raise ConflictErr("Task is already submitted for review.")
-        if task.status in {"completed", "cancelled"}:
+        if task.status in {"completed", "cancelled", "abandoned"}:
             raise ConflictErr(f"Task is already {task.status}.")
+        _raise_if_expired(task)
 
         urls = await self._evidence_urls(task, payload.photo_urls)
         task.status = "submitted"
@@ -1212,10 +1284,15 @@ class TaskService:
     async def reopen_task(self, user: User, task_id: uuid.UUID, note=None) -> Task:
         """Manually reopen a completed/cancelled task."""
         task = await self._get_task(user, task_id)
-        if task.status not in {"completed", "cancelled"}:
+        _raise_if_expired(task)
+        if task.status not in {"completed", "cancelled", "abandoned"}:
             raise ConflictErr(f"Cannot reopen a {task.status} task.")
         task.status = "assigned" if task.employee_id else "pending"
         task.completed_at = None
+        task.abandoned_at = None
+        task.abandoned_reason = None
+        task.abandoned_from_status = None
+        task.operational_date = None
         self._history(task, "reopened", user, note=note)
         if task.room_id or task.dorm_id or task.washroom_id:
             await self._refresh_unit(task, user, "task reopened")
@@ -1233,7 +1310,7 @@ class TaskService:
             raise Forbidden()
         # redo is only meaningful for active/queued work — a submitted task
         # goes through reject; completed/cancelled go through reopen.
-        if task.status in {"submitted", "completed", "cancelled"}:
+        if task.status in {"submitted", "completed", "cancelled", "abandoned"}:
             raise ConflictErr(
                 f"Cannot request a redo on a {task.status} task — "
                 "use reject (submitted) or reopen (completed/cancelled)."

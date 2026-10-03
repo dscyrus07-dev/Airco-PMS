@@ -45,11 +45,11 @@ class ScheduleConfig(BaseModel):
     time: str | None = None               # HH:MM
     end_time: str | None = None
     # recurring
-    frequency: str | None = None          # hourly|daily|weekly|monthly|custom
-    every: int = 1                        # every N hours/days/weeks
+    frequency: str | None = None          # minutes|hourly|daily|weekly|monthly|custom
+    every: int = 1                        # every N minutes/hours/days/weeks
     custom_unit: str | None = None        # days | weeks | months (custom)
-    start_time: str | None = None         # daily window start (hourly)
-    window_end: str | None = None         # daily window end (hourly)
+    start_time: str | None = None         # daily window start (minutes|hourly)
+    window_end: str | None = None         # daily window end (minutes|hourly)
     weekdays: list[int] = Field(default_factory=list)  # 0=Mon … 6=Sun
     day_of_month: int | None = None
     relative_week: str | None = None      # first|second|third|fourth|last

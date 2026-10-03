@@ -18,6 +18,7 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import { Washroom, WashroomFixture } from '../types';
+import { fmtTimeIST, fmtDateIST, parseIso, isSameISTDay, istDateKey, istDateKeyOffset } from './datetime';
 
 export type FixtureStatus = WashroomFixture['status'];
 
@@ -180,26 +181,12 @@ export function summarize(fixtures: WashroomFixture[]): FixtureSummary {
 }
 
 /** Format an ISO timestamp the way the app displays dates — e.g.
- *  "29 Sep · 10:32 AM". */
+ *  "29 Sep · 10:32 am" — always IST, 12-hour. */
 export function fmtTimestamp(iso: string | null | undefined): string {
-  if (!iso) return '—';
-  const d = new Date(iso);
-  if (isNaN(d.getTime())) return '—';
-  const months = [
-    'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
-  ];
-  const now = new Date();
-  const sameDay = d.toDateString() === now.toDateString();
-  const yesterday = new Date(now);
-  yesterday.setDate(now.getDate() - 1);
-  const isYesterday = d.toDateString() === yesterday.toDateString();
-  let h = d.getHours();
-  const ampm = h >= 12 ? 'PM' : 'AM';
-  h = h % 12 || 12;
-  const m = String(d.getMinutes()).padStart(2, '0');
-  const time = `${h}:${m} ${ampm}`;
-  if (sameDay) return `Today · ${time}`;
-  if (isYesterday) return `Yesterday · ${time}`;
-  return `${d.getDate()} ${months[d.getMonth()]} · ${time}`;
+  const d = parseIso(iso);
+  if (!d) return '—';
+  const time = fmtTimeIST(d);
+  if (isSameISTDay(d)) return `Today · ${time}`;
+  if (istDateKey(d) === istDateKeyOffset(-1)) return `Yesterday · ${time}`;
+  return `${fmtDateIST(d)} · ${time}`;
 }

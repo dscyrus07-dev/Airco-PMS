@@ -1,4 +1,5 @@
 import { Task, TaskStatus, AutomationTrigger, RecurrenceSchedule } from '../types';
+import { fmtDateIST, fmtDateTimeIST, isSameISTDay, istDateKey } from './datetime';
 
 /**
  * Effective display status — a non-completed, non-rule task whose due date
@@ -7,21 +8,24 @@ import { Task, TaskStatus, AutomationTrigger, RecurrenceSchedule } from '../type
  * are compared to the start of today.
  */
 export function getEffectiveTaskStatus(task: Task): TaskStatus {
-  if (task.status === 'completed' || task.status === 'scheduled') return task.status;
+  // terminal/planning states are never masked by the due-date check
+  if (
+    task.status === 'completed' || task.status === 'scheduled' ||
+    task.status === 'cancelled' || task.status === 'abandoned'
+  ) return task.status;
   if (task.status === 'overdue') return 'overdue';
   // Review workflow states outrank the due-date mask — a submitted task must
   // stay reviewable and a returned task must show as rework even when late.
   if (task.status === 'submitted' || task.status === 'reopened') return task.status;
   if (task.due_date) {
     const due = new Date(task.due_date);
-    let cmp: Date;
     if (task.due_date.includes('T')) {
-      cmp = new Date();
-    } else {
-      cmp = new Date();
-      cmp.setHours(0, 0, 0, 0);
+      // timestamped due — instant comparison is timezone-free
+      if (due < new Date()) return 'overdue';
+    } else if (istDateKey(due) < istDateKey()) {
+      // plain date — overdue when its IST day is before IST today
+      return 'overdue';
     }
-    if (due < cmp) return 'overdue';
   }
   return task.status || 'pending';
 }
@@ -49,6 +53,7 @@ export const TASK_STATUS_LABELS: Record<TaskStatus, string> = {
   reopened: 'Returned for correction',
   completed: 'Completed',
   cancelled: 'Cancelled',
+  abandoned: 'Abandoned',
   overdue: 'Overdue',
   scheduled: 'Scheduled',
 };
@@ -68,23 +73,11 @@ export const AUTOMATION_TRIGGER_LABELS: Record<AutomationTrigger, string> = {
 export function formatTaskDue(task: Task): string {
   if (!task.due_date) return '—';
   const date = new Date(task.due_date);
-  const today = new Date();
-  const isToday = date.toDateString() === today.toDateString();
-  const label = isToday
-    ? 'Today'
-    : date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  const label = isSameISTDay(date) ? 'Today' : fmtDateIST(date);
   return task.due_time ? `${label} · ${task.due_time}` : label;
 }
 
 export function formatEventTime(iso: string | null | undefined): string {
   // missing/invalid timestamps must not render as epoch (Jan 1 1970)
-  if (!iso) return '—';
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return '—';
-  return d.toLocaleString(undefined, {
-    month: 'short',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit',
-  });
+  return fmtDateTimeIST(iso);
 }

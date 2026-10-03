@@ -11,6 +11,9 @@ Client-supplied company/property ids are never trusted for authorization.
 
 import uuid
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+IST = ZoneInfo("Asia/Kolkata")
 
 from sqlalchemy import delete as sa_delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
@@ -246,7 +249,7 @@ class StructureService:
             scope_zone = rule.get("scope_zone_uid")
             if scope_zone and zone_id and str(zone_id) != scope_zone:
                 continue
-            today = datetime.now(timezone.utc).date().isoformat()
+            today = datetime.now(IST).date().isoformat()
             from app.services.task_location import resolve_task_location
             location = await resolve_task_location(
                 self.session, property_id=property_id,
@@ -1469,7 +1472,7 @@ class StructureService:
             select(Task).where(
                 Task.property_id == prop.id,
                 or_(*scope),
-                Task.status.not_in(("completed", "cancelled")),
+                Task.status.not_in(("completed", "cancelled", "abandoned")),
             ).with_for_update()
         )
         tasks = list(res.scalars())
@@ -1939,7 +1942,7 @@ class StructureService:
                 Task.title == title,
                 Task.room_id == room_id,
                 dorm_cond,
-                Task.status.not_in(("completed", "cancelled")),
+                Task.status.not_in(("completed", "cancelled", "abandoned")),
             )
         )
         return res.scalar_one_or_none() is not None

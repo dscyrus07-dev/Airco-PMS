@@ -25,6 +25,7 @@ import { Badge } from '../ui/Badge';
 import { Modal } from '../ui/Modal';
 import { TemplateWizard } from './TemplateWizard';
 import { TemplateDetailDrawer } from './TemplateDetailDrawer';
+import { fmtTimeIST, fmtDateIST } from '../../lib/datetime';
 
 const TYPE_LABELS: Record<string, string> = {
   task: 'Task', maintenance: 'Maintenance', inspection: 'Inspection',
@@ -137,9 +138,9 @@ function nextRunLabel(t: WorkTemplate): string {
   const when =
     diff < 0 ? 'Due now'
     : diff < 3600000 ? `in ${Math.max(1, Math.round(diff / 60000))} min`
-    : diff < 86400000 ? `today ${d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })}`
-    : days === 0 ? `tomorrow ${d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })}`
-    : d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' });
+    : diff < 86400000 ? `today ${fmtTimeIST(d)}`
+    : days === 0 ? `tomorrow ${fmtTimeIST(d)}`
+    : fmtDateIST(d);
   return `Next run: ${when}`;
 }
 

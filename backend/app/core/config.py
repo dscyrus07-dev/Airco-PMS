@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     # Database — password injected via SUPABASE_DB_PASSWORD or a full URL
     DATABASE_URL: str | None = None
     SUPABASE_DB_PASSWORD: str | None = None
-    SUPABASE_DB_HOST: str = "db.lqaejzcipdozffpftllp.supabase.co"
+    SUPABASE_DB_HOST: str = ""  # required when building the URL from parts
     SUPABASE_DB_PORT: int = 5432
     SUPABASE_DB_NAME: str = "postgres"
     SUPABASE_DB_USER: str = "postgres"
@@ -43,12 +43,10 @@ class Settings(BaseSettings):
     DB_POOL_TIMEOUT: int = 30
 
     # Supabase services (storage configured, not yet implemented)
-    SUPABASE_URL: str = "https://lqaejzcipdozffpftllp.supabase.co"
+    SUPABASE_URL: str = ""
     SUPABASE_PUBLISHABLE_KEY: str | None = None
     SUPABASE_SECRET_KEY: str | None = None
-    SUPABASE_STORAGE_S3_URL: str = (
-        "https://lqaejzcipdozffpftllp.storage.supabase.co/storage/v1/s3"
-    )
+    SUPABASE_STORAGE_S3_URL: str = ""
 
     # Auth / JWT
     JWT_SECRET_KEY: str = ""
@@ -157,6 +155,10 @@ class Settings(BaseSettings):
         if not self.SUPABASE_DB_PASSWORD:
             raise ValueError(
                 "Database not configured: set DATABASE_URL or SUPABASE_DB_PASSWORD"
+            )
+        if not self.SUPABASE_DB_HOST:
+            raise ValueError(
+                "SUPABASE_DB_HOST is required when building the URL from parts"
             )
         # URL.create quotes the credentials correctly — passwords containing
         # @, :, /, %, etc. would corrupt a hand-built connection string.

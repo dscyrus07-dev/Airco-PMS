@@ -110,6 +110,7 @@ class CompanyOut(BaseModel):
     phone: str
     address: str | None = None
     pin_code: str | None = None
+    operational_day_start: str = "06:00"
     created_at: datetime
 
 
@@ -164,6 +165,7 @@ def company_to_out(company) -> CompanyOut:
         phone=company.phone_number,
         address=company.address,
         pin_code=company.pin_code,
+        operational_day_start=company.operational_day_start or "06:00",
         created_at=company.created_at,
     )
 

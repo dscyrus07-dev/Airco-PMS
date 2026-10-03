@@ -5,6 +5,7 @@ import { WorkTemplate, WorkTemplateGeneratedWork } from '../../api/types';
 import { useApp } from '../../context/AppContext';
 import { Badge } from '../ui/Badge';
 import { Button } from '../ui/Button';
+import { fmtDateTimeIST } from '../../lib/datetime';
 
 const TYPE_LABELS: Record<string, string> = {
   task: 'Task', maintenance: 'Maintenance', inspection: 'Inspection',
@@ -120,7 +121,7 @@ export const TemplateDetailDrawer: React.FC<Props> = ({ template, onClose, onCha
           <div className="grid grid-cols-3 gap-2">
             {[
               ['Generated', String(template.generated_count)],
-              ['Next run', template.next_run_at ? new Date(template.next_run_at).toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) : '—'],
+              ['Next run', template.next_run_at ? fmtDateTimeIST(template.next_run_at) : '—'],
               ['Checklist', `${template.checklist?.length || 0} items`],
             ].map(([k, v]) => (
               <div key={k} className="bg-[#FAF8F5] border border-[#EAE5DC] rounded-[10px] px-3 py-2.5 text-center">

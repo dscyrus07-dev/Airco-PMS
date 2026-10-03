@@ -307,6 +307,13 @@ export const TaskStatusBadge: React.FC<{ status: TaskStatus; size?: 'sm' | 'md' 
           {TASK_STATUS_LABELS[status]}
         </Badge>
       );
+    case 'abandoned':
+      return (
+        <Badge variant="red" size={size} className="bg-[#F6E9E4] text-[#8C4A2F] border-[#EAD2C5]">
+          <AlertCircle className="w-3 h-3" />
+          {TASK_STATUS_LABELS[status]}
+        </Badge>
+      );
     default:
       return <Badge size={size}>{status}</Badge>;
   }

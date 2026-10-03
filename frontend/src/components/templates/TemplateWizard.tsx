@@ -158,7 +158,7 @@ export const TemplateWizard: React.FC<Props> = ({ editTemplate, onClose, onSaved
   // Derived FROM loc — the stored location config is the condition model:
   //   resource → target, scope → scope (specific = the uid-picker scopes),
   //   occupancy → occupancy. Resolved server-side at generation time.
-  type CondResource = 'rooms' | 'beds' | 'dorms' | 'washrooms' | 'rooms_beds';
+  type CondResource = 'rooms' | 'beds' | 'dorms' | 'washrooms' | 'rooms_beds' | 'common_area';
   type CondScope = 'property' | 'area' | 'zone' | 'specific';
   const SPECIFIC_KINDS = ['rooms', 'dorms', 'beds', 'washrooms', 'units'];
   const isSpecific = SPECIFIC_KINDS.includes(loc.scope as string);
@@ -188,6 +188,15 @@ export const TemplateWizard: React.FC<Props> = ({ editTemplate, onClose, onSaved
     const scope = patch.scope ?? condScope;
     const occupancy = patch.occupancy ?? condOccupancy;
     const next: NonNullable<WorkTemplateCreateRequest['location']> = { ...loc };
+    if (resource === 'common_area') {
+      // zone-level work — one task per zone; no unit pickers, no occupancy
+      next.scope = scope === 'specific' ? 'property' : scope;
+      next.target = 'common_area';
+      next.occupancy = undefined;
+      next.occupied_only = undefined;
+      set({ location: next });
+      return;
+    }
     if (scope === 'specific') {
       // dorm beds narrow to a specific dorm; 'all units' picks rooms + beds
       next.scope =
@@ -254,6 +263,7 @@ export const TemplateWizard: React.FC<Props> = ({ editTemplate, onClose, onSaved
       dorms: 'dorms',
       washrooms: 'washrooms',
       rooms_beds: 'units (rooms + dorm beds)',
+      common_area: 'the common area',
     }[condResource];
     const where =
       condScope === 'zone'
@@ -263,6 +273,9 @@ export const TemplateWizard: React.FC<Props> = ({ editTemplate, onClose, onSaved
           : condScope === 'specific'
             ? 'on the selected units only'
             : 'in this property';
+    if (condResource === 'common_area') {
+      return `Applies to ${res} ${where} — one task per zone; resolved when the task is generated.`;
+    }
     return `Applies to ${occ} ${res} ${where} — resolved against live occupancy when the task is generated.`;
   };
 
@@ -641,13 +654,14 @@ export const TemplateWizard: React.FC<Props> = ({ editTemplate, onClose, onSaved
                 <option value="dorms">Dorms</option>
                 <option value="washrooms">Washrooms</option>
                 <option value="rooms_beds">All units</option>
+                <option value="common_area">Common area</option>
               </select>
             </div>
             <div>
               <label className={labelCls}>Occupancy</label>
               <select
                 value={condOccupancy}
-                disabled={condResource === 'washrooms'}
+                disabled={condResource === 'washrooms' || condResource === 'common_area'}
                 onChange={(e) =>
                   setCondition({
                     occupancy: e.target.value as 'all' | 'occupied' | 'unoccupied',
@@ -699,6 +713,7 @@ export const TemplateWizard: React.FC<Props> = ({ editTemplate, onClose, onSaved
             </div>
           )}
 
+          {condResource !== 'common_area' && (
           <label className="flex items-center gap-2 text-[13px] text-[#555047] cursor-pointer w-fit">
             <input
               type="checkbox"
@@ -716,6 +731,7 @@ export const TemplateWizard: React.FC<Props> = ({ editTemplate, onClose, onSaved
                 ? 'Pick specific rooms & beds instead'
                 : `Pick specific ${condResource} instead`}
           </label>
+          )}
 
           {(loc.scope === 'rooms' || loc.scope === 'units') && (
             <div>
@@ -866,7 +882,7 @@ export const TemplateWizard: React.FC<Props> = ({ editTemplate, onClose, onSaved
               <div>
                 <label className={labelCls}>Repeat</label>
                 <div className="flex flex-wrap gap-2">
-                  {(['hourly', 'daily', 'weekly', 'monthly', 'custom'] as const).map((f) => (
+                  {(['minutes', 'hourly', 'daily', 'weekly', 'monthly', 'custom'] as const).map((f) => (
                     <button key={f} type="button" onClick={() => setSub('schedule', { frequency: f })}
                       className={`px-3.5 py-2 rounded-[10px] border text-[13px] font-medium cursor-pointer ${
                         sched.frequency === f ? 'bg-[#EBF3EC] border-[#386641] text-[#244E2C]' : 'bg-white border-[#E2DCD0] text-[#58534C]'
@@ -876,6 +892,24 @@ export const TemplateWizard: React.FC<Props> = ({ editTemplate, onClose, onSaved
                   ))}
                 </div>
               </div>
+
+              {sched.frequency === 'minutes' && (
+                <div className="grid grid-cols-3 gap-3.5">
+                  <div>
+                    <label className={labelCls}>Every (minutes)</label>
+                    <input type="number" min={5} max={720} value={sched.every || 30}
+                      onChange={(e) => setSub('schedule', { every: parseInt(e.target.value) || 30 })} className={inputCls} />
+                  </div>
+                  <div>
+                    <label className={labelCls}>Start Time</label>
+                    <input type="time" value={sched.start_time || ''} onChange={(e) => setSub('schedule', { start_time: e.target.value })} className={inputCls} />
+                  </div>
+                  <div>
+                    <label className={labelCls}>End Time</label>
+                    <input type="time" value={sched.window_end || ''} onChange={(e) => setSub('schedule', { window_end: e.target.value })} className={inputCls} />
+                  </div>
+                </div>
+              )}
 
               {sched.frequency === 'hourly' && (
                 <div className="grid grid-cols-3 gap-3.5">
@@ -1170,6 +1204,7 @@ export const TemplateWizard: React.FC<Props> = ({ editTemplate, onClose, onSaved
                 ['SCHEDULE', (() => {
                   if (sched.kind !== 'recurring') return `One time — ${sched.date || '?'}${sched.time ? ` at ${sched.time}` : ''}`;
                   const t = sched.time ? ` at ${sched.time}` : '';
+                  if (sched.frequency === 'minutes') return `Every ${sched.every || 30}m, ${sched.start_time || '00:00'}–${sched.window_end || '23:59'}`;
                   if (sched.frequency === 'hourly') return `Every ${sched.every || 1}h, ${sched.start_time || '00:00'}–${sched.window_end || '23:59'}`;
                   if (sched.frequency === 'daily') return `Every ${(sched.every || 1) > 1 ? `${sched.every} days` : 'day'}${t}`;
                   if (sched.frequency === 'weekly') return `Weekly on ${(sched.weekdays || []).map((d) => WEEKDAYS[d]).join(', ')}${t}`;

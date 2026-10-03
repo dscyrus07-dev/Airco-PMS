@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { CalendarCheck, ClipboardCheck, History, Plus } from 'lucide-react';
+import { CalendarCheck, CalendarDays, ClipboardCheck, History, OctagonX, Plus } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { usePolling } from '../../hooks/usePolling';
 import { Button } from '../ui/Button';
@@ -8,7 +8,10 @@ import { CreateTaskModal } from './CreateTaskModal';
 import { TaskDetailDrawer } from './TaskDetailDrawer';
 import { TodayTasksView } from './TodayTasksView';
 import { TaskHistoryView } from './TaskHistoryView';
+import { TaskCalendarView } from './TaskCalendarView';
 import { PendingCheckView } from './PendingCheckView';
+import { AbandonedTodayView } from './AbandonedTodayView';
+import { BackButton } from '../ui/BackButton';
 import { Task } from '../../types';
 
 /**
@@ -25,8 +28,9 @@ export const TasksView: React.FC = () => {
     pendingCheck, refreshPendingCheck,
   } = useApp();
 
-  const [tab, setTab] = useState<'today' | 'pending' | 'history'>('today');
+  const [tab, setTab] = useState<'today' | 'abandoned' | 'pending' | 'history' | 'calendar'>('today');
   const canReview = currentUser?.role !== 'employee';
+  const isSuperAdmin = currentUser?.role === 'super_admin';
 
   // Pending Check badge — shared AppContext snapshot; this view is the
   // sole 30s poller (PendingCheckView reads the same data, no second fetch)
@@ -54,6 +58,9 @@ export const TasksView: React.FC = () => {
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
+          <div className="mb-2">
+            <BackButton to={`/property/${activePropertyUid}/zones`} />
+          </div>
           <h1 className="font-display font-bold text-2xl sm:text-[28px] text-[#24221F] tracking-tight">
             Tasks
           </h1>
@@ -80,8 +87,10 @@ export const TasksView: React.FC = () => {
       <div className="flex items-center gap-1 bg-[#F0EDE6] rounded-[12px] p-1 w-fit">
         {([
           { v: 'today' as const, l: "Today's Tasks", icon: CalendarCheck },
+          { v: 'abandoned' as const, l: "Today's Abandoned", icon: OctagonX },
           ...(canReview ? [{ v: 'pending' as const, l: 'Pending Check', icon: ClipboardCheck, count: pendingCount }] : []),
           { v: 'history' as const, l: 'Task History', icon: History },
+          ...(isSuperAdmin ? [{ v: 'calendar' as const, l: 'Calendar', icon: CalendarDays }] : []),
         ]).map((t) => {
           const Icon = t.icon;
           return (
@@ -110,6 +119,8 @@ export const TasksView: React.FC = () => {
 
       {tab === 'today' ? (
         <TodayTasksView onOpenTask={setSelectedTaskUid} />
+      ) : tab === 'abandoned' ? (
+        <AbandonedTodayView onOpenTask={setSelectedTaskUid} />
       ) : tab === 'pending' ? (
         <PendingCheckView
           onOpenTask={(uid, kind) =>
@@ -118,6 +129,8 @@ export const TasksView: React.FC = () => {
               : setSelectedTaskUid(uid)
           }
         />
+      ) : tab === 'calendar' ? (
+        <TaskCalendarView />
       ) : (
         <TaskHistoryView onOpenTask={setSelectedTaskUid} />
       )}

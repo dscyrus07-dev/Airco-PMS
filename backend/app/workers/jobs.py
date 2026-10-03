@@ -43,14 +43,24 @@ async def generation_tick(ctx: dict) -> dict:
 
     from app.services.task import TaskService
     from app.services.template import TemplateService
+    from app.services.rollover import RolloverService
 
+    # Order is load-bearing: occurrence expiry runs BEFORE generation so
+    # a still-open predecessor releases its (property, room, title) slot
+    # and never blocks the next recurring instance.
+    async with AsyncSessionLocal() as session:
+        exp = await RolloverService(session).expire_due()
     async with AsyncSessionLocal() as session:
         tpl = await TemplateService(session).run_due()
     async with AsyncSessionLocal() as session:
         rep = await TaskService(session).run_due_repetitive()
+    async with AsyncSessionLocal() as session:
+        roll = await RolloverService(session).run()
 
-    result = {"templates": tpl, "repetitive": rep}
-    if tpl["generated"] or rep["generated"]:
+    result = {"expiry": exp, "templates": tpl,
+              "repetitive": rep, "rollover": roll}
+    if tpl["generated"] or rep["generated"] \
+            or roll["abandoned"] or exp["expired"]:
         logger.info("Generation tick: %s", result)
     return result
 

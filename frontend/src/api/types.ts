@@ -87,6 +87,8 @@ export interface UpdateCompanyRequest {
   phone?: string;
   address?: string;
   pin_code?: string;
+  /** 'HH:MM' IST — operational-day start; rollover + day analysis use it. */
+  operational_day_start?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -626,7 +628,7 @@ export type LocationScope =
   | 'washrooms'
   | 'units';
 export type ScheduleKind = 'one_time' | 'recurring';
-export type ScheduleFrequency = 'hourly' | 'daily' | 'weekly' | 'monthly' | 'custom';
+export type ScheduleFrequency = 'minutes' | 'hourly' | 'daily' | 'weekly' | 'monthly' | 'custom';
 
 export interface TemplateAssignment {
   mode: AssignmentMode;
@@ -646,7 +648,7 @@ export interface TemplateLocation {
   dorm_uids?: string[];
   bed_uids?: string[];
   washroom_uids?: string[];
-  /** dynamic expansion inside a zone/area: rooms | dorms | beds | washrooms | units */
+  /** dynamic expansion inside a zone/area: rooms | dorms | beds | washrooms | units | common_area (one task per zone) */
   target?: string;
   /** occupancy condition — resolved at generation time; rooms/beds/dorms only */
   occupancy?: 'all' | 'occupied' | 'unoccupied';
@@ -795,8 +797,28 @@ export interface TodayTaskItem {
   allocation_method?: string;
 }
 
+export interface AbandonedTaskItem {
+  task_uid: string;
+  ticket_number?: string;
+  title: string;
+  source: 'template' | 'manual' | 'recurring' | 'one_time';
+  template_uid?: string;
+  priority: TaskPriority;
+  zone_name?: string;
+  target_label?: string;
+  room_number?: string;
+  assignee?: string;
+  scheduled_for?: string;
+  expires_at?: string;
+  abandoned_at?: string;
+  abandoned_reason?: string;
+  abandoned_from_status?: string;
+}
+
 export interface TodayTasksResponse {
   date: string;
+  /** operational-day key (YYYY-MM-DD) the abandoned_today list is scoped to — resets at the company's operational_day_start, not IST midnight */
+  abandoned_day: string;
   summary: {
     total_planned: number;
     generated: number;
@@ -806,8 +828,10 @@ export interface TodayTasksResponse {
     completed: number;
     overdue: number;
     unassigned: number;
+    abandoned: number;
   };
   items: TodayTaskItem[];
+  abandoned_today: AbandonedTaskItem[];
 }
 
 export interface TaskHistoryItem {
@@ -850,4 +874,225 @@ export interface TaskHistoryParams {
   search?: string;
   page?: number;
   page_size?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Task calendar + daily analysis (Super Admin)
+// ---------------------------------------------------------------------------
+
+export interface TaskCalendarDay {
+  date: string; // YYYY-MM-DD operational-day key
+  generated: number;
+  allocated: number;
+  completed: number;
+  abandoned: number;
+  active: number;
+}
+
+export interface TaskCalendarResponse {
+  month: string;
+  today: string; // current operational-day key
+  operational_day_start: string;
+  days: TaskCalendarDay[];
+}
+
+export interface DayAnalysisTask {
+  task_uid: string;
+  ticket_number?: string;
+  title: string;
+  status: string;
+  priority: string;
+  task_type: string;
+  work_type?: string;
+  category: string;
+  origin: string;
+  template_name?: string;
+  assigned_employee_uid?: string;
+  assigned_employee?: string;
+  actual_worker?: string;
+  zone_name?: string;
+  area_name?: string;
+  resource?: string;
+  room_number?: string;
+  dorm_name?: string;
+  washroom_name?: string;
+  scheduled_for?: string;   // recurring-instance occurrence instant
+  expires_at?: string;      // validity end = next scheduled boundary
+  generated_at?: string;
+  allocated_at?: string;
+  started_at?: string;
+  submitted_at?: string;
+  completed_at?: string;
+  abandoned: boolean;
+  abandoned_at?: string;
+  abandoned_reason?: string;
+  abandoned_from_status?: string;
+  auto_abandoned: boolean;
+  allocation_method?: string;
+}
+
+export interface DayAnalysisEmployee {
+  employee_uid: string;
+  employee?: string;
+  allocated: number;
+  completed: number;
+  abandoned: number;
+  active: number;
+  completion_rate: number;
+  zones: string[];
+  areas: string[];
+  work: string[];
+}
+
+export interface DayAnalysisBucket {
+  generated: number;
+  allocated: number;
+  completed: number;
+  abandoned: number;
+  active: number;
+  completion_rate: number;
+}
+
+export interface DayAnalysisResponse {
+  date: string;
+  operational_day_start: string;
+  is_today: boolean;
+  summary: {
+    generated: number;
+    allocated: number;
+    completed: number;
+    abandoned: number;
+    active: number;
+    completion_rate: number;
+    employees_involved: number;
+    resources_processed: number;
+  };
+  tasks: DayAnalysisTask[];
+  employees: DayAnalysisEmployee[];
+  zones: (DayAnalysisBucket & { zone: string })[];
+  areas: (DayAnalysisBucket & { area: string })[];
+  categories: (DayAnalysisBucket & { category: string })[];
+}
+
+// ---------------------------------------------------------------------------
+// Maintenance calendar + daily analysis (Super Admin)
+// ---------------------------------------------------------------------------
+
+export interface MaintenanceCalendarDay {
+  date: string; // YYYY-MM-DD operational-day key
+  raised: number;
+  carried: number;
+  resolved: number;
+  closed: number;
+  cancelled: number;
+}
+
+export interface MaintenanceCalendarResponse {
+  month: string;
+  today: string;
+  operational_day_start: string;
+  days: MaintenanceCalendarDay[];
+}
+
+export interface ResourceTransition {
+  at: string;
+  from: string;
+  to: string;
+  source: string;
+  actor?: string;
+}
+
+export interface MaintenanceDayTicket {
+  ticket_uid: string;
+  ticket_number: string;
+  issue: string;
+  maintenance_type: string;
+  priority: string;
+  status: string;             // live status
+  status_at_day_end: string;  // replayed status at window end
+  raised_today: boolean;
+  carried: boolean;
+  resource_type?: string;
+  resource_label?: string;
+  zone_name?: string;
+  area_name?: string;
+  assigned_employee_uid?: string;
+  assigned_employee?: string;
+  actual_worker?: string;
+  reported_by?: string;
+  created_at: string;
+  allocated_at?: string;
+  started_at?: string;
+  resolved_at?: string;
+  closed_at?: string;
+  cancelled_at?: string;
+  resolution_notes?: string;
+  allocation_method?: string;
+  due_date?: string;
+  time_to_allocate_min?: number;
+  time_to_start_min?: number;
+  resolution_time_min?: number;
+  close_time_min?: number;
+  resource_was?: string;
+  resource_after?: string;
+  resource_current?: string;
+  resource_transitions: ResourceTransition[];
+}
+
+export interface MaintenanceDayEmployee {
+  employee_uid: string;
+  employee?: string;
+  tickets: number;
+  resolved: number;
+  closed: number;
+  cancelled: number;
+  open: number;
+  pending_review: number;
+  zones: string[];
+  areas: string[];
+  work: string[];
+  avg_resolution_min?: number;
+}
+
+export interface MaintenanceDayBucket {
+  raised: number;
+  allocated: number;
+  resolved: number;
+  closed: number;
+  cancelled: number;
+  open: number;
+  employees_involved: number;
+  completion_rate: number;
+  avg_resolution_min?: number;
+}
+
+export interface MaintenanceDayAnalysis {
+  date: string;
+  operational_day_start: string;
+  window_start_utc: string;
+  window_end_utc: string;
+  is_today: boolean;
+  summary: {
+    raised: number;
+    carried: number;
+    allocated: number;
+    resolved: number;
+    closed: number;
+    cancelled: number;
+    open_at_end: number;
+    pending_review: number;
+    tickets: number;
+    allocated_total: number;
+    completion_rate: number;
+    employees_involved: number;
+    zones_affected: number;
+    resources_affected: number;
+    avg_resolution_min?: number;
+    avg_time_to_start_min?: number;
+  };
+  tickets: MaintenanceDayTicket[];
+  employees: MaintenanceDayEmployee[];
+  zones: (MaintenanceDayBucket & { zone: string })[];
+  areas: (MaintenanceDayBucket & { area: string })[];
+  categories: (MaintenanceDayBucket & { category: string })[];
 }

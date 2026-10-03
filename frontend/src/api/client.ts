@@ -238,6 +238,20 @@ export async function apiFetch<T>(path: string, options: RequestOptions = {}): P
   }
 
   if (response.status === 401) {
+    // Credential endpoints are excluded — a 401 there is a bad username/
+    // password, not an expired session. Running the refresh+clear path on
+    // it would wipe a still-valid session (e.g. in another tab) and mask
+    // the real error with "session expired".
+    const isCredentialEndpoint = path === '/auth/login' || path === '/auth/signup';
+    if (isCredentialEndpoint) {
+      let bodyJson: unknown = null;
+      try {
+        bodyJson = await response.json();
+      } catch {
+        /* non-JSON error body */
+      }
+      throw normalizeError(response.status, bodyJson);
+    }
     // Attempt a refresh-token exchange once before giving up the session
     if (!options._retried && getRefreshToken() && (await refreshOnce())) {
       return apiFetch<T>(path, { ...options, _retried: true });

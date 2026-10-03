@@ -144,6 +144,27 @@ export async function tasksHistory(
   return apiFetch<import('./types').TaskHistoryResponse>('/tasks/history', { query: params });
 }
 
+/** Task calendar — per-day activity counts for one month (YYYY-MM). Super Admin. */
+export async function taskCalendar(
+  month: string,
+  property_uid?: string
+): Promise<import('./types').TaskCalendarResponse> {
+  return apiFetch<import('./types').TaskCalendarResponse>('/tasks/calendar', {
+    query: { month, property_uid },
+  });
+}
+
+/** Daily task analysis for one operational day (YYYY-MM-DD). Super Admin. */
+export async function taskDayAnalysis(
+  day: string,
+  property_uid?: string
+): Promise<import('./types').DayAnalysisResponse> {
+  return apiFetch<import('./types').DayAnalysisResponse>(
+    `/tasks/history/${day}`,
+    { query: { property_uid } }
+  );
+}
+
 export async function generateOccurrence(
   template_uid: string,
   occurrence_key: string

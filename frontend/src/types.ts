@@ -28,7 +28,8 @@ export type EmployeeStatus =
 
 export type TaskPriority = 'low' | 'medium' | 'high' | 'urgent' | 'critical';
 // pending = open/unassigned · assigned · in_progress · submitted (awaiting
-// review) · reopened (was rejected) · completed · cancelled · scheduled · overdue
+// review) · reopened (was rejected) · completed · cancelled · abandoned
+// (closed unfinished by the daily rollover) · scheduled · overdue
 export type TaskStatus =
   | 'pending'
   | 'assigned'
@@ -37,6 +38,7 @@ export type TaskStatus =
   | 'reopened'
   | 'completed'
   | 'cancelled'
+  | 'abandoned'
   | 'overdue'
   | 'scheduled';
 export type TaskType = 'fixed' | 'repetitive' | 'automated';
@@ -159,6 +161,16 @@ export interface Task {
   created_by_name?: string;
   recurrence?: RecurrenceSchedule;
   recurrence_interval_days?: number; // used when recurrence === 'custom'
+  series_id?: string;                 // repetitive-series lineage
+  template_id?: string;               // generating work template
+  /** recurring-instance validity window — scheduled occurrence instant
+   *  and the next scheduled boundary (hard expiry; never extended by
+   *  scheduler downtime). Absent on manual/one-time tasks. */
+  scheduled_for?: string;
+  expires_at?: string;
+  abandoned_at?: string;
+  abandoned_reason?: string;   // NEXT_SCHEDULED_OCCURRENCE | SYSTEM_DAILY_ROLLOVER
+  abandoned_from_status?: string;
   automation_rule?: AutomationRule;
   history: TaskHistoryEvent[];
   completion_images?: TaskCompletionImage[];
@@ -251,6 +263,8 @@ export interface Company {
   phone: string;
   address?: string;
   pin_code?: string;
+  /** 'HH:MM' IST — when each operational day begins (rollover boundary). */
+  operational_day_start?: string;
   created_at: string;
 }
 

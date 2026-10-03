@@ -12,6 +12,7 @@ import {
   Trash2,
   Activity,
   History,
+  CalendarDays,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { Card } from '../ui/Card';
@@ -30,6 +31,8 @@ import {
 } from '../../lib/maintenanceUtils';
 import { formatEventTime } from '../../lib/taskUtils';
 import { isEmployeeAssignable } from '../../lib/employeeUtils';
+import { MaintenanceCalendarView } from './MaintenanceCalendarView';
+import { BackButton } from '../ui/BackButton';
 
 const PRIORITY_STYLES: Record<string, string> = {
   low: 'bg-[#F4F0E8] text-[#6C675F]',
@@ -511,9 +514,10 @@ export const TicketDrawer: React.FC<{
 // ---------------------------------------------------------------------------
 
 export const MaintenanceView: React.FC = () => {
-  const { currentPropertyMaintenance, activeProperty } = useApp();
+  const { currentPropertyMaintenance, activeProperty, currentUser, activePropertyUid } = useApp();
+  const isSuperAdmin = currentUser?.role === 'super_admin';
   const [searchParams] = useSearchParams();
-  const [view, setView] = useState<'live' | 'history'>('live');
+  const [view, setView] = useState<'live' | 'history' | 'calendar'>('live');
   const [statusFilter, setStatusFilter] = useState('all');
   const [search, setSearch] = useState('');
   const [openedTicketUid, setOpenedTicketUid] = useState<string | null>(
@@ -550,6 +554,9 @@ export const MaintenanceView: React.FC = () => {
   return (
     <div className="space-y-6">
       <div>
+        <div className="mb-2">
+          <BackButton to={`/property/${activePropertyUid}/zones`} />
+        </div>
         <div className="flex items-center gap-2">
           <h1 className="font-display font-bold text-2xl sm:text-[28px] text-[#24221F] tracking-tight">
             Maintenance
@@ -567,6 +574,9 @@ export const MaintenanceView: React.FC = () => {
         {([
           { v: 'live' as const, l: 'Current Live', icon: Activity },
           { v: 'history' as const, l: 'History', icon: History },
+          ...(isSuperAdmin
+            ? [{ v: 'calendar' as const, l: 'Calendar', icon: CalendarDays }]
+            : []),
         ]).map((t) => {
           const Icon = t.icon;
           return (
@@ -586,6 +596,10 @@ export const MaintenanceView: React.FC = () => {
         })}
       </div>
 
+      {view === 'calendar' ? (
+        <MaintenanceCalendarView />
+      ) : (
+        <>
       {/* Filters */}
       <div className="flex items-center gap-3 flex-wrap">
         <div className="flex items-center gap-1.5 text-xs text-[#736E65]">
@@ -663,6 +677,8 @@ export const MaintenanceView: React.FC = () => {
             </Card>
           ))}
         </div>
+      )}
+        </>
       )}
 
       {openedTicket && (

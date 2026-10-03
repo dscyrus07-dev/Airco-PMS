@@ -379,3 +379,6 @@ class CompanyUpdateRequest(BaseModel):
     phone: str | None = None
     address: str | None = None
     pin_code: str | None = None
+    operational_day_start: str | None = Field(
+        default=None, pattern=r"^\d{2}:\d{2}$"
+    )

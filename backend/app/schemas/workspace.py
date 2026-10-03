@@ -441,6 +441,12 @@ def task_out(t: Task) -> dict:
         "recurrence": t.recurrence,
         "recurrence_interval_days": t.recurrence_interval_days,
         "series_id": str(t.series_id) if t.series_id else None,
+        "scheduled_for": t.scheduled_for,
+        "expires_at": t.expires_at,
+        "template_id": str(t.template_id) if t.template_id else None,
+        "abandoned_at": t.abandoned_at,
+        "abandoned_reason": t.abandoned_reason,
+        "abandoned_from_status": t.abandoned_from_status,
         "automation_rule": t.automation_rule,
         "history": [
             history_out(h) for h in (

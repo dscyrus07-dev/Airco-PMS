@@ -4,6 +4,7 @@ import { Modal } from '../ui/Modal';
 import { Button } from '../ui/Button';
 import { PasswordInput } from '../auth/PasswordInput';
 import { ApiError } from '../../api/client';
+import { istDateKey } from '../../lib/datetime';
 
 interface CreateEmployeeModalProps {
   isOpen: boolean;
@@ -32,7 +33,7 @@ export const CreateEmployeeModal: React.FC<CreateEmployeeModalProps> = ({
   const [email, setEmail] = useState('');
   const [phone, setPhone] = useState('');
   const [zoneUid, setZoneUid] = useState('');
-  const [startDate, setStartDate] = useState(new Date().toISOString().split('T')[0]);
+  const [startDate, setStartDate] = useState(istDateKey());
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [passwordError, setPasswordError] = useState<string | null>(null);

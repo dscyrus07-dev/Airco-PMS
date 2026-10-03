@@ -25,7 +25,7 @@ backend/                    # FastAPI + SQLAlchemy 2 async + asyncpg + Alembic
   app/schemas/              # pydantic request/response + *_out() UUID→uid mappers
   app/services/             # business logic (Router → Service → Repository → ORM)
   app/workers/              # arq worker: jobs.py + settings.py
-  alembic/versions/         # 28 migrations (never hand-edit prod schema)
+  alembic/versions/         # 30 migrations (never hand-edit prod schema)
   scripts/sync_local_uploads.py
   tests/                    # pytest-asyncio suite (111 tests)
 frontend/                   # React 19 + TS + Vite 8 + Tailwind v4 + react-router-dom 7
@@ -98,7 +98,7 @@ window + in-memory fallback), `storage.py` (local /s3 /supabase),
 |---|---|
 | `resource_state.py` | **ResourceStateService** — THE authoritative status writer. `transition()`, `derive()`, `repair()`. All status writes funnel here |
 | `task.py` (~1300) | `TaskService` — task CRUD, lifecycle (start/submit/approve/reject/reopen/complete), repetitive-series engine, evidence |
-| `task_ops.py` | task assignment/bulk-ops helpers |
+| `task_ops.py` | `TaskOpsService` — operational read models: `today` (generated tasks + pending template occurrences), `pending_check` (submitted tasks + resolved tickets review queue), `history`, `generate_occurrence` ("Generate Now") |
 | `task_location.py` | `resolve_task_location()` — room/dorm/bed/washroom → zone/area resolution |
 | `template.py` (~1290) | `TemplateService` — template CRUD+validate, `_expand_targets` (condition resolver), `_structure` per-run snapshot (incl. open-occupancy id sets + derived dorm occupancy), `_generate`/`_generate_for_target`/`_make_task`/`_make_ticket`, dedupe (`_open_task_exists` + savepoint), people pools (`_people_pool`, `allocate_people` callers) |
 | `work_allocation.py` (~820) | `WorkAllocationService` — `allocate()` (zone/area/property pools), `allocate_people()` (named/team/dept pools), `_fair_pick` (workload-first + rotation), `_locked_state`/`_locked_area`/`_locked_property` (FOR UPDATE), `_active_workloads`, `infer_task_work_type`, `WORK_TYPE_DEPARTMENTS` |
@@ -124,7 +124,7 @@ fairness: zone+area union, workload-first, dedupe, dept gating,
 people pools, property/area levels), `test_state_pipeline.py`
 (occupancy → state → task pipeline + template expansion/condition
 matrix), `test_occupancy.py`, `test_lifecycle.py`,
-`test_resource_state.py`. **111 passing.**
+`test_resource_state.py`, `test_zone_distribution.py`. **127 test functions.**
 
 ## 3. Frontend files — what each owns
 
@@ -262,8 +262,8 @@ Route permission shortcut: `Staff = Depends(require_property_manager)`.
 ## 6. Infra & operations
 
 - **DB**: Supabase Postgres (ap-south-1 / Mumbai), asyncpg driver.
-  Env: `DATABASE_URL` or `SUPABASE_DB_*` parts; `SUPABASE_DB_HOST` has a
-  hardcoded project default in `config.py`.
+  Env: `DATABASE_URL` or `SUPABASE_DB_*` parts — no hardcoded default;
+  boot fails fast when unset.
 - **Scheduler**: dev = embedded asyncio loop (`RUN_EMBEDDED_SCHEDULER`,
   60s tick); prod = arq worker cron + Redis dedupe lock.
 - **Redis**: rate-limit, arq queue, tick lock. Optional in dev.

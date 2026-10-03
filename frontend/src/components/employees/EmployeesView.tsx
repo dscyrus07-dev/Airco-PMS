@@ -5,6 +5,7 @@ import { Button } from '../ui/Button';
 import { ZoneBoard } from './ZoneBoard';
 import { EmployeeDirectory } from './EmployeeDirectory';
 import { CreateEmployeeModal } from './CreateEmployeeModal';
+import { BackButton } from '../ui/BackButton';
 import { isEmployeeDeactivated } from '../../lib/employeeUtils';
 
 // Compact metric pill — quiet statistics, not dashboard cards
@@ -53,6 +54,9 @@ export const EmployeesView: React.FC = () => {
       {/* Header — title hierarchy + primary action */}
       <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
         <div>
+          <div className="mb-2">
+            <BackButton to={`/property/${activeProperty?.property_uid}/zones`} />
+          </div>
           <h1 className="font-display font-semibold text-[28px] text-[#17221B] tracking-tight leading-tight">
             Property Team & Zone Staffing
           </h1>

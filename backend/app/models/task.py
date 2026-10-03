@@ -92,7 +92,8 @@ class Task(Base):
     origin: Mapped[str] = mapped_column(
         String(32), nullable=False, default="manual"
     )
-    # pending | in_progress | completed | overdue | scheduled
+    # pending | assigned | in_progress | submitted | reopened |
+    # completed | cancelled | abandoned | overdue | scheduled
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     priority: Mapped[str] = mapped_column(String(32), nullable=False, default="medium")
     # Date (YYYY-MM-DD) or ISO timestamp for hourly schedules
@@ -110,6 +111,28 @@ class Task(Base):
         DateTime(timezone=True), nullable=True
     )
     completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Daily-rollover outcome — set only by RolloverService. operational_date
+    # is the IST operational-day key (YYYY-MM-DD) the task belonged to.
+    abandoned_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    abandoned_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    abandoned_from_status: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
+    operational_date: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    # Recurring-instance validity window — stamped at generation for
+    # template- and series-produced occurrences. `scheduled_for` is the
+    # scheduled occurrence instant; `expires_at` is the NEXT scheduled
+    # boundary (the instance is valid until then, never extended by
+    # scheduler downtime). NULL on manual/one-time tasks — those are
+    # governed by the daily operational rollover instead.
+    scheduled_for: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     recurrence: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -149,9 +172,27 @@ class Task(Base):
             "property_id", "room_id", "title",
             unique=True,
             postgresql_where=(room_id.isnot(None) & ~status.in_(
-                ("completed", "cancelled"))),
+                ("completed", "cancelled", "abandoned"))),
             sqlite_where=(room_id.isnot(None) & ~status.in_(
-                ("completed", "cancelled"))),
+                ("completed", "cancelled", "abandoned"))),
+        ),
+        # Expiry sweep: WHERE expires_at <= now AND status IN (expirable).
+        # Partial — only recurring instances carry a validity window.
+        Index(
+            "ix_tasks_expires_at", "expires_at",
+            postgresql_where=expires_at.isnot(None),
+            sqlite_where=expires_at.isnot(None),
+        ),
+        # One row per (series, occurrence) — the scheduler sweep and the
+        # on-completion spawn can race the same slot; this is the
+        # DB-authoritative dedupe (the app-level select is only a hint).
+        Index(
+            "uq_tasks_series_due", "series_id", "due_date",
+            unique=True,
+            postgresql_where=(series_id.isnot(None) & due_date.isnot(None)
+                              & (task_type == "repetitive")),
+            sqlite_where=(series_id.isnot(None) & due_date.isnot(None)
+                          & (task_type == "repetitive")),
         ),
     )
 
@@ -163,7 +204,8 @@ class TaskHistoryEvent(Base):
     task_id: Mapped[uuid.UUID] = mapped_column(
         Uuid, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    # allocated | started | completed | redo_requested | reassigned | edited | auto_generated
+    # allocated | started | completed | redo_requested | reassigned |
+    # edited | auto_generated | abandoned
     type: Mapped[str] = mapped_column(String(32), nullable=False)
     at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
