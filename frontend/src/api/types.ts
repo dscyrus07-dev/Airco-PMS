@@ -788,7 +788,7 @@ export interface TodayTaskItem {
   target_label?: string;
   room_number?: string;
   washroom_name?: string;
-  generation_state: 'generated' | 'pending_generation' | 'generation_failed' | 'cancelled';
+  generation_state: 'generated' | 'pending_generation' | 'generation_failed' | 'skipped' | 'cancelled';
   work_status?: string;
   task_uid?: string;
   ticket_number?: string;

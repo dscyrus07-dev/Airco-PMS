@@ -17,6 +17,7 @@ const GEN_BADGE: Record<string, { label: string; variant: 'sage' | 'orange' | 'r
   generated: { label: 'Generated', variant: 'sage' },
   pending_generation: { label: 'Scheduled', variant: 'orange' },
   generation_failed: { label: 'Failed', variant: 'red' },
+  skipped: { label: 'Skipped', variant: 'neutral' },
   cancelled: { label: 'Cancelled', variant: 'neutral' },
 };
 

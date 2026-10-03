@@ -241,10 +241,15 @@ class TaskOpsService:
         if gen_task is not None:
             return {**base, "item_type": "task", "generation_state": "generated",
                     **self._task_fields(gen_task)}
+        # Slots earlier than next_run_at were collapsed by the catch-up logic —
+        # they will never generate, so don't present them as pending.
+        skipped = (t.next_run_at is not None
+                   and occ < (t.next_run_at if t.next_run_at.tzinfo
+                              else t.next_run_at.replace(tzinfo=timezone.utc)))
         return {
             **base,
             "item_type": "occurrence",
-            "generation_state": "pending_generation",
+            "generation_state": "skipped" if skipped else "pending_generation",
             "work_status": None,
             "task_uid": None,
             "ticket_number": None,
@@ -272,7 +277,13 @@ class TaskOpsService:
             "title": t.title,
             "source": source,
             "priority": t.priority,
-            "scheduled_at": t.due_date,
+            # Date-only due_date ('2026-10-03') has no real time — emitting it
+            # makes the client parse UTC midnight and render "05:30 am" IST.
+            "scheduled_at": (
+                t.scheduled_for.isoformat() if t.scheduled_for
+                else t.due_date if t.due_date and "T" in t.due_date
+                else None
+            ),
             "zone_name": zone_name,
             "target_label": (t.room_number or t.dorm_name or t.washroom_name),
             "room_number": t.room_number or t.dorm_name or t.washroom_name,
@@ -310,7 +321,7 @@ class TaskOpsService:
         for i in items:
             if i["generation_state"] == "generated":
                 s["generated"] += 1
-            else:
+            elif i["generation_state"] == "pending_generation":
                 s["pending_generation"] += 1
             ws = i.get("work_status")
             if ws in ("assigned",):
