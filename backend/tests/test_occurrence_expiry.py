@@ -790,3 +790,33 @@ async def test_windowless_rows_survive_global_sweep(session, seed):
 
     await session.refresh(legacy)
     assert legacy.status == "assigned"
+
+
+async def test_generate_now_normalizes_offset_iso_key(session, seed):
+    """A '+05:30' occurrence key generates with the canonical UTC ledger
+    key — the same instant must dedupe/match against '+00:00' spellings."""
+    prop, admin, room = seed["prop"], seed["admin"], seed["room"]
+    t = make_template(
+        prop, next_run_at=ist(2030, 10, 2, 10, 0),
+        location={"scope": "rooms", "room_uids": [str(room.id)]},
+    )
+    session.add(t)
+    await session.commit()
+
+    from app.models.template import TemplateGeneration
+    occ_ist = ist(2030, 10, 2, 11, 0)
+    created = await TaskOpsService(session).generate_occurrence(
+        admin, t.id, f"{occ_ist.isoformat()}|room:{room.id}")
+    assert created is not None
+
+    # ledger key is the UTC spelling, not the +05:30 the caller sent
+    rows = (await session.execute(
+        select(TemplateGeneration.occurrence_key)
+        .where(TemplateGeneration.template_id == t.id))).scalars().all()
+    canon = occ_ist.astimezone(timezone.utc).isoformat()
+    assert rows == [f"{canon}|room:{room.id}"]
+
+    # re-asking for the SAME instant in UTC spelling dedupes cleanly
+    with pytest.raises(ValidationErr, match="already generated"):
+        await TaskOpsService(session).generate_occurrence(
+            admin, t.id, f"{canon}|room:{room.id}")

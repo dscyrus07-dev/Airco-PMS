@@ -466,6 +466,16 @@ class TaskOpsService:
             occurrence = datetime.fromisoformat(occ_iso)
         except ValueError:
             raise ValidationErr("Invalid occurrence key.")
+        # Ledger keys are canonical UTC ('...+00:00') — the today view and
+        # batch path build them from UTC-aware occurrences. A client that
+        # sends '+05:30' would otherwise write a key that never matches.
+        if occurrence.tzinfo is None:
+            occurrence = occurrence.replace(tzinfo=timezone.utc)
+        occurrence = occurrence.astimezone(timezone.utc)
+
+        canon_key = f"{occurrence.isoformat()}|{target_key}"
+        if await self.templates._already_generated(t.id, canon_key):
+            raise ValidationErr("This occurrence was already generated.")
 
         # Same lifecycle as the ordered tick, scoped to THIS target —
         # generating one room's occurrence supersedes only that room's

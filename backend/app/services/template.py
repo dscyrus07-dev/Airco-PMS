@@ -851,6 +851,11 @@ class TemplateService:
         from app.models.property import Property
         is_maint = (t.template_type == "maintenance"
                     if is_maint is None else is_maint)
+        # Canonical occurrence key — always UTC so '...+05:30' and
+        # '...+00:00' spellings of the same instant can't fork the ledger.
+        if occurrence.tzinfo is None:
+            occurrence = occurrence.replace(tzinfo=timezone.utc)
+        occurrence = occurrence.astimezone(timezone.utc)
         key = f"{occurrence.isoformat()}|{tgt['key']}"
         if not ledger_checked and await self._already_generated(t.id, key):
             return None
