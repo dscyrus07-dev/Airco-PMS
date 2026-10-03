@@ -1,0 +1,43 @@
+{
+  "expo": {
+    "name": "AiROS Staff",
+    "slug": "airos-staff",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "scheme": "airos-staff",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "backgroundColor": "#F4F3F0",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "app.airos.staff"
+    },
+    "android": {
+      "package": "app.airos.staff",
+      "adaptiveIcon": {
+        "backgroundColor": "#F4F3F0",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "extra": {
+      "apiUrl": "https://airco-pms-production.up.railway.app/api/v1"
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-secure-store",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "AiROS Staff needs photo access to attach evidence to tasks and tickets.",
+          "cameraPermission": "AiROS Staff needs camera access to capture task evidence."
+        }
+      ]
+    ]
+  }
+}
