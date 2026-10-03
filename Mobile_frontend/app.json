@@ -23,7 +23,11 @@
       "predictiveBackGestureEnabled": false
     },
     "extra": {
-      "apiUrl": "https://airco-pms-production.up.railway.app/api/v1"
+      "apiUrl": "https://airco-pms-production.up.railway.app/api/v1",
+      "router": {},
+      "eas": {
+        "projectId": "06051501-a408-4d02-9811-25b1113984ba"
+      }
     },
     "web": {
       "favicon": "./assets/favicon.png"
@@ -38,6 +42,7 @@
           "cameraPermission": "AiROS Staff needs camera access to capture task evidence."
         }
       ]
-    ]
+    ],
+    "owner": "baljyot_singh_13"
   }
 }
