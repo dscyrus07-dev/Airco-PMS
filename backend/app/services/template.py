@@ -626,7 +626,7 @@ class TemplateService:
                 # due instances so a still-open predecessor can't block
                 # its successor through uq_tasks_open_room_title.
                 await RolloverService(self.session).expire_due(
-                    now, template_id=t.id)
+                    now, template_id=t.id, include_windowless=True)
                 created = await self._generate(
                     t, now, occurrence=occurrence)
                 stats["generated"] += created

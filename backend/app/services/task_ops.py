@@ -474,7 +474,8 @@ class TaskOpsService:
         # stay valid until their own expiry; unrelated open tasks
         # (manual work, other templates) still block below.
         await RolloverService(self.session).expire_due(
-            template_id=t.id, target=tgt, boundary=occurrence)
+            template_id=t.id, target=tgt, boundary=occurrence,
+            include_windowless=True)
 
         # On-demand path precheck — the batch path does this via
         # _open_task_rooms; without it a covered room walks straight into

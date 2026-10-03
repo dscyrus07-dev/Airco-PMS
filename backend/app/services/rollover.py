@@ -241,6 +241,7 @@ class RolloverService:
         template_id=None,
         target: dict | None = None,
         boundary: datetime | None = None,
+        include_windowless: bool = False,
     ) -> dict:
         """Abandon recurring instances whose validity window has ended.
 
@@ -261,6 +262,14 @@ class RolloverService:
         `boundary` overrides the expiry cutoff — manual "Generate Now"
         expires predecessors up to the occurrence being generated while
         still stamping `abandoned_at` with the real time.
+        `include_windowless` also matches open rows with `expires_at IS
+        NULL` — legacy instances generated before occurrence windows
+        existed. Scoped calls (template generation, Generate Now) use it
+        because a windowless open task in the same template+target scope
+        is necessarily a predecessor and would otherwise block the next
+        occurrence forever (only daily rollover could clear it). The
+        global tick sweep leaves it off — windowless rows stay under
+        daily-rollover governance.
         """
         now_utc = (now or datetime.now(timezone.utc))
         if now_utc.tzinfo is None:
@@ -269,12 +278,14 @@ class RolloverService:
         if cutoff.tzinfo is None:
             cutoff = cutoff.replace(tzinfo=timezone.utc)
 
+        window_pred = Task.expires_at <= cutoff
+        if include_windowless:
+            window_pred = window_pred | Task.expires_at.is_(None)
         q = (
             select(Task, Property.company_id)
             .join(Property, Task.property_id == Property.id)
             .where(
-                Task.expires_at.is_not(None),
-                Task.expires_at <= cutoff,
+                window_pred,
                 Task.status.in_(EXPIRABLE_STATUSES),
             )
         )

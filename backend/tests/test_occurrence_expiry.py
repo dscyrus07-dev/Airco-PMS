@@ -718,3 +718,75 @@ async def test_abandoned_today_scoped_to_operational_day(session, seed):
     from app.services.rollover import operational_day_key
     assert res["abandoned_day"] == operational_day_key(
         now_utc.astimezone(IST_OFFSET), dtime(6, 0))
+
+
+async def test_generate_now_supersedes_windowless_predecessor(session, seed):
+    """Legacy instances (generated before expires_at existed) are still
+    superseded — a windowless open task in the same template+target scope
+    is a predecessor and must not block Generate Now forever."""
+    prop, admin, room = seed["prop"], seed["admin"], seed["room"]
+    t = make_template(
+        prop, next_run_at=ist(2030, 10, 2, 10, 0),
+        location={"scope": "rooms", "room_uids": [str(room.id)]},
+    )
+    session.add(t)
+    await session.flush()
+    legacy = Task(
+        property_id=prop.id, template_id=t.id, title=t.name,
+        room_id=room.id, room_number=room.room_number,
+        status="assigned", scheduled_for=ist(2030, 10, 2, 10, 0),
+        expires_at=None,  # pre-window row — the prod case
+    )
+    session.add(legacy)
+    await session.commit()
+
+    occ = ist(2030, 10, 2, 11, 0)
+    created = await TaskOpsService(session).generate_occurrence(
+        admin, t.id, f"{occ.isoformat()}|room:{room.id}")
+
+    await session.refresh(legacy)
+    assert legacy.status == "abandoned"
+    assert legacy.abandoned_reason == "NEXT_SCHEDULED_OCCURRENCE"
+    assert created.status in {"pending", "assigned"}
+
+
+async def test_tick_supersedes_windowless_predecessor(session, seed):
+    """The same applies to run_due's template-scoped expire pass —
+    a legacy open row can't block successor generation."""
+    prop, room = seed["prop"], seed["room"]
+    t = make_template(
+        prop, next_run_at=ist(2030, 10, 2, 11, 0),
+        location={"scope": "rooms", "room_uids": [str(room.id)]},
+    )
+    session.add(t)
+    await session.flush()
+    legacy = Task(
+        property_id=prop.id, template_id=t.id, title=t.name,
+        room_id=room.id, room_number=room.room_number,
+        status="assigned", expires_at=None)
+    session.add(legacy)
+    await session.commit()
+
+    await TemplateService(session).run_due(now=ist(2030, 10, 2, 11, 0))
+
+    await session.refresh(legacy)
+    assert legacy.status == "abandoned"
+    tasks = await _tasks(session, t.id)
+    new = [x for x in tasks if x.id != legacy.id]
+    assert len(new) == 1 and new[0].status in {"pending", "assigned"}
+
+
+async def test_windowless_rows_survive_global_sweep(session, seed):
+    """But the unscoped tick sweep still leaves windowless rows to daily
+    rollover — include_windowless is only for scoped supersede calls."""
+    prop, room = seed["prop"], seed["room"]
+    legacy = Task(
+        property_id=prop.id, title="Old clean", room_id=room.id,
+        room_number=room.room_number, status="assigned", expires_at=None)
+    session.add(legacy)
+    await session.commit()
+
+    await RolloverService(session).expire_due(now=ist(2030, 10, 2, 12, 0))
+
+    await session.refresh(legacy)
+    assert legacy.status == "assigned"
